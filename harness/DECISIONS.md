@@ -58,3 +58,8 @@
   the user (reply/notify tools); the user's messages arrive as single channel events. No live activity/transcript feed.
 - D18 (accepted) No permission relay for now. User runs sessions in auto-approve mode; the daemon will launch sessions
   in the user's chosen permission mode. Relay (D3 bonus) parked.
+- D19 (accepted) Agent-chosen urgency ships in Phase 1: the shim exposes a messaging tool with an urgency level
+  (e.g. silent / normal / urgent) and the session instructions tell Claude when each fits. The phone renders it,
+  and in Phase 4 urgency maps to Web Push behavior.
+- D20 (accepted) Build process = "Ratchet" pipeline (see harness/RATCHET.md). Commits/pushes happen automatically
+  (no user approval) at logical moments; the Stop-hook autosync was removed.
