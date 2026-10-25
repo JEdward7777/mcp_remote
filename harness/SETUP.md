@@ -122,15 +122,19 @@ Description=mcp-remote daemon
 ExecStart=%h/.npm-global/bin/mcp-remote daemon
 Restart=on-failure
 RestartSec=10
+# 3 = revoked / account no longer allowed, 4 = token in use by another computer: restarting can't help.
+RestartPreventExitStatus=3 4
 
 [Install]
 WantedBy=default.target
 ```
 
-`systemctl --user enable --now mcp-remote`. The daemon exits with code 3 if the machine is revoked or the account
-is no longer allowed (`Restart=on-failure` will retry; it keeps failing with a clear log line until you pair again),
-and with code 4 if another computer is running a daemon with the same token (e.g. a copied
-`~/.config/mcp-remote`): pair each computer separately, never copy `config.json`.
+`systemctl --user enable --now mcp-remote`. The daemon exits on purpose, and must not be restarted, with code 3 if the
+machine is revoked or the account is no longer allowed (pair again), and with code 4 if another computer is running
+a daemon with the same token (e.g. a copied `~/.config/mcp-remote`: pair each computer separately, never copy
+`config.json`). `RestartPreventExitStatus=3 4` keeps systemd from restarting it in those cases; any other
+supervisor (launchd `KeepAlive`, Task Scheduler "restart on failure") must likewise not restart on exit codes 3 or 4.
+Other exits (crash, network) are fine to restart; the daemon already reconnects with backoff on its own.
 
 ## 12. Add the shim to Claude Code
 
@@ -147,8 +151,16 @@ Per project, `.mcp.json` in the project root:
 or once for all projects: `claude mcp add --scope user mcp-remote -- mcp-remote shim`.
 
 Each shim registers a session named after the project folder (basename of the cwd) with a random session id.
-Set `MCP_REMOTE_SESSION_ID` in the server's `env` to keep a stable id (and thread) across restarts, e.g.
-`"env": { "MCP_REMOTE_SESSION_ID": "myproject-main" }`. Offline sessions can be removed from the phone (open the thread -> Forget); each computer keeps at most 50 sessions, and the least recently active offline ones are pruned automatically. A stable id also survives re-pairing: a newly paired computer of the same account takes over the session and its history.
+To keep a stable id (and thread) across restarts, set `MCP_REMOTE_SESSION_ID`, but **per computer, never in a
+committed `.mcp.json`**: put it in your user-scope config (`claude mcp add --scope user -e MCP_REMOTE_SESSION_ID=laptop-myproject
+mcp-remote -- mcp-remote shim`) or export it in the shell that launches `claude`, and include the computer in the
+name (e.g. `laptop-myproject`). Two active computers announcing the same id is refused: the second one's
+`send_message` fails with "already used by another computer on this account", and the phone keeps showing the first.
+The only hand-over is from a **revoked** computer: after you revoke a computer and pair its replacement, the new one
+takes the id over together with its history (the Hub tells the other daemons to re-announce, no polling).
+
+Offline sessions can be removed from the phone (open the thread -> Forget); each computer keeps at most 50 sessions,
+and the least recently active offline ones are pruned automatically.
 
 ## 13. Launch Claude Code with the channel
 

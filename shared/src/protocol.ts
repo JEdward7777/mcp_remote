@@ -156,6 +156,8 @@ export const HubToDaemon = z.discriminatedUnion("t", [
   z.object({ t: z.literal("welcome"), machine_id: MachineId, name: z.string() }),
   z.object({ t: z.literal("deliver"), session_id: SessionId, messages: z.array(MessageRecord) }),
   z.object({ t: z.literal("sent"), req_id: ReqId, message_id: z.number().int() }),
+  /** Re-send hello (e.g. a session id this daemon was refused may be free now). */
+  z.object({ t: z.literal("resync") }),
   /** session_id is set when the error concerns one session (e.g. a refused session_up). */
   z.object({ t: z.literal("error"), error: z.string(), req_id: ReqId.optional(), session_id: SessionId.optional() }),
 ]);

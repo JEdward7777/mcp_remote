@@ -35,29 +35,38 @@ export async function pair(
   let attempt = 0;
   for (;;) {
     if (Date.now() > start.expires_at) throw new Error("pairing code expired; run `mcp-remote pair` again");
-    const result = await waitOnce(url, start);
+    // The token is saved before the server is told "claimed": if saving fails, the pairing stays
+    // unclaimed and its expiry removes the orphan machine.
+    let saved: string | null = null;
+    const persist = (r: Extract<PairResult, { t: "approved" }>) => {
+      saved = saveConfig({
+        url,
+        token: r.token,
+        machine_id: r.machine_id,
+        machine_name: r.machine_name,
+        account: r.account,
+      });
+    };
+    const result = await waitOnce(url, start, persist);
     if (result === "retry") {
       const d = backoffDelay(attempt++, { baseMs: 1000, capMs: 30_000 });
       await new Promise((res) => setTimeout(res, d));
       continue;
     }
     if (result.t === "expired") throw new Error("pairing code expired; run `mcp-remote pair` again");
-    if (result.t === "approved") {
-      const configPath = saveConfig({
-        url,
-        token: result.token,
-        machine_id: result.machine_id,
-        machine_name: result.machine_name,
-        account: result.account,
-      });
-      return { configPath, machine_id: result.machine_id, machine_name: result.machine_name, account: result.account };
+    if (result.t === "approved" && saved) {
+      return { configPath: saved, machine_id: result.machine_id, machine_name: result.machine_name, account: result.account };
     }
   }
 }
 
 /** One WebSocket wait. Resolves with the final result, or "retry" if the socket dropped. */
-function waitOnce(url: string, start: PairStartResponse): Promise<PairResult | "retry"> {
-  return new Promise((resolve) => {
+function waitOnce(
+  url: string,
+  start: PairStartResponse,
+  persist: (r: Extract<PairResult, { t: "approved" }>) => void,
+): Promise<PairResult | "retry"> {
+  return new Promise((resolve, reject) => {
     const u = new URL(wsUrl(url, "/api/pair/wait"));
     u.searchParams.set("code", start.code);
     u.searchParams.set("pairing_id", start.pairing_id);
@@ -82,7 +91,18 @@ function waitOnce(url: string, start: PairStartResponse): Promise<PairResult | "
       const r = parseFrame(PairResult, text);
       if (!r.ok) return;
       if (r.value.t === "pending") return;
-      if (r.value.t === "approved") ws.send("claimed");
+      if (r.value.t === "approved") {
+        try {
+          persist(r.value);
+        } catch (e) {
+          done = true;
+          clearInterval(ping);
+          ws.close();
+          reject(new Error(`approved, but could not save the config (${e instanceof Error ? e.message : e}); run pair again`));
+          return;
+        }
+        ws.send("claimed");
+      }
       setTimeout(() => ws.close(), 200);
       finish(r.value);
     });

@@ -32,6 +32,8 @@ const SEND_TIMEOUT_MS = 15_000;
 interface ShimEntry {
   conn: LineConn<ShimToDaemon>;
   session: SessionAnnounce;
+  /** Set when the Hub refused this session (e.g. id used by another computer). */
+  refused: string | null;
 }
 
 interface PendingSend {
@@ -47,6 +49,8 @@ export interface DaemonOptions {
   onFatal?: (exitCode: number) => void;
   /** Base delay after being replaced by another daemon (tests shorten it). */
   replacedDelayMs?: number;
+  /** A connection that lived this long resets the replaced streak (tests shorten it). */
+  stableAfterMs?: number;
 }
 
 export class Daemon {
@@ -141,7 +145,7 @@ export class Daemon {
             return;
           }
           sessionId = f.session.session_id;
-          this.shims.set(sessionId, { conn, session: f.session });
+          this.shims.set(sessionId, { conn, session: f.session, refused: null });
           log(`shim up: ${f.session.project} (${sessionId})`);
           conn.send({ t: "registered", hub_connected: this.hubReady } satisfies DaemonToShim);
           this.toHub({ t: "session_up", session: f.session });
@@ -151,6 +155,11 @@ export class Daemon {
         if (f.t === "send") {
           if (!this.hubReady) {
             conn.send({ t: "send_error", req_id: f.req_id, error: "daemon is not connected to the server right now" } satisfies DaemonToShim);
+            return;
+          }
+          const refused = this.shims.get(sessionId)?.refused;
+          if (refused) {
+            conn.send({ t: "send_error", req_id: f.req_id, error: `the server refused this session: ${refused}` } satisfies DaemonToShim);
             return;
           }
           const hubReq = `r${++this.reqSeq}`;
@@ -187,6 +196,12 @@ export class Daemon {
 
   private broadcastShims(frame: DaemonToShim): void {
     for (const s of this.shims.values()) s.conn.send(frame);
+  }
+
+  /** Full session list; also clears refusals so they are retried (the Hub re-refuses if still taken). */
+  private sendHello(): void {
+    for (const s of this.shims.values()) s.refused = null;
+    this.toHub({ t: "hello", v: PROTOCOL_VERSION, sessions: [...this.shims.values()].map((s) => s.session) });
   }
 
   private fatal(exitCode: number): void {
@@ -234,8 +249,7 @@ export class Daemon {
       this.hubReady = true;
       this.lastRx = Date.now();
       log(`connected to ${this.opts.config.url}`);
-      const sessions = [...this.shims.values()].map((s) => s.session);
-      this.toHub({ t: "hello", v: PROTOCOL_VERSION, sessions });
+      this.sendHello();
       this.broadcastShims({ t: "hub_status", connected: true });
       clearInterval(this.pingTimer);
       this.pingTimer = setInterval(() => {
@@ -262,6 +276,9 @@ export class Daemon {
         case "welcome":
           log(`server knows this machine as "${f.name}" (${f.machine_id})`);
           return;
+        case "resync":
+          this.sendHello();
+          return;
         case "deliver": {
           const shim = this.shims.get(f.session_id);
           // If the shim is gone the Hub keeps the messages undelivered and resends on session_up.
@@ -287,8 +304,11 @@ export class Daemon {
             }
           }
           if (f.session_id) {
-            // e.g. a refused session_up: tell that shim so it shows up in Claude Code's MCP logs.
-            this.shims.get(f.session_id)?.conn.send({ t: "error", error: `server refused this session: ${f.error}` } satisfies DaemonToShim);
+            // e.g. a refused session_up: remember it (send_message reports it) and tell that shim,
+            // so it shows up in Claude Code's MCP logs. A later hello (reconnect/resync) retries.
+            const entry = this.shims.get(f.session_id);
+            if (entry) entry.refused = f.error;
+            entry?.conn.send({ t: "error", error: `server refused this session: ${f.error}` } satisfies DaemonToShim);
             log(`server refused session ${f.session_id}: ${f.error}`);
             return;
           }
@@ -321,6 +341,12 @@ export class Daemon {
       }
       if (this.stopped) return;
       let delay: number;
+      const wasStable = this.openedAt > 0 && Date.now() - this.openedAt > (this.opts.stableAfterMs ?? STABLE_AFTER_MS);
+      this.openedAt = 0;
+      if (wasStable) {
+        this.replacedStreak = 0;
+        this.attempt = 0;
+      }
       if (code === 4002) {
         this.replacedStreak++;
         if (this.replacedStreak >= MAX_REPLACED_STREAK) {
@@ -333,7 +359,6 @@ export class Daemon {
         }
         delay = (this.opts.replacedDelayMs ?? REPLACED_DELAY_MS) * this.replacedStreak + backoffDelay(this.attempt++, { baseMs: 1000, capMs: 60_000 });
       } else {
-        if (this.openedAt && Date.now() - this.openedAt > STABLE_AFTER_MS) this.replacedStreak = 0;
         delay = backoffDelay(this.attempt++, { baseMs: 1000, capMs: 60_000 });
       }
       log(`disconnected (${code}${reason.length ? " " + reason.toString() : ""}); retrying in ${Math.round(delay / 1000)}s`);

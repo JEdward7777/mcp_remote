@@ -23,6 +23,8 @@ let attempt = 0;
 let reconnectTimer: number | undefined;
 let pingTimer: number | undefined;
 let clientSeq = 0;
+/** Sends waiting for the Hub's echo; the draft is only cleared once the echo arrives. */
+const pendingSends = new Map<string, { sid: string; text: string }>();
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => {
   const el = document.querySelector<T>(sel);
@@ -99,6 +101,12 @@ function connect(): void {
   sock.onclose = (ev) => {
     if (ws === sock) ws = null;
     state.connected = false;
+    if (pendingSends.size) {
+      // Unconfirmed sends: keep the text in the compose box so nothing typed is lost.
+      pendingSends.clear();
+      toast("Connection lost before the message was confirmed; it is still in the box.");
+      render();
+    }
     clearInterval(pingTimer);
     renderStatus();
     if (ev.code === 1008 || ev.code === 4401) {
@@ -138,6 +146,15 @@ function onFrame(f: HubToPhone): void {
       render();
       return;
     case "message": {
+      const pend = f.client_id ? pendingSends.get(f.client_id) : undefined;
+      if (f.client_id && pend) {
+        pendingSends.delete(f.client_id);
+        // Clear the draft only if the user hasn't kept typing since.
+        if ((drafts.get(pend.sid) ?? "").trim() === pend.text) {
+          drafts.delete(pend.sid);
+          if (threadView?.sid === pend.sid) threadView.ta.value = "";
+        }
+      }
       const list = state.threads.get(f.message.session_id);
       if (list && !list.some((m) => m.id === f.message.id)) list.push(f.message);
       const s = state.sessions.find((x) => x.session_id === f.message.session_id);
@@ -171,7 +188,9 @@ function onFrame(f: HubToPhone): void {
       return;
     }
     case "error":
+      if (f.client_id) pendingSends.delete(f.client_id);
       toast(f.error);
+      render();
       return;
   }
 }
@@ -287,13 +306,15 @@ function buildThread(sid: string): ThreadView {
   form.onsubmit = (ev) => {
     ev.preventDefault();
     const text = ta.value.trim();
-    if (!text) return;
-    if (!send({ t: "send", session_id: sid, text, client_id: `c${++clientSeq}` })) {
+    if (!text || [...pendingSends.values()].some((p) => p.sid === sid)) return;
+    drafts.set(sid, ta.value);
+    const client_id = `c${++clientSeq}`;
+    if (!send({ t: "send", session_id: sid, text, client_id })) {
       toast("Not connected; try again in a moment.");
       return;
     }
-    ta.value = "";
-    drafts.delete(sid);
+    pendingSends.set(client_id, { sid, text });
+    render();
   };
   root.append(head, cwd, list, form);
   return { sid, root, head, cwd, list, ta, btn, filled: false };
@@ -360,8 +381,10 @@ function updateThread(v: ThreadView): void {
   if (atBottom || !v.filled) v.list.scrollTop = v.list.scrollHeight;
   if (msgs) v.filled = true;
 
+  const sending = [...pendingSends.values()].some((p) => p.sid === sid);
   v.ta.disabled = revoked;
-  v.btn.disabled = revoked;
+  v.btn.disabled = revoked || sending;
+  v.btn.textContent = sending ? "Sending\u2026" : "Send";
   v.ta.placeholder = revoked
     ? "This session's computer was revoked; messages can't reach it"
     : s?.online
@@ -492,6 +515,17 @@ function renderSignedOut(): void {
 function renderShell(): void {
   const app = $("#app");
   const logout = h("form", { method: "post", action: "/auth/logout", class: "logout" }, h("button", { type: "submit" }, "Sign out"));
+  logout.onsubmit = async (ev) => {
+    // fetch() always sends our Origin on POST; a plain form post may send "Origin: null".
+    ev.preventDefault();
+    const r = await fetch("/auth/logout", { method: "POST", headers: { accept: "application/json" } }).catch(() => null);
+    if (!r || !r.ok) {
+      toast("Sign-out failed; try again.");
+      return;
+    }
+    location.hash = "";
+    void boot();
+  };
   app.replaceChildren(
     h(
       "header",

@@ -189,7 +189,13 @@ async function main() {
   });
   if (wrangler.exitCode !== null) throw new Error(`wrangler dev exited:\n${wrangler.output}`);
   await waitFor(async () => (await fetch(`${base}/`).catch(() => null))?.ok, { timeout: 20_000, what: "worker" });
-  check("wrangler dev serves the PWA", (await (await fetch(`${base}/`)).text()).includes("mcp remote"));
+  const home = await fetch(`${base}/`);
+  check("wrangler dev serves the PWA", (await home.text()).includes("mcp remote"));
+  check(
+    "PWA Referrer-Policy keeps Origin on same-origin posts (not no-referrer)",
+    home.headers.get("referrer-policy") === "strict-origin-when-cross-origin",
+    String(home.headers.get("referrer-policy")),
+  );
 
   // --- auth ---------------------------------------------------------------------------
   const alice = await devLogin(base, "alice");
@@ -197,6 +203,11 @@ async function main() {
   const me = await (await api(base, alice, "/api/me")).json();
   check("dev auth issues a session cookie (/api/me)", me.tenant === "dev-alice", JSON.stringify(me));
   check("/api/me without cookie is 401", (await fetch(`${base}/api/me`)).status === 401);
+  const carol = await devLogin(base, "carol");
+  const lo = await fetch(`${base}/auth/logout`, { method: "POST", headers: { cookie: carol, origin: base, accept: "application/json" } });
+  check("logout (fetch, same origin) clears the session cookie", lo.ok && /Max-Age=0/.test(lo.headers.get("set-cookie") ?? ""));
+  const loNull = await fetch(`${base}/auth/logout`, { method: "POST", headers: { cookie: carol, origin: "null" }, redirect: "manual" });
+  check("logout with Origin: null is refused", loNull.status === 403);
 
   // --- pairing ------------------------------------------------------------------------
   const machineDir = join(tmp, "alice-laptop");

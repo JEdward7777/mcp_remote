@@ -221,7 +221,7 @@ describe("hub", () => {
     const db = await daemon(b.token);
     db.send({ t: "session_up", session: { session_id: "shared", project: "p" } });
     const e = await waitFor(() => db.frames.find((f) => f.t === "error"), "error");
-    expect(e.error).toMatch(/another online machine/);
+    expect(e.error).toMatch(/already used by another computer/);
     expect(e.session_id).toBe("shared");
     db.send({ t: "send", req_id: "x", session_id: "shared", text: "spoof", urgency: "normal" });
     const e2 = await waitFor(() => db.frames.find((f) => f.t === "error" && f.req_id === "x"), "send error");
@@ -452,5 +452,67 @@ describe("review round 1", () => {
     const stub = E.PAIRING.get(E.PAIRING.idFromName(`pair:${start.code.replace("-", "")}`));
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     expect((await list()).length).toBe(0);
+  });
+});
+
+describe("review round 2", () => {
+  it("logout works from our origin (fetch and form) and refuses Origin: null", async () => {
+    const cookie = await cookieFor("uma");
+    const viaFetch = await SELF.fetch(`${ORIGIN}/auth/logout`, {
+      method: "POST",
+      headers: { cookie, origin: ORIGIN, accept: "application/json" },
+    });
+    expect(viaFetch.status).toBe(200);
+    expect(viaFetch.headers.get("set-cookie")).toMatch(/__Host-mr_session=; Path=\/; Max-Age=0/);
+    const viaForm = await SELF.fetch(`${ORIGIN}/auth/logout`, { method: "POST", headers: { cookie, origin: ORIGIN }, redirect: "manual" });
+    expect(viaForm.status).toBe(302);
+    expect(viaForm.headers.get("set-cookie")).toMatch(/Max-Age=0/);
+    const nullOrigin = await SELF.fetch(`${ORIGIN}/auth/logout`, { method: "POST", headers: { cookie, origin: "null" }, redirect: "manual" });
+    expect(nullOrigin.status).toBe(403);
+    expect(nullOrigin.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("refuses a session id held by another active computer even when it is offline, then hands it over on revoke via resync", async () => {
+    const a = await newMachine("vic", "a");
+    const b = await newMachine("vic", "b");
+    const da = await daemon(a.token);
+    da.send({ t: "hello", v: 1, sessions: [{ session_id: "dupe", project: "p" }] });
+    await sleep(50);
+    da.send({ t: "session_down", session_id: "dupe" });
+    const db = await daemon(b.token);
+    db.send({ t: "hello", v: 1, sessions: [{ session_id: "dupe", project: "p" }] });
+    const e = await waitFor(() => db.frames.find((f) => f.t === "error" && f.session_id === "dupe"), "refusal");
+    expect(e.error).toMatch(/MCP_REMOTE_SESSION_ID/);
+    const rv = await SELF.fetch(`${ORIGIN}/api/machines/${a.machineId}`, {
+      method: "DELETE",
+      headers: { cookie: await cookieFor("vic"), origin: ORIGIN },
+    });
+    expect(rv.status).toBe(200);
+    await waitFor(() => db.frames.find((f) => f.t === "resync"), "resync");
+    db.send({ t: "hello", v: 1, sessions: [{ session_id: "dupe", project: "p" }] });
+    const p = await phone("vic");
+    await waitFor(
+      () => last(p, "state")?.sessions.find((s: any) => s.session_id === "dupe" && s.online && s.machine_id === b.machineId),
+      "taken over after revoke",
+    );
+  });
+
+  it("applies the live-session cap to take-overs", async () => {
+    const a = await newMachine("wes", "a");
+    const da = await daemon(a.token);
+    da.send({ t: "hello", v: 1, sessions: [{ session_id: "w-old", project: "p" }] });
+    await sleep(50);
+    await SELF.fetch(`${ORIGIN}/api/machines/${a.machineId}`, {
+      method: "DELETE",
+      headers: { cookie: await cookieFor("wes"), origin: ORIGIN },
+    });
+    const b = await newMachine("wes", "b");
+    const db = await daemon(b.token);
+    const sessions = Array.from({ length: 64 }, (_, i) => ({ session_id: `w${i}`, project: "p" }));
+    db.send({ t: "hello", v: 1, sessions });
+    await sleep(50);
+    db.send({ t: "session_up", session: { session_id: "w-old", project: "p" } });
+    const e = await waitFor(() => db.frames.find((f) => f.t === "error" && f.session_id === "w-old"), "cap error");
+    expect(e.error).toMatch(/too many live sessions/);
   });
 });

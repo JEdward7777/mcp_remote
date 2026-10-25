@@ -205,6 +205,12 @@ export class Hub extends DurableObject<Env> {
         /* already closing */
       }
     }
+    // Its session ids are free now: ask the other live daemons to re-announce, so a session that
+    // was refused because of the collision is picked up without any polling.
+    for (const ws of this.ctx.getWebSockets("daemon")) {
+      const a = ws.deserializeAttachment() as Attachment | null;
+      if (a?.kind === "daemon" && a.machine_id !== machineId) this.sendDaemon(ws, { t: "resync" });
+    }
     this.broadcastState();
     return true;
   }
@@ -467,19 +473,24 @@ export class Hub extends DurableObject<Env> {
 
   private upsertSession(machineId: string, s: SessionAnnounce, now: number): string | null {
     const existing = this.getSession(s.session_id);
-    if (existing && existing.machine_id !== machineId) {
-      // Another machine of this same tenant may take the session over (keeping its history),
-      // e.g. after re-pairing, unless the current owner is live and has it online.
-      const ownerLive = this.machineActive(existing.machine_id) && !!this.daemonSocket(existing.machine_id);
-      if (ownerLive && existing.online === 1) return "session id is in use by another online machine";
-      this.sql.exec("UPDATE sessions SET machine_id = ? WHERE session_id = ?", machineId, s.session_id);
+    if (existing && existing.machine_id !== machineId && this.machineActive(existing.machine_id)) {
+      // Only a revoked owner gives a session id up (e.g. re-pairing a computer). Two active
+      // computers announcing the same id is a configuration error: refuse it rather than
+      // bouncing the session (and its pending messages) between them.
+      return (
+        `session id "${s.session_id}" is already used by another computer on this account; ` +
+        "give each computer its own MCP_REMOTE_SESSION_ID (or unset it)"
+      );
     }
-    if (!existing) {
+    if (!existing || existing.machine_id !== machineId) {
+      // New to this machine (brand new, or taken over from a revoked one): apply the same limits.
       const count = this.sql
         .exec<{ n: number }>("SELECT COUNT(*) AS n FROM sessions WHERE machine_id = ? AND online = 1", machineId)
         .one().n;
       if (count >= MAX_SESSIONS_PER_MACHINE) return "too many live sessions on this machine";
       this.evictOldSessions(machineId, MAX_STORED_SESSIONS_PER_MACHINE - 1);
+    }
+    if (!existing) {
       this.sql.exec(
         "INSERT INTO sessions (session_id, machine_id, project, cwd, online, last_seen, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
         s.session_id,
@@ -491,7 +502,8 @@ export class Hub extends DurableObject<Env> {
       );
     } else {
       this.sql.exec(
-        "UPDATE sessions SET project = ?, cwd = ?, online = 1, last_seen = ? WHERE session_id = ?",
+        "UPDATE sessions SET machine_id = ?, project = ?, cwd = ?, online = 1, last_seen = ? WHERE session_id = ?",
+        machineId,
         s.project,
         s.cwd ?? null,
         now,

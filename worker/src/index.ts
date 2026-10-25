@@ -148,7 +148,11 @@ async function handleAuth(request: Request, env: Env, url: URL): Promise<Respons
     }
     case "/auth/logout": {
       if (request.method !== "POST") return err(405, "use POST");
+      // Origin "null" (e.g. a form post under a no-referrer policy) is refused like any foreign origin.
       if (!sameOrigin(request, url)) return err(403, "bad origin");
+      if ((request.headers.get("accept") ?? "").includes("application/json")) {
+        return json({ ok: true }, 200, { "set-cookie": clearCookie(SESSION_COOKIE) });
+      }
       return redirect("/", [clearCookie(SESSION_COOKIE)]);
     }
     case "/auth/dev": {
@@ -276,11 +280,13 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     const pairing = env.PAIRING.get(env.PAIRING.idFromName(`pair:${code}`));
     const claim = await pairing.beginApprove();
     if (!claim.ok) return err(404, claim.error);
+    const machineId = randomToken(12);
+    let added = false;
     try {
-      const machineId = randomToken(12);
       const name = body.machine_name || claim.hostname;
       const token = await mintMachineToken(env.SESSION_SECRET, session.tid, machineId);
       const machine = await hubFor(env, session.tid).addMachine(machineId, name, await sha256Hex(token), session.email);
+      added = true;
       await pairing.complete(
         { t: "approved", token, machine_id: machineId, machine_name: name, account: session.email },
         session.tid,
@@ -288,6 +294,8 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       return json({ ok: true, machine });
     } catch (e) {
       console.error("approve failed", e);
+      // E.g. the code expired between beginApprove and complete: don't leave an orphan machine.
+      if (added) await hubFor(env, session.tid).removeUnclaimedMachine(machineId).catch(() => false);
       await pairing.abortApprove();
       return err(500, "approval failed");
     }

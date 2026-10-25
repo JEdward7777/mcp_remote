@@ -167,6 +167,40 @@ describe("daemon", () => {
     expect(hubSockets.length).toBe(3);
   });
 
+  it("resets the replaced streak after a long stable connection", { timeout: 15_000 }, async () => {
+    let exitCode = 0;
+    daemon = new Daemon({
+      config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
+      socket: join(dir, "d.sock"),
+      onFatal: (c) => (exitCode = c),
+      replacedDelayMs: 10,
+      stableAfterMs: 100,
+    });
+    // Every connection is replaced, but only after living longer than stableAfterMs.
+    wss.on("connection", (ws) => setTimeout(() => ws.close(4002, "replaced"), 150));
+    await daemon.start();
+    await waitFor(() => hubSockets.length >= 5, "5 connections", 8_000);
+    expect(exitCode).toBe(0);
+  });
+
+  it("remembers a refused session, fails its sends clearly, and retries on resync", async () => {
+    await startDaemon().start();
+    await waitFor(() => hubSockets.length === 1, "connect");
+    const a = await shim("taken");
+    await waitFor(() => hubFrames.find((f) => f.t === "session_up"), "session_up");
+    hubSockets[0]!.send(JSON.stringify({ t: "error", error: "already used by another computer", session_id: "taken" }));
+    await waitFor(() => a.frames.find((f) => f.t === "error"), "error at shim");
+    a.conn.send({ t: "send", req_id: "q1", text: "hi", urgency: "normal" });
+    const se = await waitFor(() => a.frames.find((f) => f.t === "send_error"), "send_error");
+    expect(se.error).toMatch(/refused this session: already used by another computer/);
+    expect(hubFrames.find((f) => f.t === "send")).toBeUndefined();
+    hubSockets[0]!.send(JSON.stringify({ t: "resync" }));
+    await waitFor(() => hubFrames.filter((f) => f.t === "hello").length === 2, "hello after resync");
+    expect(hubFrames.filter((f) => f.t === "hello")[1].sessions[0].session_id).toBe("taken");
+    a.conn.send({ t: "send", req_id: "q2", text: "hi again", urgency: "normal" });
+    await waitFor(() => a.frames.find((f) => f.t === "sent" && f.req_id === "q2"), "sent after resync");
+  });
+
   it("forwards a per-session server error to that shim", async () => {
     await startDaemon().start();
     await waitFor(() => hubSockets.length === 1, "connect");
