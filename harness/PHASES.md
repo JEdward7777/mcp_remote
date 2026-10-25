@@ -5,7 +5,8 @@
 - [ ] Phase 1: Local stdio MCP server + WebSocket link to Worker
 - [ ] Phase 2: Push (server-initiated) messages from agent to user
 - [ ] Phase 3: Cloudflare Worker with OAuth + Hub Durable Object (verify free-tier limits first)
-- [ ] Phase 4: Phone web page (chat, GPS, map links, Web Push)
+- [ ] Phase 4: Phone PWA (favicon/icons, chat, GPS, map links, Web Push)
+- [ ] Phase 4b: Onboarding (sign-up cap/waitlist, invite links, one-line daemon install) + owner /admin usage page and alerts
 - [ ] Phase 5: Multi-project support and second agent backend
 
 ## Completed

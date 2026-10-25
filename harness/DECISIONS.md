@@ -35,6 +35,15 @@
   Pairing codes are approved by a signed-in user and mint a machine token bound to that user's `sub`; the Worker
   routes a token only to its own Hub. No code path lists or reads across Hubs. Owner allowlist (D7) becomes a
   sign-up allowlist / invite list. Note: all users share the deployer's free-tier quota.
-- D10 (proposed) Growth path: invite-only sign-up at launch (open-signup switch exists but off). Each tenant record
+- D10 (proposed, amended by D12) Growth path: sign-up gating per D12. Each tenant record
   carries a `plan` field and per-tenant rate limits enforced in its Hub, so one user can't exhaust the shared free quota.
   If it gets popular: move to Workers Paid and add billing (e.g. Stripe) keyed on `plan`. No billing code until needed.
+- D11 (accepted) Phone = Android. Page is an installable PWA (manifest, service worker, Web Push) with a real favicon
+  and app icon set (favicon.svg/.ico, 192/512 PNG, maskable).
+- D12 (proposed) Low-friction onboarding: open sign-up with Google, auto-approved until a configurable user cap, then
+  a waitlist (owner approves with one tap). Shareable invite links skip the waitlist. After sign-in the page shows one
+  copy-paste install line for the daemon with the pairing code pre-filled; the daemon installs itself as a user service.
+- D13 (proposed) Popularity/usage monitoring: a global Registry (D1 or a single Durable Object) holds ONLY tenant
+  metadata and counters (sign-ups, daily active users, requests per tenant), never message content; this is the one
+  sanctioned cross-tenant store (refines D9). Owner-only /admin page in the PWA. Web Push to the owner when daily usage
+  passes thresholds (e.g. 50% / 80% of free quota) or sign-ups spike.
