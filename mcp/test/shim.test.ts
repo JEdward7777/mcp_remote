@@ -49,12 +49,12 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function startShim(sessionId: string): Promise<Client> {
+async function startShim(sessionId: string, extraEnv: Record<string, string> = {}): Promise<Client> {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [CLI, "shim"],
     cwd: dir,
-    env: { ...process.env, MCP_REMOTE_SOCKET: join(dir, "d.sock"), MCP_REMOTE_SESSION_ID: sessionId } as Record<string, string>,
+    env: { ...process.env, MCP_REMOTE_SOCKET: join(dir, "d.sock"), MCP_REMOTE_SESSION_ID: sessionId, ...extraEnv } as Record<string, string>,
     stderr: "pipe",
   });
   const c = new Client({ name: "test", version: "0" }, { capabilities: {} });
@@ -64,6 +64,13 @@ async function startShim(sessionId: string): Promise<Client> {
 }
 
 describe("shim", () => {
+  it("names the session after CLAUDE_PROJECT_DIR when set", async () => {
+    await startShim("proj-id", { CLAUDE_PROJECT_DIR: "/some/where/my-project" });
+    for (let i = 0; i < 50 && !hubFrames.find((f) => f.t === "session_up"); i++) await sleep(100);
+    const up = hubFrames.find((f) => f.t === "session_up");
+    expect(up.session).toMatchObject({ session_id: "proj-id", project: "my-project", cwd: "/some/where/my-project" });
+  }, 20_000);
+
   it("reports the daemon's refusal (duplicate session id) from send_message instead of 'daemon not running'", async () => {
     const first = await startShim("same-id");
     const ok = async () => !(await first.callTool({ name: "send_message", arguments: { text: "hi" } })).isError;

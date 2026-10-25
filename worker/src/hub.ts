@@ -90,12 +90,15 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(session_id, direction, delivered);
+CREATE INDEX IF NOT EXISTS messages_dir ON messages(session_id, direction, id);
 `;
 
 /** Max messages per deliver frame (keeps the daemon's ack under DO SQLite's bound-parameter cap too). */
 export const DELIVER_MAX_MESSAGES = 90;
 /** Sessions kept per machine; beyond this the oldest offline ones (and their history) are evicted. */
 export const MAX_STORED_SESSIONS_PER_MACHINE = 50;
+/** Messages kept per session; older ones are trimmed on insert (bounds storage and rows read). */
+export const MAX_HISTORY_PER_SESSION = 1000;
 
 /** Byte budget for one deliver frame (must fit MAX_FRAME_BYTES once wrapped for IPC). */
 const DELIVER_BYTES = MAX_FRAME_BYTES - 4096;
@@ -366,6 +369,7 @@ export class Hub extends DurableObject<Env> {
             now,
           )
           .one();
+        this.trimHistory(row.session_id);
         const msg = toMessage(row);
         this.broadcastPhones({ t: "message", message: msg, client_id: f.client_id });
         // Deliver now if the session is live; otherwise it waits for session_up/hello.
@@ -445,6 +449,7 @@ export class Hub extends DurableObject<Env> {
           )
           .one();
         this.sql.exec("UPDATE sessions SET last_seen = ? WHERE session_id = ?", now, f.session_id);
+        this.trimHistory(row.session_id);
         const msg = toMessage(row);
         this.sendDaemon(ws, { t: "sent", req_id: f.req_id, message_id: msg.id });
         this.broadcastPhones({ t: "message", message: msg });
@@ -467,6 +472,17 @@ export class Hub extends DurableObject<Env> {
         return;
       }
     }
+  }
+
+  /** Keep only the newest MAX_HISTORY_PER_SESSION messages of a session (index range delete). */
+  private trimHistory(sessionId: string): void {
+    this.sql.exec(
+      `DELETE FROM messages WHERE session_id = ? AND id <= (
+         SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)`,
+      sessionId,
+      sessionId,
+      MAX_HISTORY_PER_SESSION,
+    );
   }
 
   private upsertSession(machineId: string, s: SessionAnnounce, now: number): string | null {
@@ -520,7 +536,7 @@ export class Hub extends DurableObject<Env> {
     const victims = this.sql
       .exec<{ session_id: string }>(
         `SELECT s.session_id FROM sessions s WHERE s.machine_id = ? AND s.online = 0
-         ORDER BY MAX(s.last_seen, COALESCE((SELECT MAX(created_at) FROM messages m WHERE m.session_id = s.session_id), 0)) ASC
+         ORDER BY MAX(s.last_seen, COALESCE((SELECT created_at FROM messages m WHERE m.session_id = s.session_id ORDER BY id DESC LIMIT 1), 0)) ASC
          LIMIT MAX(0, (SELECT COUNT(*) FROM sessions WHERE machine_id = ?) - ?)`,
         machineId,
         machineId,
@@ -646,7 +662,7 @@ export class Hub extends DurableObject<Env> {
     return this.sql
       .exec<Row>(
         `SELECT s.*,
-           (SELECT MAX(created_at) FROM messages m WHERE m.session_id = s.session_id) AS last_message_at,
+           (SELECT created_at FROM messages m WHERE m.session_id = s.session_id ORDER BY id DESC LIMIT 1) AS last_message_at,
            (SELECT urgency FROM messages m WHERE m.session_id = s.session_id AND m.direction = 'out' ORDER BY id DESC LIMIT 1) AS last_urgency,
            (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.session_id AND m.direction = 'in' AND m.delivered = 0) AS pending_in
          FROM sessions s ORDER BY s.machine_id, s.project, s.created_at`,

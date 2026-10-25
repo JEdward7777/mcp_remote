@@ -1,5 +1,5 @@
 // Integration tests that run inside workerd via @cloudflare/vitest-plugin.
-import { SELF, env, evictDurableObject, runDurableObjectAlarm } from "cloudflare:test";
+import { SELF, env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { makeSessionCookieValue, mintMachineToken, tenantIdForDev } from "../src/auth";
 import { sha256Hex } from "../src/crypto";
@@ -554,5 +554,43 @@ describe("review round 3", () => {
     }
     await waitFor(() => db.frames.find((f) => f.t === "resync"), "resync to other daemon");
     expect(da.frames.find((f) => f.t === "resync")).toBeUndefined();
+  });
+});
+
+describe("review round 5", () => {
+  it("caps history per session and keeps session list fields correct", async () => {
+    const { token } = await newMachine("zed");
+    const d = await daemon(token);
+    d.send({ t: "hello", v: 1, sessions: [{ session_id: "zh", project: "p" }] });
+    for (let i = 0; i < 1005; i++) d.send({ t: "send", req_id: `r${i}`, session_id: "zh", text: `n${i}`, urgency: i === 1004 ? "urgent" : "silent" });
+    await waitFor(() => d.frames.filter((f) => f.t === "sent").length === 1005, "1005 sent", 15_000);
+    const p = await phone("zed");
+    const st = await waitFor(() => last(p, "state"), "state");
+    expect(st.sessions[0].last_urgency).toBe("urgent");
+    expect(st.sessions[0].last_message_at).toBeGreaterThan(0);
+    const count = await runInDurableObject(E.HUB.get(E.HUB.idFromName(tenantIdForDev("zed"))), (_i, state) =>
+      state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages WHERE session_id = 'zh'").one().n,
+    );
+    expect(count).toBe(1000);
+    p.send({ t: "history", session_id: "zh" });
+    const h = await waitFor(() => p.frames.find((f) => f.t === "history"), "history");
+    expect(h.messages[h.messages.length - 1].text).toBe("n1004");
+  }, 30_000);
+
+  it("uses indexes for the session-list subqueries", async () => {
+    const plan = await runInDurableObject(E.HUB.get(E.HUB.idFromName(tenantIdForDev("plan"))), (_i, state) =>
+      state.storage.sql
+        .exec<{ detail: string }>(
+          `EXPLAIN QUERY PLAN SELECT
+             (SELECT created_at FROM messages m WHERE m.session_id = 'x' ORDER BY id DESC LIMIT 1),
+             (SELECT urgency FROM messages m WHERE m.session_id = 'x' AND m.direction = 'out' ORDER BY id DESC LIMIT 1),
+             (SELECT COUNT(*) FROM messages m WHERE m.session_id = 'x' AND m.direction = 'in' AND m.delivered = 0)`,
+        )
+        .toArray()
+        .map((r) => r.detail),
+    );
+    const scans = plan.filter((d) => /SCAN m\b/.test(d) && !/USING/.test(d));
+    expect(scans).toEqual([]);
+    expect(plan.filter((d) => /SEARCH m USING (COVERING )?INDEX/.test(d)).length).toBe(3);
   });
 });

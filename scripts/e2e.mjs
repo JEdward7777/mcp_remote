@@ -127,7 +127,8 @@ async function startShim(name, configDir, sessionId, cwd) {
     command: process.execPath,
     args: [CLI, "shim"],
     cwd,
-    env: { ...process.env, MCP_REMOTE_CONFIG_DIR: configDir, MCP_REMOTE_SESSION_ID: sessionId },
+    // Drop CLAUDE_PROJECT_DIR (set when run from inside Claude Code) so the project name comes from cwd.
+    env: { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "CLAUDE_PROJECT_DIR")), MCP_REMOTE_CONFIG_DIR: configDir, MCP_REMOTE_SESSION_ID: sessionId },
     stderr: "pipe",
   });
   const shim = { name, notifications: [], stderr: "" };

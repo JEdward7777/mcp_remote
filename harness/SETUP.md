@@ -122,8 +122,11 @@ Keep it running (Phase 2 will install it as a user service). Until then, e.g. a 
 Description=mcp-remote daemon
 
 [Service]
-# Adjust the path to the output of `which mcp-remote`.
-ExecStart=%h/.npm-global/bin/mcp-remote daemon
+# systemd runs units with a minimal PATH, so `mcp-remote` (a `#!/usr/bin/env node` script) fails with
+# exit 127 when node comes from nvm/fnm/volta. Use absolute paths to node and to the CLI script:
+#   node:  `which node`                     e.g. /home/you/.nvm/versions/node/v22.22.0/bin/node
+#   CLI:   `readlink -f "$(which mcp-remote)"`  e.g. .../lib/node_modules/mcp-remote/dist/cli.js
+ExecStart=/ABSOLUTE/PATH/TO/node /ABSOLUTE/PATH/TO/mcp-remote/dist/cli.js daemon
 Restart=on-failure
 RestartSec=10
 # 3 = revoked / account no longer allowed, 4 = token in use by another computer: restarting can't help.
@@ -133,7 +136,9 @@ RestartPreventExitStatus=3 4
 WantedBy=default.target
 ```
 
-`systemctl --user enable --now mcp-remote`. The daemon exits on purpose, and must not be restarted, with code 3 if the
+Replace both placeholder paths (if you upgrade node via nvm, update the node path too), then
+`systemctl --user daemon-reload && systemctl --user enable --now mcp-remote`; check with
+`journalctl --user -u mcp-remote -f`. The daemon exits on purpose, and must not be restarted, with code 3 if the
 machine is revoked or the account is no longer allowed (pair again), and with code 4 if another computer is running
 a daemon with the same token (e.g. a copied `~/.config/mcp-remote`: pair each computer separately, never copy
 `config.json`). `RestartPreventExitStatus=3 4` keeps systemd from restarting it in those cases; any other
@@ -154,15 +159,20 @@ Per project, `.mcp.json` in the project root:
 
 or once for all projects: `claude mcp add --scope user mcp-remote -- mcp-remote shim`.
 
-Each shim registers a session named after the project folder (basename of the cwd) with a random session id.
+Each shim registers a session named after the project folder (basename of `CLAUDE_PROJECT_DIR`, which Claude Code sets, else of the cwd) with a random session id.
 To keep a stable id (and thread) across restarts, set `MCP_REMOTE_SESSION_ID` **per project and per computer**,
 never in a committed `.mcp.json` and never at user scope (user scope would give every project on the computer the
 same id). Run this once inside each project, using `<computer>-<project>` as the id:
 
 ```sh
 cd ~/code/myproject
-claude mcp add --scope local -e MCP_REMOTE_SESSION_ID=laptop-myproject mcp-remote -- mcp-remote shim
+claude mcp add -e MCP_REMOTE_SESSION_ID=laptop-myproject --scope local mcp-remote -- mcp-remote shim
 ```
+
+Argument order matters: `-e` takes any number of `KEY=value` values, so anything right after it is read as another
+variable. Put another option (here `--scope local`) between `-e ...` and the server name, or put the name first
+(`claude mcp add mcp-remote -e MCP_REMOTE_SESSION_ID=... --scope local -- mcp-remote shim`). Writing
+`--scope local -e MCP_REMOTE_SESSION_ID=... mcp-remote -- ...` fails with "Invalid environment variable format".
 
 (`--scope local` is private to you and this project directory.) Only **one live session** can use an id at a time:
 a second concurrent Claude Code session in the same project with the same id is refused by the daemon, and its
@@ -206,4 +216,19 @@ MCP_REMOTE_CONFIG_DIR=/tmp/mr-dev node mcp/dist/cli.js pair http://localhost:878
 MCP_REMOTE_CONFIG_DIR=/tmp/mr-dev node mcp/dist/cli.js daemon
 ```
 
-(Build the CLI first with `npm run build`.) `npm run e2e` runs the whole flow automatically.
+(Build the CLI first with `npm run build`.) The shim finds the daemon through the same config dir, so a shim for
+this dev daemon needs the same `MCP_REMOTE_CONFIG_DIR` (or `MCP_REMOTE_SOCKET=/tmp/mr-dev/daemon.sock`), e.g. in a
+test project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "mcp-remote": {
+      "command": "node",
+      "args": ["/path/to/mcp_remote/mcp/dist/cli.js", "shim"],
+      "env": { "MCP_REMOTE_CONFIG_DIR": "/tmp/mr-dev" }
+    }
+  }
+}
+```
+ `npm run e2e` runs the whole flow automatically.

@@ -51,7 +51,9 @@ export interface ShimOptions {
 }
 
 export async function runShim(opts: ShimOptions = {}): Promise<void> {
-  const cwd = opts.cwd ?? process.cwd();
+  // Claude Code sets CLAUDE_PROJECT_DIR for MCP servers; it is the project root even if the
+  // server was started from a subdirectory.
+  const cwd = opts.cwd ?? (process.env.CLAUDE_PROJECT_DIR || process.cwd());
   const project = basename(cwd) || cwd;
   const sid = opts.sessionId ?? process.env.MCP_REMOTE_SESSION_ID ?? randomUUID();
   const parsedSid = SessionId.safeParse(sid);
@@ -181,7 +183,9 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
       },
       (error) => log("bad frame from daemon:", error),
     );
+    let connected = false;
     sock.once("connect", () => {
+      connected = true;
       conn = c;
       c.send({
         t: "register",
@@ -199,6 +203,8 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
       hubConnected = false;
       failAll("lost connection to the local mcp-remote daemon");
       if (stopping) return;
+      // Could not even connect (daemon gone/restarting): the old refusal no longer applies.
+      if (!connected) registerRefused = null;
       if (registerRefused) {
         // A refusal won't fix itself quickly (e.g. the other session must end first): retry slowly.
         const slow = backoffDelay(refusedAttempt++, { baseMs: 30_000, capMs: 600_000, minMs: 15_000 });
