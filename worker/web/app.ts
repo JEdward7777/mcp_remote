@@ -266,6 +266,17 @@ function renderThread(sid: string): HTMLElement {
     h("strong", {}, s ? s.project : sid),
     h("span", { class: "muted" }, s ? ` on ${machineName(s.machine_id)}` : ""),
   );
+  if (s && !s.online) {
+    const forget = h("button", { class: "danger small" }, "Forget");
+    forget.onclick = () => {
+      if (!confirm(`Forget offline session ${s.project} (${s.session_id.slice(0, 8)}) and its history?`)) return;
+      if (send({ t: "forget_session", session_id: sid })) {
+        state.threads.delete(sid);
+        location.hash = "#/";
+      }
+    };
+    header.append(forget);
+  }
   root.append(header);
   if (s?.cwd) root.append(h("div", { class: "cwd muted" }, s.cwd));
   const list = h("div", { class: "messages", id: "messages" });

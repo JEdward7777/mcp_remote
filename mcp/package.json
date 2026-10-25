@@ -15,7 +15,8 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepack": "node build.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

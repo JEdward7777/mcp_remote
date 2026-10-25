@@ -52,6 +52,7 @@ a.session:active { background: var(--card); }
 .compose textarea { flex: 1; resize: none; font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
 button, .button { font: inherit; background: var(--accent); color: #fff; border: 0; border-radius: 10px; padding: 8px 14px; text-decoration: none; display: inline-block; cursor: pointer; }
 button.danger { background: none; color: var(--urgent); border: 1px solid var(--urgent); }
+button.small { padding: 4px 10px; font-size: 13px; margin-left: auto; }
 .machines { padding: 0 0 24px; }
 .machines h2 { font-size: 16px; margin: 18px 16px 8px; }
 form.pair { display: flex; flex-direction: column; gap: 8px; padding: 0 16px 8px; }

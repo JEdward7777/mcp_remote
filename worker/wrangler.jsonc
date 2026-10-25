@@ -25,11 +25,10 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Hub", "Pairing"] }
   ],
+  // Non-secret settings. GOOGLE_CLIENT_ID and ALLOWED_EMAILS are set with `wrangler secret put`
+  // (see harness/SETUP.md) so personal data stays out of the repo; don't also list them here.
   "vars": {
-    // Fill in after creating the Google OAuth client (see harness/SETUP.md).
-    "GOOGLE_CLIENT_ID": "",
-    // Comma-separated sign-up allowlist; ignored when OPEN_SIGNUP is "true".
-    "ALLOWED_EMAILS": "",
+    // "true" lets any verified Google account sign up; otherwise only ALLOWED_EMAILS can.
     "OPEN_SIGNUP": "false"
   },
   "observability": { "enabled": true }

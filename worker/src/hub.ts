@@ -15,6 +15,7 @@ import {
   SessionAnnounce,
   SessionRecord,
   Urgency,
+  byteLength,
   parseFrame,
 } from "@mcp-remote/shared";
 import { timingSafeEqual } from "./crypto";
@@ -89,6 +90,39 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(session_id, direction, delivered);
 `;
+
+/** Byte budget for one deliver frame (must fit MAX_FRAME_BYTES once wrapped for IPC). */
+const DELIVER_BYTES = MAX_FRAME_BYTES - 4096;
+/** Byte budget for one history frame to the phone. */
+const HISTORY_BYTES = 512 * 1024;
+
+function msgBytes(m: MessageRecord): number {
+  return byteLength(JSON.stringify(m)) + 1;
+}
+
+/** Leading items whose encoded size fits the budget (always at least one). */
+export function takeWithinBudget(items: MessageRecord[], budget: number): MessageRecord[] {
+  const out: MessageRecord[] = [];
+  let used = 0;
+  for (const m of items) {
+    const b = msgBytes(m);
+    if (out.length && used + b > budget) break;
+    out.push(m);
+    used += b;
+  }
+  return out;
+}
+
+export function chunkWithinBudget(items: MessageRecord[], budget: number): MessageRecord[][] {
+  const out: MessageRecord[][] = [];
+  let rest = items;
+  while (rest.length) {
+    const head = takeWithinBudget(rest, budget);
+    out.push(head);
+    rest = rest.slice(head.length);
+  }
+  return out;
+}
 
 function toMessage(r: MessageRow): MessageRecord {
   const u = Urgency.safeParse(r.urgency);
@@ -270,9 +304,10 @@ export class Hub extends DurableObject<Env> {
             HISTORY_PAGE + 1,
           )
           .toArray();
-        const has_more = rows.length > HISTORY_PAGE;
-        const messages = rows.slice(0, HISTORY_PAGE).reverse().map(toMessage);
-        this.sendPhone(ws, { t: "history", session_id: f.session_id, messages, has_more });
+        // Newest first; stop at the page size or the byte budget, whichever comes first.
+        const page = takeWithinBudget(rows.slice(0, HISTORY_PAGE).map(toMessage), HISTORY_BYTES);
+        const has_more = rows.length > page.length;
+        this.sendPhone(ws, { t: "history", session_id: f.session_id, messages: page.reverse(), has_more });
         return;
       }
       case "send": {
@@ -426,11 +461,14 @@ export class Hub extends DurableObject<Env> {
     if (!s || s.machine_id !== machineId || s.online !== 1) return;
     const rows = this.sql
       .exec<MessageRow>(
-        "SELECT * FROM messages WHERE session_id = ? AND direction = 'in' AND delivered = 0 ORDER BY id LIMIT 500",
+        "SELECT * FROM messages WHERE session_id = ? AND direction = 'in' AND delivered = 0 ORDER BY id LIMIT 2000",
         sessionId,
       )
       .toArray();
-    if (rows.length) this.sendDaemon(ws, { t: "deliver", session_id: sessionId, messages: rows.map(toMessage) });
+    // Several frames if needed: each must fit the daemon -> shim IPC frame limit.
+    for (const batch of chunkWithinBudget(rows.map(toMessage), DELIVER_BYTES)) {
+      this.sendDaemon(ws, { t: "deliver", session_id: sessionId, messages: batch });
+    }
   }
 
   private onSocketGone(ws: WebSocket): void {

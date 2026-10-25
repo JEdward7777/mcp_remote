@@ -17,9 +17,11 @@
     "e2e": "npm run build && node scripts/e2e.mjs"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@types/node": "^22.19.0",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.3",
     "vitest": "^4.1.12",
-    "esbuild": "^0.28.2"
+    "ws": "^8.22.0"
   }
 }
