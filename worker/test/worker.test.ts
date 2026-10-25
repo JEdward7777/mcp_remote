@@ -1,5 +1,5 @@
 // Integration tests that run inside workerd via @cloudflare/vitest-plugin.
-import { SELF, env, evictDurableObject } from "cloudflare:test";
+import { SELF, env, evictDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { makeSessionCookieValue, mintMachineToken, tenantIdForDev } from "../src/auth";
 import { sha256Hex } from "../src/crypto";
@@ -54,11 +54,15 @@ async function phone(user: string): Promise<Sock> {
   return s;
 }
 
-async function newMachine(user: string, name = "box"): Promise<{ machineId: string; token: string }> {
-  const tid = tenantIdForDev(user);
+async function newMachine(
+  user: string,
+  name = "box",
+  tid = tenantIdForDev(user),
+  email?: string,
+): Promise<{ machineId: string; token: string }> {
   const machineId = `m${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
   const token = await mintMachineToken(E.SESSION_SECRET, tid, machineId);
-  await E.HUB.get(E.HUB.idFromName(tid)).addMachine(machineId, name, await sha256Hex(token));
+  await E.HUB.get(E.HUB.idFromName(tid)).addMachine(machineId, name, await sha256Hex(token), email);
   return { machineId, token };
 }
 
@@ -217,7 +221,8 @@ describe("hub", () => {
     const db = await daemon(b.token);
     db.send({ t: "session_up", session: { session_id: "shared", project: "p" } });
     const e = await waitFor(() => db.frames.find((f) => f.t === "error"), "error");
-    expect(e.error).toMatch(/another machine/);
+    expect(e.error).toMatch(/another online machine/);
+    expect(e.session_id).toBe("shared");
     db.send({ t: "send", req_id: "x", session_id: "shared", text: "spoof", urgency: "normal" });
     const e2 = await waitFor(() => db.frames.find((f) => f.t === "error" && f.req_id === "x"), "send error");
     expect(e2.error).toBe("unknown session");
@@ -327,5 +332,125 @@ describe("frame budgets", () => {
     for (const f of delivers) expect(new TextEncoder().encode(JSON.stringify(f)).byteLength).toBeLessThan(64 * 1024);
     const order = delivers.flatMap((f) => f.messages.map((m: any) => Number(m.text[0])));
     expect(order).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+  });
+});
+
+describe("review round 1", () => {
+  it("acks more than 100 queued messages (no SQL parameter overflow) in <=90-message frames", async () => {
+    const { token } = await newMachine("pete");
+    const d = await daemon(token);
+    d.send({ t: "hello", v: 1, sessions: [{ session_id: "pq", project: "p" }] });
+    const p = await phone("pete");
+    await waitFor(() => last(p, "state")?.sessions[0]?.online, "online");
+    d.send({ t: "session_down", session_id: "pq" });
+    await waitFor(() => last(p, "state")?.sessions[0]?.online === false, "offline");
+    for (let i = 0; i < 150; i++) p.send({ t: "send", session_id: "pq", text: `m${i}` });
+    await waitFor(() => p.frames.filter((f) => f.t === "message").length === 150, "150 stored", 10_000);
+    d.send({ t: "session_up", session: { session_id: "pq", project: "p" } });
+    const delivers = await waitFor(() => {
+      const ds = d.frames.filter((f) => f.t === "deliver");
+      return ds.reduce((n, f) => n + f.messages.length, 0) === 150 ? ds : null;
+    }, "150 delivered");
+    for (const f of delivers) expect(f.messages.length).toBeLessThanOrEqual(90);
+    const ids = delivers.flatMap((f) => f.messages.map((m: any) => m.id));
+    // One ack with every id (the protocol allows up to 500).
+    d.send({ t: "ack", session_id: "pq", ids });
+    await waitFor(() => p.frames.filter((f) => f.t === "delivered").reduce((n, f) => n + f.ids.length, 0) === 150, "all acked");
+    p.send({ t: "refresh" });
+    await sleep(50);
+    expect(last(p, "state").sessions[0].pending_in).toBe(0);
+    // Reconnect: nothing is redelivered.
+    d.frames.length = 0;
+    d.send({ t: "session_down", session_id: "pq" });
+    d.send({ t: "session_up", session: { session_id: "pq", project: "p" } });
+    await sleep(100);
+    expect(d.frames.find((f) => f.t === "deliver")).toBeUndefined();
+  });
+
+  it("lets a re-paired machine take over a session id from a revoked machine, keeping history", async () => {
+    const a = await newMachine("quin", "old");
+    const da = await daemon(a.token);
+    da.send({ t: "hello", v: 1, sessions: [{ session_id: "fixed-id", project: "p" }] });
+    da.send({ t: "send", req_id: "r", session_id: "fixed-id", text: "old history", urgency: "normal" });
+    await waitFor(() => da.frames.find((f) => f.t === "sent"), "sent");
+    const rv = await SELF.fetch(`${ORIGIN}/api/machines/${a.machineId}`, {
+      method: "DELETE",
+      headers: { cookie: await cookieFor("quin"), origin: ORIGIN },
+    });
+    expect(rv.status).toBe(200);
+    const b = await newMachine("quin", "new");
+    const db = await daemon(b.token);
+    db.send({ t: "hello", v: 1, sessions: [{ session_id: "fixed-id", project: "p" }] });
+    const p = await phone("quin");
+    await waitFor(() => last(p, "state")?.sessions.find((s: any) => s.session_id === "fixed-id" && s.online && s.machine_id === b.machineId), "taken over");
+    expect(db.frames.find((f) => f.t === "error")).toBeUndefined();
+    p.send({ t: "history", session_id: "fixed-id" });
+    const hist = await waitFor(() => p.frames.find((f) => f.t === "history"), "history");
+    expect(hist.messages.map((m: any) => m.text)).toEqual(["old history"]);
+  });
+
+  it("rejects phone messages to sessions of a revoked machine", async () => {
+    const a = await newMachine("rita");
+    const d = await daemon(a.token);
+    d.send({ t: "hello", v: 1, sessions: [{ session_id: "rs", project: "p" }] });
+    await sleep(50);
+    await SELF.fetch(`${ORIGIN}/api/machines/${a.machineId}`, {
+      method: "DELETE",
+      headers: { cookie: await cookieFor("rita"), origin: ORIGIN },
+    });
+    const p = await phone("rita");
+    p.send({ t: "send", session_id: "rs", text: "hello?" });
+    const e = await waitFor(() => p.frames.find((f) => f.t === "error"), "error");
+    expect(e.error).toMatch(/revoked/);
+    expect(p.frames.find((f) => f.t === "message")).toBeUndefined();
+  });
+
+  it("caps stored sessions per machine by evicting the oldest offline ones", async () => {
+    const { token } = await newMachine("sam");
+    const d = await daemon(token);
+    d.send({ t: "hello", v: 1, sessions: [] });
+    for (let i = 0; i < 60; i++) {
+      d.send({ t: "session_up", session: { session_id: `s${i}`, project: "p" } });
+      d.send({ t: "session_down", session_id: `s${i}` });
+    }
+    const p = await phone("sam");
+    await waitFor(
+      () => last(p, "state")?.sessions.some((s: any) => s.session_id === "s59" && !s.online),
+      "all 60 processed",
+    );
+    const ids = last(p, "state").sessions.map((s: any) => s.session_id);
+    expect(ids.length).toBe(50);
+    expect(ids).toContain("s59");
+    expect(ids).not.toContain("s0");
+  });
+
+  it("re-checks ALLOWED_EMAILS for cookies and machine tokens", async () => {
+    const mk = async (email: string) =>
+      `__Host-mr_session=${await makeSessionCookieValue(E.SESSION_SECRET, { tid: "g-1001", email })}`;
+    expect((await SELF.fetch(`${ORIGIN}/api/me`, { headers: { cookie: await mk("allowed@example.com") } })).status).toBe(200);
+    expect((await SELF.fetch(`${ORIGIN}/api/me`, { headers: { cookie: await mk("removed@example.com") } })).status).toBe(401);
+    const ok = await newMachine("x", "m", "g-2001", "allowed@example.com");
+    expect(typeof (await connect("/api/daemon/ws", { authorization: `Bearer ${ok.token}` }))).toBe("object");
+    const gone = await newMachine("x", "m", "g-2002", "removed@example.com");
+    expect(await connect("/api/daemon/ws", { authorization: `Bearer ${gone.token}` })).toBe(403);
+  });
+
+  it("removes the machine of an approved pairing whose token is never claimed", async () => {
+    const start = (await (
+      await SELF.fetch(`${ORIGIN}/api/pair/start`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })
+    ).json()) as { code: string };
+    const cookie = await cookieFor("tina");
+    const ap = await SELF.fetch(`${ORIGIN}/api/pair/approve`, {
+      method: "POST",
+      headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
+      body: JSON.stringify({ code: start.code }),
+    });
+    expect(ap.status).toBe(200);
+    const list = async () =>
+      ((await (await SELF.fetch(`${ORIGIN}/api/machines`, { headers: { cookie } })).json()) as { machines: unknown[] }).machines;
+    expect((await list()).length).toBe(1);
+    const stub = E.PAIRING.get(E.PAIRING.idFromName(`pair:${start.code.replace("-", "")}`));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect((await list()).length).toBe(0);
   });
 });

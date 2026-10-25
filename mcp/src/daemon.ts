@@ -18,6 +18,13 @@ import { LineConn } from "./ipc";
 import { log } from "./log";
 
 export const EXIT_REVOKED = 3;
+/** Another daemon keeps taking over this machine's connection (same token on two computers). */
+export const EXIT_DUPLICATE = 4;
+/** After this many consecutive "replaced" closes, give up instead of fighting forever. */
+const MAX_REPLACED_STREAK = 3;
+const REPLACED_DELAY_MS = 30_000;
+/** A connection that lived this long without being replaced resets the streak. */
+const STABLE_AFTER_MS = 5 * 60_000;
 const PING_EVERY_MS = 30_000;
 const DEAD_AFTER_MS = 75_000;
 const SEND_TIMEOUT_MS = 15_000;
@@ -36,8 +43,10 @@ interface PendingSend {
 export interface DaemonOptions {
   config: Config;
   socket?: string;
-  /** Called instead of process.exit when the Hub says this machine is revoked. */
-  onRevoked?: () => void;
+  /** Called instead of process.exit when the daemon must stop (revoked, duplicate). */
+  onFatal?: (exitCode: number) => void;
+  /** Base delay after being replaced by another daemon (tests shorten it). */
+  replacedDelayMs?: number;
 }
 
 export class Daemon {
@@ -50,6 +59,8 @@ export class Daemon {
   private reconnectTimer: NodeJS.Timeout | undefined;
   private pingTimer: NodeJS.Timeout | undefined;
   private lastRx = 0;
+  private replacedStreak = 0;
+  private openedAt = 0;
   private server: Server | null = null;
   private stopped = false;
   readonly socket: string;
@@ -178,6 +189,12 @@ export class Daemon {
     for (const s of this.shims.values()) s.conn.send(frame);
   }
 
+  private fatal(exitCode: number): void {
+    this.stop();
+    if (this.opts.onFatal) this.opts.onFatal(exitCode);
+    else process.exit(exitCode);
+  }
+
   // -------------------------------------------------------------------------
   // Hub link
 
@@ -201,6 +218,9 @@ export class Daemon {
       if (res.statusCode === 401) {
         revoked = true;
         log("server rejected this machine's token (revoked or unknown). Run `mcp-remote pair` again.");
+      } else if (res.statusCode === 403) {
+        revoked = true;
+        log("server says this account is no longer allowed to sign in (removed from the sign-up list).");
       } else {
         log(`server refused websocket: HTTP ${res.statusCode}`);
       }
@@ -208,7 +228,9 @@ export class Daemon {
       ws.terminate();
     });
     ws.on("open", () => {
-      this.attempt = 0;
+      // Keep backing off while another daemon keeps replacing us.
+      if (this.replacedStreak === 0) this.attempt = 0;
+      this.openedAt = Date.now();
       this.hubReady = true;
       this.lastRx = Date.now();
       log(`connected to ${this.opts.config.url}`);
@@ -264,6 +286,12 @@ export class Daemon {
               return;
             }
           }
+          if (f.session_id) {
+            // e.g. a refused session_up: tell that shim so it shows up in Claude Code's MCP logs.
+            this.shims.get(f.session_id)?.conn.send({ t: "error", error: `server refused this session: ${f.error}` } satisfies DaemonToShim);
+            log(`server refused session ${f.session_id}: ${f.error}`);
+            return;
+          }
           log("server error:", f.error);
           return;
         }
@@ -287,14 +315,27 @@ export class Daemon {
       if (wasReady) this.broadcastShims({ t: "hub_status", connected: false });
       if (code === 4001) revoked = true;
       if (revoked) {
-        log("this machine was revoked; daemon exiting. Pair again with `mcp-remote pair <url>`.");
-        this.stop();
-        if (this.opts.onRevoked) this.opts.onRevoked();
-        else process.exit(EXIT_REVOKED);
+        log("this machine can no longer connect; daemon exiting. Pair again with `mcp-remote pair <url>`.");
+        this.fatal(EXIT_REVOKED);
         return;
       }
       if (this.stopped) return;
-      const delay = backoffDelay(this.attempt++, { baseMs: 1000, capMs: 60_000 });
+      let delay: number;
+      if (code === 4002) {
+        this.replacedStreak++;
+        if (this.replacedStreak >= MAX_REPLACED_STREAK) {
+          log(
+            "another mcp-remote daemon is using this machine's token (config copied to another computer or VM?) " +
+              "and keeps replacing this connection. Exiting. Run `mcp-remote pair <url>` on each computer so each has its own token.",
+          );
+          this.fatal(EXIT_DUPLICATE);
+          return;
+        }
+        delay = (this.opts.replacedDelayMs ?? REPLACED_DELAY_MS) * this.replacedStreak + backoffDelay(this.attempt++, { baseMs: 1000, capMs: 60_000 });
+      } else {
+        if (this.openedAt && Date.now() - this.openedAt > STABLE_AFTER_MS) this.replacedStreak = 0;
+        delay = backoffDelay(this.attempt++, { baseMs: 1000, capMs: 60_000 });
+      }
       log(`disconnected (${code}${reason.length ? " " + reason.toString() : ""}); retrying in ${Math.round(delay / 1000)}s`);
       this.reconnectTimer = setTimeout(() => this.connectHub(), delay);
     });

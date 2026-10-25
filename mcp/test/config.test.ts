@@ -40,6 +40,17 @@ describe("config", () => {
   });
 });
 
+describe("ensureConfigDir", () => {
+  it("does not chmod a pre-existing directory", async () => {
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(dir, { mode: 0o755 });
+    chmodSync(dir, 0o755);
+    saveConfig({ url: "https://x.example", token: "mrm1.aaaa.bbbb.cccc.dddd", machine_id: "m1" });
+    expect(statSync(dir).mode & 0o777).toBe(0o755);
+    expect(statSync(configPath()).mode & 0o777).toBe(0o600);
+  });
+});
+
 describe("urls", () => {
   it("requires https except for localhost", () => {
     expect(normalizeWorkerUrl("https://a.b.workers.dev/some/path")).toBe("https://a.b.workers.dev");

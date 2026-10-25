@@ -145,6 +145,22 @@ export async function exchangeCode(opts: {
   return { id_token: j.id_token };
 }
 
+/**
+ * Re-check gating for an existing tenant (cookie or machine token), so removing an email from
+ * ALLOWED_EMAILS takes effect without waiting for the 30-day cookie to expire. Dev tenants
+ * (only mintable with DEV_AUTH) are not subject to the Google allowlist.
+ */
+export function accountAllowed(
+  tid: string,
+  email: string | null | undefined,
+  env: { ALLOWED_EMAILS?: string | undefined; OPEN_SIGNUP?: string | undefined },
+): boolean {
+  if (tid.startsWith("dev-")) return true;
+  if (env.OPEN_SIGNUP === "true") return true;
+  if (!email) return false;
+  return isAllowed({ email, email_verified: true }, env.ALLOWED_EMAILS, env.OPEN_SIGNUP);
+}
+
 /** Sign-up gating (Phase 1): OPEN_SIGNUP=true, or the verified email is in ALLOWED_EMAILS. */
 export function isAllowed(
   claims: Pick<IdClaims, "email" | "email_verified">,

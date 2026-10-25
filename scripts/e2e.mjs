@@ -268,6 +268,8 @@ async function main() {
     "shim instructions explain discrete messaging + urgency levels",
     /discrete and intentional/.test(instr) && /silent/.test(instr) && /urgent/.test(instr) && /normal/.test(instr),
   );
+  await waitFor(() => /dangerously-load-development-channels/.test(shimA.stderr), { what: "shim channel-flag notice" });
+  check("shim prints the --dangerously-load-development-channels reminder on stderr", true);
   const tools = await shimA.client.listTools();
   const sendTool = tools.tools.find((t) => t.name === "send_message");
   check(

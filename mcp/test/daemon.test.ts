@@ -60,11 +60,11 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function startDaemon(onRevoked?: () => void): Daemon {
+function startDaemon(onFatal?: (code: number) => void): Daemon {
   daemon = new Daemon({
     config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
     socket: join(dir, "d.sock"),
-    ...(onRevoked ? { onRevoked } : {}),
+    ...(onFatal ? { onFatal } : {}),
   });
   return daemon;
 }
@@ -146,11 +146,34 @@ describe("daemon", () => {
   });
 
   it("stops on revocation (close 4001)", async () => {
-    let revoked = false;
-    await startDaemon(() => (revoked = true)).start();
+    let exitCode = 0;
+    await startDaemon((c) => (exitCode = c)).start();
     await waitFor(() => hubSockets.length === 1, "connect");
     hubSockets[0]!.close(4001, "machine revoked");
-    await waitFor(() => revoked, "onRevoked");
+    await waitFor(() => exitCode === 3, "fatal 3");
+  });
+
+  it("gives up (exit 4) when another daemon with the same token keeps replacing it", async () => {
+    let exitCode = 0;
+    daemon = new Daemon({
+      config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
+      socket: join(dir, "d.sock"),
+      onFatal: (c) => (exitCode = c),
+      replacedDelayMs: 10,
+    });
+    wss.on("connection", (ws) => setTimeout(() => ws.close(4002, "replaced by a newer connection"), 20));
+    await daemon.start();
+    await waitFor(() => exitCode === 4, "fatal 4", 10_000);
+    expect(hubSockets.length).toBe(3);
+  });
+
+  it("forwards a per-session server error to that shim", async () => {
+    await startDaemon().start();
+    await waitFor(() => hubSockets.length === 1, "connect");
+    const a = await shim("sx");
+    hubSockets[0]!.send(JSON.stringify({ t: "error", error: "session id is in use", session_id: "sx" }));
+    const e = await waitFor(() => a.frames.find((f) => f.t === "error"), "error at shim");
+    expect(e.error).toMatch(/server refused this session: session id is in use/);
   });
 
   it("refuses to start twice on the same socket", async () => {

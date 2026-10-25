@@ -22,6 +22,7 @@ import { randomToken, sha256Hex, timingSafeEqual } from "./crypto";
 import { type Env, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH } from "./env";
 import {
   IdTokenError,
+  accountAllowed,
   type OAuthPending,
   buildAuthUrl,
   exchangeCode,
@@ -73,7 +74,10 @@ function sameOrigin(request: Request, url: URL): boolean {
 async function getSession(request: Request, env: Env): Promise<SessionClaims | null> {
   const v = parseCookies(request.headers.get("cookie")).get(SESSION_COOKIE);
   if (!v) return null;
-  return verifySessionCookieValue(env.SESSION_SECRET, v);
+  const c = await verifySessionCookieValue(env.SESSION_SECRET, v);
+  // Re-check gating on every request: removing someone from ALLOWED_EMAILS signs them out.
+  if (c && !accountAllowed(c.tid, c.email, env)) return null;
+  return c;
 }
 
 function hubFor(env: Env, tid: string): DurableObjectStub<import("./hub").Hub> {
@@ -276,8 +280,11 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       const machineId = randomToken(12);
       const name = body.machine_name || claim.hostname;
       const token = await mintMachineToken(env.SESSION_SECRET, session.tid, machineId);
-      const machine = await hubFor(env, session.tid).addMachine(machineId, name, await sha256Hex(token));
-      await pairing.complete({ t: "approved", token, machine_id: machineId, machine_name: name, account: session.email });
+      const machine = await hubFor(env, session.tid).addMachine(machineId, name, await sha256Hex(token), session.email);
+      await pairing.complete(
+        { t: "approved", token, machine_id: machineId, machine_name: name, account: session.email },
+        session.tid,
+      );
       return json({ ok: true, machine });
     } catch (e) {
       console.error("approve failed", e);

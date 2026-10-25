@@ -19,7 +19,8 @@ import {
   parseFrame,
 } from "@mcp-remote/shared";
 import { timingSafeEqual } from "./crypto";
-import { Env, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH } from "./env";
+import { Env, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH } from "./env";
+import { accountAllowed } from "./oauth";
 
 type Attachment = { kind: "phone" } | { kind: "daemon"; machine_id: string };
 
@@ -91,6 +92,11 @@ CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(session_id, direction, delivered);
 `;
 
+/** Max messages per deliver frame (keeps the daemon's ack under DO SQLite's bound-parameter cap too). */
+export const DELIVER_MAX_MESSAGES = 90;
+/** Sessions kept per machine; beyond this the oldest offline ones (and their history) are evicted. */
+export const MAX_STORED_SESSIONS_PER_MACHINE = 50;
+
 /** Byte budget for one deliver frame (must fit MAX_FRAME_BYTES once wrapped for IPC). */
 const DELIVER_BYTES = MAX_FRAME_BYTES - 4096;
 /** Byte budget for one history frame to the phone. */
@@ -101,23 +107,23 @@ function msgBytes(m: MessageRecord): number {
 }
 
 /** Leading items whose encoded size fits the budget (always at least one). */
-export function takeWithinBudget(items: MessageRecord[], budget: number): MessageRecord[] {
+export function takeWithinBudget(items: MessageRecord[], budget: number, maxCount = Infinity): MessageRecord[] {
   const out: MessageRecord[] = [];
   let used = 0;
   for (const m of items) {
     const b = msgBytes(m);
-    if (out.length && used + b > budget) break;
+    if (out.length && (used + b > budget || out.length >= maxCount)) break;
     out.push(m);
     used += b;
   }
   return out;
 }
 
-export function chunkWithinBudget(items: MessageRecord[], budget: number): MessageRecord[][] {
+export function chunkWithinBudget(items: MessageRecord[], budget: number, maxCount = Infinity): MessageRecord[][] {
   const out: MessageRecord[][] = [];
   let rest = items;
   while (rest.length) {
-    const head = takeWithinBudget(rest, budget);
+    const head = takeWithinBudget(rest, budget, maxCount);
     out.push(head);
     rest = rest.slice(head.length);
   }
@@ -151,8 +157,9 @@ export class Hub extends DurableObject<Env> {
   // -------------------------------------------------------------------------
   // RPC used by the Worker (never reachable from outside it)
 
-  async addMachine(machineId: string, name: string, tokenHash: string): Promise<MachineRecord> {
+  async addMachine(machineId: string, name: string, tokenHash: string, email?: string): Promise<MachineRecord> {
     const now = Date.now();
+    if (email) this.rememberEmail(email);
     this.sql.exec(
       "INSERT INTO machines (machine_id, name, token_hash, created_at) VALUES (?, ?, ?, ?)",
       machineId,
@@ -162,6 +169,21 @@ export class Hub extends DurableObject<Env> {
     );
     this.broadcastState();
     return { machine_id: machineId, name, created_at: now, last_seen: null, online: false, revoked: false };
+  }
+
+  /**
+   * Called when a pairing expires without the daemon ever claiming its token: drop the machine
+   * if it never connected, so no orphan record is left behind.
+   */
+  async removeUnclaimedMachine(machineId: string): Promise<boolean> {
+    const n = this.sql
+      .exec(
+        "DELETE FROM machines WHERE machine_id = ? AND last_seen IS NULL AND NOT EXISTS (SELECT 1 FROM sessions WHERE machine_id = ?)",
+        machineId,
+        machineId,
+      ).rowsWritten;
+    if (n) this.broadcastState();
+    return n > 0;
   }
 
   async listMachines(): Promise<MachineRecord[]> {
@@ -203,6 +225,8 @@ export class Hub extends DurableObject<Env> {
     if (tenant) this.rememberTenant(tenant);
 
     if (kind === "phone") {
+      const email = request.headers.get(H_EMAIL);
+      if (email) this.rememberEmail(email);
       const pair = new WebSocketPair();
       const server = pair[1];
       this.ctx.acceptWebSocket(server, ["phone"]);
@@ -219,6 +243,12 @@ export class Hub extends DurableObject<Env> {
         .toArray()[0];
       if (!row || row.revoked_at !== null || !row.token_hash || !timingSafeEqual(row.token_hash, tokenHash)) {
         return new Response("machine token revoked or unknown", { status: 401 });
+      }
+      // Sign-up gating is re-checked on every daemon connect, so removing an account from
+      // ALLOWED_EMAILS also locks out its machines (D7/D9).
+      const tid = tenant ?? this.getMeta("tenant") ?? "";
+      if (!accountAllowed(tid, this.getMeta("email"), this.env)) {
+        return new Response("account is no longer allowed to sign in", { status: 403 });
       }
       // One live socket per machine: a reconnecting daemon replaces a stale one.
       for (const old of this.ctx.getWebSockets(`m:${machineId}`)) {
@@ -316,6 +346,14 @@ export class Hub extends DurableObject<Env> {
           this.sendPhone(ws, { t: "error", error: "unknown session", client_id: f.client_id });
           return;
         }
+        if (!this.machineActive(s.machine_id)) {
+          this.sendPhone(ws, {
+            t: "error",
+            error: "this session's computer was revoked; messages can no longer reach it",
+            client_id: f.client_id,
+          });
+          return;
+        }
         const now = Date.now();
         const row = this.sql
           .exec<MessageRow>(
@@ -359,7 +397,7 @@ export class Hub extends DurableObject<Env> {
         this.sql.exec("UPDATE sessions SET online = 0, last_seen = ? WHERE machine_id = ? AND online = 1", now, machineId);
         for (const s of f.sessions) {
           const err = this.upsertSession(machineId, s, now);
-          if (err) this.sendDaemon(ws, { t: "error", error: `${s.session_id}: ${err}` });
+          if (err) this.sendDaemon(ws, { t: "error", error: err, session_id: s.session_id });
         }
         for (const s of f.sessions) this.flushPending(ws, machineId, s.session_id);
         this.broadcastState();
@@ -368,7 +406,7 @@ export class Hub extends DurableObject<Env> {
       case "session_up": {
         const err = this.upsertSession(machineId, f.session, now);
         if (err) {
-          this.sendDaemon(ws, { t: "error", error: `${f.session.session_id}: ${err}` });
+          this.sendDaemon(ws, { t: "error", error: err, session_id: f.session.session_id });
           return;
         }
         this.flushPending(ws, machineId, f.session.session_id);
@@ -411,13 +449,13 @@ export class Hub extends DurableObject<Env> {
       case "ack": {
         const s = this.getSession(f.session_id);
         if (!s || s.machine_id !== machineId) return;
+        // One JSON parameter instead of one per id: DO SQLite caps bound parameters at 100.
         const ids = [...new Set(f.ids)];
-        const placeholders = ids.map(() => "?").join(",");
         const updated = this.sql
           .exec<{ id: number }>(
-            `UPDATE messages SET delivered = 1 WHERE session_id = ? AND direction = 'in' AND delivered = 0 AND id IN (${placeholders}) RETURNING id`,
+            "UPDATE messages SET delivered = 1 WHERE session_id = ? AND direction = 'in' AND delivered = 0 AND id IN (SELECT value FROM json_each(?)) RETURNING id",
             f.session_id,
-            ...ids,
+            JSON.stringify(ids),
           )
           .toArray()
           .map((r) => r.id);
@@ -429,12 +467,19 @@ export class Hub extends DurableObject<Env> {
 
   private upsertSession(machineId: string, s: SessionAnnounce, now: number): string | null {
     const existing = this.getSession(s.session_id);
-    if (existing && existing.machine_id !== machineId) return "session id already used by another machine";
+    if (existing && existing.machine_id !== machineId) {
+      // Another machine of this same tenant may take the session over (keeping its history),
+      // e.g. after re-pairing, unless the current owner is live and has it online.
+      const ownerLive = this.machineActive(existing.machine_id) && !!this.daemonSocket(existing.machine_id);
+      if (ownerLive && existing.online === 1) return "session id is in use by another online machine";
+      this.sql.exec("UPDATE sessions SET machine_id = ? WHERE session_id = ?", machineId, s.session_id);
+    }
     if (!existing) {
       const count = this.sql
         .exec<{ n: number }>("SELECT COUNT(*) AS n FROM sessions WHERE machine_id = ? AND online = 1", machineId)
         .one().n;
       if (count >= MAX_SESSIONS_PER_MACHINE) return "too many live sessions on this machine";
+      this.evictOldSessions(machineId, MAX_STORED_SESSIONS_PER_MACHINE - 1);
       this.sql.exec(
         "INSERT INTO sessions (session_id, machine_id, project, cwd, online, last_seen, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
         s.session_id,
@@ -456,6 +501,24 @@ export class Hub extends DurableObject<Env> {
     return null;
   }
 
+  /** Keep at most `keep` sessions for a machine by deleting the least recently active offline ones. */
+  private evictOldSessions(machineId: string, keep: number): void {
+    const victims = this.sql
+      .exec<{ session_id: string }>(
+        `SELECT s.session_id FROM sessions s WHERE s.machine_id = ? AND s.online = 0
+         ORDER BY MAX(s.last_seen, COALESCE((SELECT MAX(created_at) FROM messages m WHERE m.session_id = s.session_id), 0)) ASC
+         LIMIT MAX(0, (SELECT COUNT(*) FROM sessions WHERE machine_id = ?) - ?)`,
+        machineId,
+        machineId,
+        keep,
+      )
+      .toArray();
+    for (const v of victims) {
+      this.sql.exec("DELETE FROM messages WHERE session_id = ?", v.session_id);
+      this.sql.exec("DELETE FROM sessions WHERE session_id = ?", v.session_id);
+    }
+  }
+
   private flushPending(ws: WebSocket, machineId: string, sessionId: string): void {
     const s = this.getSession(sessionId);
     if (!s || s.machine_id !== machineId || s.online !== 1) return;
@@ -466,7 +529,7 @@ export class Hub extends DurableObject<Env> {
       )
       .toArray();
     // Several frames if needed: each must fit the daemon -> shim IPC frame limit.
-    for (const batch of chunkWithinBudget(rows.map(toMessage), DELIVER_BYTES)) {
+    for (const batch of chunkWithinBudget(rows.map(toMessage), DELIVER_BYTES, DELIVER_MAX_MESSAGES)) {
       this.sendDaemon(ws, { t: "deliver", session_id: sessionId, messages: batch });
     }
   }
@@ -494,6 +557,14 @@ export class Hub extends DurableObject<Env> {
 
   private rememberTenant(tenant: string): void {
     this.sql.exec("INSERT OR IGNORE INTO meta (k, v) VALUES ('tenant', ?)", tenant);
+  }
+
+  private rememberEmail(email: string): void {
+    this.sql.exec("INSERT INTO meta (k, v) VALUES ('email', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", email);
+  }
+
+  private getMeta(k: string): string | null {
+    return this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v ?? null;
   }
 
   private machineActive(machineId: string): boolean {

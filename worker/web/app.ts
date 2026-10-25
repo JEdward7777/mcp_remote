@@ -80,7 +80,10 @@ function connect(): void {
     renderStatus();
     clearInterval(pingTimer);
     pingTimer = window.setInterval(() => sock.readyState === WebSocket.OPEN && sock.send("ping"), 30_000);
+    // Anything may have happened while we were disconnected: drop every cached thread except the
+    // visible one (refetched now; the fresh copy wins on merge) so others reload when opened.
     const sid = currentSession();
+    for (const k of [...state.threads.keys()]) if (k !== sid) state.threads.delete(k);
     if (sid) send({ t: "history", session_id: sid });
   };
   sock.onmessage = (ev) => {
@@ -151,7 +154,8 @@ function onFrame(f: HubToPhone): void {
     case "history": {
       const existing = state.threads.get(f.session_id) ?? [];
       const byId = new Map<number, MessageRecord>();
-      for (const m of [...f.messages, ...existing]) byId.set(m.id, m);
+      // Server copy last so it overrides stale cached fields (e.g. delivered).
+      for (const m of [...existing, ...f.messages]) byId.set(m.id, m);
       state.threads.set(
         f.session_id,
         [...byId.values()].sort((a, b) => a.id - b.id),
@@ -255,61 +259,27 @@ function renderSessions(): HTMLElement {
   return root;
 }
 
-function renderThread(sid: string): HTMLElement {
-  const s = state.sessions.find((x) => x.session_id === sid);
+// The thread and machines views are built once per visit and then updated in place, so the
+// focused textarea/input (and Android IME composition) survives incoming frames.
+
+interface ThreadView {
+  sid: string;
+  root: HTMLElement;
+  head: HTMLElement;
+  cwd: HTMLElement;
+  list: HTMLElement;
+  ta: HTMLTextAreaElement;
+  btn: HTMLButtonElement;
+  filled: boolean;
+}
+
+function buildThread(sid: string): ThreadView {
   const root = h("section", { class: "thread" });
-  const header = h(
-    "div",
-    { class: "thread-head" },
-    h("a", { href: "#/", class: "back", "aria-label": "back" }, "←"),
-    h("span", { class: s?.online ? "dot on" : "dot off" }),
-    h("strong", {}, s ? s.project : sid),
-    h("span", { class: "muted" }, s ? ` on ${machineName(s.machine_id)}` : ""),
-  );
-  if (s && !s.online) {
-    const forget = h("button", { class: "danger small" }, "Forget");
-    forget.onclick = () => {
-      if (!confirm(`Forget offline session ${s.project} (${s.session_id.slice(0, 8)}) and its history?`)) return;
-      if (send({ t: "forget_session", session_id: sid })) {
-        state.threads.delete(sid);
-        location.hash = "#/";
-      }
-    };
-    header.append(forget);
-  }
-  root.append(header);
-  if (s?.cwd) root.append(h("div", { class: "cwd muted" }, s.cwd));
+  const head = h("div", { class: "thread-head" });
+  const cwd = h("div", { class: "cwd muted" });
   const list = h("div", { class: "messages", id: "messages" });
-  const msgs = state.threads.get(sid);
-  if (!msgs) list.append(h("p", { class: "empty" }, "Loading..."));
-  else if (msgs.length === 0) list.append(h("p", { class: "empty" }, "No messages yet."));
-  else {
-    if (state.hasMore.get(sid)) {
-      const more = h("button", { class: "more" }, "Load earlier");
-      more.onclick = () => send({ t: "history", session_id: sid, before_id: msgs[0]!.id });
-      list.append(more);
-    }
-    for (const m of msgs) {
-      const cls = m.direction === "in" ? "msg in" : `msg out u-${m.urgency ?? "normal"}`;
-      list.append(
-        h(
-          "div",
-          { class: cls, "data-id": String(m.id) },
-          m.direction === "out" ? urgencyBadge(m.urgency) : null,
-          h("div", { class: "text" }, m.text),
-          h(
-            "div",
-            { class: "meta" },
-            fmtTime(m.created_at),
-            m.direction === "in" ? (m.delivered ? " ✓ delivered" : " … waiting") : "",
-          ),
-        ),
-      );
-    }
-  }
-  root.append(list);
   const form = h("form", { class: "compose" });
-  const ta = h("textarea", { rows: "2", placeholder: s?.online ? "Message this session" : "Session offline: message will wait", maxlength: "8000" });
+  const ta = h("textarea", { rows: "2", maxlength: "8000" });
   ta.value = drafts.get(sid) ?? "";
   ta.oninput = () => drafts.set(sid, ta.value);
   const btn = h("button", { type: "submit" }, "Send");
@@ -325,13 +295,88 @@ function renderThread(sid: string): HTMLElement {
     ta.value = "";
     drafts.delete(sid);
   };
-  root.append(form);
-  return root;
+  root.append(head, cwd, list, form);
+  return { sid, root, head, cwd, list, ta, btn, filled: false };
+}
+
+function updateThread(v: ThreadView): void {
+  const sid = v.sid;
+  const s = state.sessions.find((x) => x.session_id === sid);
+  const machine = s ? state.machines.find((m) => m.machine_id === s.machine_id) : undefined;
+  const revoked = !!machine?.revoked;
+
+  v.head.replaceChildren(
+    h("a", { href: "#/", class: "back", "aria-label": "back" }, "\u2190"),
+    h("span", { class: s?.online ? "dot on" : "dot off" }),
+    h("strong", {}, s ? s.project : sid),
+    h("span", { class: "muted" }, s ? ` on ${machineName(s.machine_id)}` : ""),
+  );
+  if (s && !s.online) {
+    const forget = h("button", { class: "danger small" }, "Forget");
+    forget.onclick = () => {
+      if (!confirm(`Forget offline session ${s.project} (${s.session_id.slice(0, 8)}) and its history?`)) return;
+      if (send({ t: "forget_session", session_id: sid })) {
+        state.threads.delete(sid);
+        location.hash = "#/";
+      }
+    };
+    v.head.append(forget);
+  }
+  v.cwd.textContent = s?.cwd ?? "";
+  v.cwd.hidden = !s?.cwd;
+
+  const atBottom = v.list.scrollHeight - v.list.scrollTop - v.list.clientHeight < 40;
+  const items: Node[] = [];
+  const msgs = state.threads.get(sid);
+  if (!msgs) items.push(h("p", { class: "empty" }, "Loading..."));
+  else if (msgs.length === 0) items.push(h("p", { class: "empty" }, "No messages yet."));
+  else {
+    if (state.hasMore.get(sid)) {
+      const more = h("button", { class: "more" }, "Load earlier");
+      more.onclick = () => send({ t: "history", session_id: sid, before_id: msgs[0]!.id });
+      items.push(more);
+    }
+    for (const m of msgs) {
+      const cls = m.direction === "in" ? "msg in" : `msg out u-${m.urgency ?? "normal"}`;
+      items.push(
+        h(
+          "div",
+          { class: cls, "data-id": String(m.id) },
+          m.direction === "out" ? urgencyBadge(m.urgency) : null,
+          h("div", { class: "text" }, m.text),
+          h(
+            "div",
+            { class: "meta" },
+            fmtTime(m.created_at),
+            // "Handed to session": the shim emitted it to Claude Code. Whether Claude Code actually
+            // loaded the shim as a channel cannot be observed from here.
+            m.direction === "in" ? (m.delivered ? " \u2713 handed to session" : " \u2026 waiting for session") : "",
+          ),
+        ),
+      );
+    }
+  }
+  v.list.replaceChildren(...items);
+  if (atBottom || !v.filled) v.list.scrollTop = v.list.scrollHeight;
+  if (msgs) v.filled = true;
+
+  v.ta.disabled = revoked;
+  v.btn.disabled = revoked;
+  v.ta.placeholder = revoked
+    ? "This session's computer was revoked; messages can't reach it"
+    : s?.online
+      ? "Message this session"
+      : "Session offline: message will wait";
 }
 
 const drafts = new Map<string, string>();
 
-function renderMachines(): HTMLElement {
+interface MachinesView {
+  root: HTMLElement;
+  list: HTMLElement;
+}
+
+function buildMachines(): MachinesView {
   const root = h("section", { class: "machines" });
   const form = h("form", { class: "pair" });
   const code = h("input", { name: "code", placeholder: "ABCD-EFGH", autocomplete: "off", autocapitalize: "characters", required: "" });
@@ -354,9 +399,15 @@ function renderMachines(): HTMLElement {
       name.value = "";
     }
   };
-  root.append(form, h("h2", {}, "Computers"));
+  const list = h("div", { class: "machine-list" });
+  root.append(form, h("h2", {}, "Computers"), list);
+  return { root, list };
+}
+
+function updateMachines(v: MachinesView): void {
   const active = state.machines.filter((m) => !m.revoked);
-  if (active.length === 0) root.append(h("p", { class: "empty" }, "None yet."));
+  const rows: Node[] = [];
+  if (active.length === 0) rows.push(h("p", { class: "empty" }, "None yet."));
   for (const m of active) {
     const btn = h("button", { class: "danger" }, "Revoke");
     btn.onclick = async () => {
@@ -364,7 +415,7 @@ function renderMachines(): HTMLElement {
       const r = await fetch(`/api/machines/${encodeURIComponent(m.machine_id)}`, { method: "DELETE" });
       if (!r.ok) toast("Revoke failed");
     };
-    root.append(
+    rows.push(
       h(
         "div",
         { class: "machine-row", "data-machine": m.machine_id },
@@ -375,12 +426,14 @@ function renderMachines(): HTMLElement {
       ),
     );
   }
-  return root;
+  v.list.replaceChildren(...rows);
 }
 
 let lastView = "";
+let threadView: ThreadView | null = null;
+let machinesView: MachinesView | null = null;
 
-function render(force = false): void {
+function render(_force = false): void {
   const main = document.querySelector("#main");
   if (!main || !state.me) return;
   const sid = currentSession();
@@ -388,24 +441,27 @@ function render(force = false): void {
   for (const tab of document.querySelectorAll<HTMLAnchorElement>("nav a")) {
     tab.classList.toggle("active", (tab.dataset.view ?? "") === (sid ? "sessions" : view));
   }
-  // Keep the compose box focused/typed-in when re-rendering the same thread.
-  const active = document.activeElement;
-  const typing = active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement;
-  if (!force && view === lastView && typing && view === "machines") return;
-  const msgs = document.querySelector("#messages");
-  const atBottom = !msgs || msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight < 40;
-  const node = sid ? renderThread(sid) : view === "machines" ? renderMachines() : renderSessions();
-  main.replaceChildren(node);
-  if (sid) {
-    const ta = main.querySelector("textarea");
-    if (ta && typing && view === lastView) {
-      ta.focus();
-      ta.setSelectionRange(ta.value.length, ta.value.length);
-    }
-    const list = main.querySelector("#messages");
-    if (list && (atBottom || view !== lastView)) list.scrollTop = list.scrollHeight;
-  }
+  const changed = view !== lastView || !main.firstChild;
   lastView = view;
+  if (sid) {
+    if (changed || !threadView || threadView.sid !== sid) {
+      threadView = buildThread(sid);
+      main.replaceChildren(threadView.root);
+    }
+    updateThread(threadView);
+    return;
+  }
+  threadView = null;
+  if (view === "machines") {
+    if (changed || !machinesView) {
+      machinesView = buildMachines();
+      main.replaceChildren(machinesView.root);
+    }
+    updateMachines(machinesView);
+    return;
+  }
+  machinesView = null;
+  main.replaceChildren(renderSessions());
 }
 
 function renderSignedOut(): void {

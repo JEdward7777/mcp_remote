@@ -39,6 +39,8 @@ interface PairingState {
   expires_at: number;
   status: "pending" | "approving" | "approved";
   result?: Extract<PairResult, { t: "approved" }>;
+  /** Tenant that approved; used to drop the machine again if the token is never claimed. */
+  tid?: string;
 }
 
 export class Pairing extends DurableObject<Env> {
@@ -58,6 +60,15 @@ export class Pairing extends DurableObject<Env> {
   }
 
   private async wipe(): Promise<void> {
+    const s = await this.ctx.storage.get<PairingState>("state");
+    if (s?.status === "approved" && s.result && s.tid) {
+      // Approved but never claimed: remove the orphan machine (only if it never connected).
+      try {
+        await this.env.HUB.get(this.env.HUB.idFromName(s.tid)).removeUnclaimedMachine(s.result.machine_id);
+      } catch (e) {
+        console.error("could not remove unclaimed machine", e);
+      }
+    }
     for (const ws of this.ctx.getWebSockets()) {
       try {
         ws.send(JSON.stringify({ t: "expired" } satisfies PairResult));
@@ -104,11 +115,12 @@ export class Pairing extends DurableObject<Env> {
     }
   }
 
-  async complete(result: Extract<PairResult, { t: "approved" }>): Promise<void> {
+  async complete(result: Extract<PairResult, { t: "approved" }>, tid: string): Promise<void> {
     const s = await this.load();
     if (!s || s.status !== "approving") throw new Error("pairing not in approving state");
     s.status = "approved";
     s.result = result;
+    s.tid = tid;
     await this.ctx.storage.put("state", s);
     const data = JSON.stringify(result);
     for (const ws of this.ctx.getWebSockets()) {

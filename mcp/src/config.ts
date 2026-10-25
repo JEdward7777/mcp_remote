@@ -35,14 +35,27 @@ export function socketPath(): string {
   return join(configDir(), "daemon.sock");
 }
 
+/**
+ * Create the config dir with 0700. An existing directory is never chmod-ed (MCP_REMOTE_CONFIG_DIR
+ * may point anywhere); it must belong to the current user, and a group/world-accessible one
+ * only produces a warning.
+ */
 export function ensureConfigDir(): string {
   const dir = configDir();
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") chmodSync(dir, 0o700); // umask can only remove bits; be explicit
+    return dir;
+  }
   if (process.platform !== "win32") {
-    try {
-      chmodSync(dir, 0o700);
-    } catch (e) {
-      log("warning: could not chmod config dir:", e);
+    const st = statSync(dir);
+    if (!st.isDirectory()) throw new Error(`${dir} exists and is not a directory`);
+    const uid = process.getuid?.();
+    if (uid !== undefined && st.uid !== uid) {
+      throw new Error(`refusing to use ${dir}: it is owned by uid ${st.uid}, not you (uid ${uid})`);
+    }
+    if (st.mode & 0o077) {
+      log(`warning: ${dir} is accessible by other users (mode ${(st.mode & 0o777).toString(8)}); consider chmod 700`);
     }
   }
   return dir;

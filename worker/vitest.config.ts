@@ -13,6 +13,7 @@ export default defineConfig({
           DEV_AUTH: "",
           GOOGLE_CLIENT_ID: "test-client.apps.googleusercontent.com",
           GOOGLE_CLIENT_SECRET: "test-google-secret",
+          ALLOWED_EMAILS: "allowed@example.com",
         },
       },
     }),

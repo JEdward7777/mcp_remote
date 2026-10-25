@@ -1,5 +1,10 @@
 # Setup (desktop steps)
 
+> **Important:** Claude Code only delivers phone messages into a session started with
+> `claude --dangerously-load-development-channels server:mcp-remote` (step 13). Without that flag the shim still
+> runs and the phone still shows "handed to session", but Claude Code silently drops the messages. The shim cannot
+> detect this, so it prints a reminder on stderr at startup.
+
 Everything below is done once on your desktop, except step 8 (phone) and steps 9-12 (per computer).
 Free Cloudflare plan only; the app is served from `https://mcp-remote.<your-subdomain>.workers.dev` (D15).
 
@@ -55,6 +60,10 @@ npx wrangler secret put GOOGLE_CLIENT_ID                           # paste the c
 npx wrangler secret put GOOGLE_CLIENT_SECRET                       # paste the client secret
 npx wrangler secret put ALLOWED_EMAILS                             # e.g. you@gmail.com,friend@gmail.com
 ```
+
+Gating is re-checked on every request: removing an email from `ALLOWED_EMAILS` (or setting `OPEN_SIGNUP` back to
+`false`) signs that person out immediately and refuses their daemons the next time they connect (an already open
+daemon socket stays up until it reconnects; revoke the machine to cut it at once).
 
 Optional: `GOOGLE_REDIRECT_URI` (only if you serve from a different URL than the request origin).
 **Never** set `DEV_AUTH` on the deployed Worker (it only belongs in `worker/.dev.vars`; the code also refuses it on
@@ -118,8 +127,10 @@ RestartSec=10
 WantedBy=default.target
 ```
 
-`systemctl --user enable --now mcp-remote`. The daemon exits with code 3 if the machine is revoked
-(`Restart=on-failure` will retry; it keeps failing with a clear log line until you pair again).
+`systemctl --user enable --now mcp-remote`. The daemon exits with code 3 if the machine is revoked or the account
+is no longer allowed (`Restart=on-failure` will retry; it keeps failing with a clear log line until you pair again),
+and with code 4 if another computer is running a daemon with the same token (e.g. a copied
+`~/.config/mcp-remote`): pair each computer separately, never copy `config.json`.
 
 ## 12. Add the shim to Claude Code
 
@@ -137,7 +148,7 @@ or once for all projects: `claude mcp add --scope user mcp-remote -- mcp-remote 
 
 Each shim registers a session named after the project folder (basename of the cwd) with a random session id.
 Set `MCP_REMOTE_SESSION_ID` in the server's `env` to keep a stable id (and thread) across restarts, e.g.
-`"env": { "MCP_REMOTE_SESSION_ID": "myproject-main" }`. Offline sessions can be removed from the phone (open the thread -> Forget).
+`"env": { "MCP_REMOTE_SESSION_ID": "myproject-main" }`. Offline sessions can be removed from the phone (open the thread -> Forget); each computer keeps at most 50 sessions, and the least recently active offline ones are pruned automatically. A stable id also survives re-pairing: a newly paired computer of the same account takes over the session and its history.
 
 ## 13. Launch Claude Code with the channel
 
@@ -145,7 +156,7 @@ Set `MCP_REMOTE_SESSION_ID` in the server's `env` to keep a stable id (and threa
 claude --dangerously-load-development-channels server:mcp-remote
 ```
 
-Accept the development-channel warning ("I am using this for local development") and the "New MCP server found"
+**Do not skip the flag**: it is what makes Claude Code register the shim as a channel. Accept the development-channel warning ("I am using this for local development") and the "New MCP server found"
 prompt. Channels need an interactive session; `-p` / Agent SDK mode ignores the flag. Run it in the permission
 mode you want the session to use while you are away (D18: no permission relay yet).
 

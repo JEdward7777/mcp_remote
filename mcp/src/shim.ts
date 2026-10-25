@@ -280,4 +280,11 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   process.on("SIGINT", shutdown);
   await server.connect(transport);
   log(`ready (session ${sessionId}, project ${project})`);
+  // There is no reliable way for the server to tell whether Claude Code registered it as a
+  // channel; without the flag, phone messages are dropped silently by Claude Code. Say so loudly.
+  log(
+    `NOTE: phone messages only reach Claude if this session was started with ` +
+      `\`claude --dangerously-load-development-channels server:<name of this server in .mcp.json>\` ` +
+      `(e.g. server:${SERVER_NAME}). Without it, messages are handed to Claude Code and silently dropped.`,
+  );
 }
