@@ -25,7 +25,13 @@
 - D6 (proposed) One always-on daemon per computer (user service: systemd/launchd/Task Scheduler) holds the single
   WebSocket to the Hub and can launch/relaunch Claude Code sessions in a terminal multiplexer (tmux), since channels need
   an interactive session. Per-session stdio shims talk to the local daemon over localhost, not to Cloudflare directly.
-- D7 (proposed) Auth: Google OAuth done directly in the Worker (user has done this before). Authorization-code + PKCE,
+- D7 (proposed, amended by D9) Auth: Google OAuth done directly in the Worker (user has done this before). Authorization-code + PKCE,
   allowlist of the owner's Google account `sub`, then the Worker issues its own signed HttpOnly session cookie.
   No workers-oauth-provider needed: the Worker is not an OAuth server for third-party MCP clients.
   Machines use separate pairing tokens (D4), revocable from the phone.
+- D8 (accepted) Language: TypeScript everywhere (worker/, daemon + shim in mcp/), shared message types package.
+- D9 (proposed) Multi-tenant from day one. Tenant key = Google `sub`. Each user gets their own Hub Durable Object
+  (idFromName(sub)), so data, sockets and history are separated by construction, not by filtering.
+  Pairing codes are approved by a signed-in user and mint a machine token bound to that user's `sub`; the Worker
+  routes a token only to its own Hub. No code path lists or reads across Hubs. Owner allowlist (D7) becomes a
+  sign-up allowlist / invite list. Note: all users share the deployer's free-tier quota.
