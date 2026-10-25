@@ -53,4 +53,6 @@
 - D15 (accepted) Hosting: free `<worker>.<account>.workers.dev` subdomain; no custom domain.
 - D16 (accepted) Build order: walking skeleton first, and it must already support multiple concurrent sessions
   (several Claude Code sessions per computer, any number of computers), with a session list on the phone.
-  Benchmark: parity with Claude Code Remote Control over time.
+  Not aiming for Remote Control parity (see D17); multi-session support is the part we match.
+- D17 (accepted) Messaging model: discrete, intentional events in both directions. The agent decides when to message
+  the user (reply/notify tools); the user's messages arrive as single channel events. No live activity/transcript feed.

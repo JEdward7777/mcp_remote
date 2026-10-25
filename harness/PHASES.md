@@ -13,3 +13,8 @@
 
 ## Completed
 - [x] Phase -1: Repo scaffold (mcp/, worker/, harness/) and auto commit/push hook
+
+## Parked
+- Live activity feed (tool calls, edits) via hooks or transcript tailing; parked by D17.
+- Native Android helper for background location; parked by D14.
+- Billing; parked by D10.
