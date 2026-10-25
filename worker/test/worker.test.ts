@@ -562,8 +562,8 @@ describe("review round 5", () => {
     const { token } = await newMachine("zed");
     const d = await daemon(token);
     d.send({ t: "hello", v: 1, sessions: [{ session_id: "zh", project: "p" }] });
-    for (let i = 0; i < 1005; i++) d.send({ t: "send", req_id: `r${i}`, session_id: "zh", text: `n${i}`, urgency: i === 1004 ? "urgent" : "silent" });
-    await waitFor(() => d.frames.filter((f) => f.t === "sent").length === 1005, "1005 sent", 15_000);
+    for (let i = 0; i < 1100; i++) d.send({ t: "send", req_id: `r${i}`, session_id: "zh", text: `n${i}`, urgency: i === 1099 ? "urgent" : "silent" });
+    await waitFor(() => d.frames.filter((f) => f.t === "sent").length === 1100, "1100 sent", 15_000);
     const p = await phone("zed");
     const st = await waitFor(() => last(p, "state"), "state");
     expect(st.sessions[0].last_urgency).toBe("urgent");
@@ -574,7 +574,7 @@ describe("review round 5", () => {
     expect(count).toBe(1000);
     p.send({ t: "history", session_id: "zh" });
     const h = await waitFor(() => p.frames.find((f) => f.t === "history"), "history");
-    expect(h.messages[h.messages.length - 1].text).toBe("n1004");
+    expect(h.messages[h.messages.length - 1].text).toBe("n1099");
   }, 30_000);
 
   it("uses indexes for the session-list subqueries", async () => {
@@ -592,5 +592,79 @@ describe("review round 5", () => {
     const scans = plan.filter((d) => /SCAN m\b/.test(d) && !/USING/.test(d));
     expect(scans).toEqual([]);
     expect(plan.filter((d) => /SEARCH m USING (COVERING )?INDEX/.test(d)).length).toBe(3);
+  });
+});
+
+describe("review round 6", () => {
+  type HubInternals = {
+    insertMessage: (sid: string, dir: "in" | "out", text: string, u: string | null, now: number, d: 0 | 1) => { rowsRead: number };
+  };
+  const seed = (state: DurableObjectState, sid: string) =>
+    state.storage.sql.exec(
+      "INSERT INTO sessions (session_id, machine_id, project, online, last_seen, created_at) VALUES (?, 'm', 'p', 0, 0, 0)",
+      sid,
+    );
+
+  it("keeps amortized rows read per insert small in a full session", async () => {
+    const stub = E.HUB.get(E.HUB.idFromName(tenantIdForDev("rows")));
+    const { avg, max, count } = await runInDurableObject(stub, (instance, state) => {
+      const hub = instance as unknown as HubInternals;
+      seed(state, "full");
+      for (let i = 0; i < 1000; i++) hub.insertMessage("full", "out", `x${i}`, "silent", i, 1);
+      let total = 0;
+      let max = 0;
+      for (let i = 0; i < 500; i++) {
+        const r = hub.insertMessage("full", "out", `y${i}`, "silent", 1000 + i, 1).rowsRead;
+        total += r;
+        max = Math.max(max, r);
+      }
+      const count = state.storage.sql
+        .exec<{ n: number; c: number }>(
+          "SELECT (SELECT COUNT(*) FROM messages WHERE session_id = 'full') AS n, (SELECT msg_count FROM sessions WHERE session_id = 'full') AS c",
+        )
+        .one();
+      return { avg: total / 500, max, count };
+    });
+    expect(avg).toBeLessThan(20); // measured ~9 (was ~2000 with the per-insert OFFSET trim)
+    expect(max).toBeLessThan(400); // one trim step: ~50 index entries + rows + index deletes
+    expect(count.n).toBe(count.c);
+    expect(count.n).toBeLessThanOrEqual(1000 + 50);
+  });
+
+  it("never trims undelivered inbound messages (soft cap while queued)", async () => {
+    const stub = E.HUB.get(E.HUB.idFromName(tenantIdForDev("queue")));
+    const r = await runInDurableObject(stub, (instance, state) => {
+      const hub = instance as unknown as HubInternals;
+      seed(state, "q");
+      for (let i = 0; i < 1100; i++) hub.insertMessage("q", "in", `q${i}`, null, i, 0);
+      return state.storage.sql
+        .exec<{ n: number; first: string }>(
+          "SELECT COUNT(*) AS n, (SELECT text FROM messages WHERE session_id = 'q' ORDER BY id LIMIT 1) AS first FROM messages WHERE session_id = 'q'",
+        )
+        .one();
+    });
+    expect(r.n).toBe(1100);
+    expect(r.first).toBe("q0");
+  });
+
+  it("backfills msg_count idempotently for Hubs from before the column existed", async () => {
+    const stub = E.HUB.get(E.HUB.idFromName(tenantIdForDev("legacy")));
+    await runInDurableObject(stub, (_i, state) => {
+      seed(state, "old");
+      for (let i = 0; i < 5; i++)
+        state.storage.sql.exec("INSERT INTO messages (session_id, direction, text, created_at) VALUES ('old', 'out', 't', 0)");
+      state.storage.sql.exec("UPDATE sessions SET msg_count = 0");
+      state.storage.sql.exec("DELETE FROM meta WHERE k = 'msg_count_v1'");
+    });
+    await evictDurableObject(stub);
+    const c1 = await runInDurableObject(stub, (_i, state) =>
+      state.storage.sql.exec<{ c: number }>("SELECT msg_count AS c FROM sessions WHERE session_id = 'old'").one().c,
+    );
+    expect(c1).toBe(5);
+    await evictDurableObject(stub);
+    const c2 = await runInDurableObject(stub, (_i, state) =>
+      state.storage.sql.exec<{ c: number }>("SELECT msg_count AS c FROM sessions WHERE session_id = 'old'").one().c,
+    );
+    expect(c2).toBe(5);
   });
 });

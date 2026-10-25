@@ -231,4 +231,4 @@ test project's `.mcp.json`:
   }
 }
 ```
- `npm run e2e` runs the whole flow automatically.
+`npm run e2e` runs the whole flow automatically.

@@ -97,8 +97,9 @@ CREATE INDEX IF NOT EXISTS messages_dir ON messages(session_id, direction, id);
 export const DELIVER_MAX_MESSAGES = 90;
 /** Sessions kept per machine; beyond this the oldest offline ones (and their history) are evicted. */
 export const MAX_STORED_SESSIONS_PER_MACHINE = 50;
-/** Messages kept per session; older ones are trimmed on insert (bounds storage and rows read). */
+/** Messages kept per session (soft: may exceed by < HISTORY_TRIM_SLACK, and while inbound messages are queued). */
 export const MAX_HISTORY_PER_SESSION = 1000;
+export const HISTORY_TRIM_SLACK = 50;
 
 /** Byte budget for one deliver frame (must fit MAX_FRAME_BYTES once wrapped for IPC). */
 const DELIVER_BYTES = MAX_FRAME_BYTES - 4096;
@@ -153,8 +154,25 @@ export class Hub extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
+    this.migrate();
     // Keepalive pings are answered by the runtime without waking the object (D5).
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+  }
+
+  /** Idempotent schema upgrades for Hubs created by earlier versions. */
+  private migrate(): void {
+    try {
+      this.sql.exec("ALTER TABLE sessions ADD COLUMN msg_count INTEGER NOT NULL DEFAULT 0");
+    } catch {
+      /* column already exists */
+    }
+    if (!this.getMeta("msg_count_v1")) {
+      // One-time backfill (per session, via the (session_id, id) index); guarded by the meta flag.
+      this.sql.exec(
+        "UPDATE sessions SET msg_count = (SELECT COUNT(*) FROM messages m WHERE m.session_id = sessions.session_id)",
+      );
+      this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('msg_count_v1', '1')");
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -361,15 +379,7 @@ export class Hub extends DurableObject<Env> {
           return;
         }
         const now = Date.now();
-        const row = this.sql
-          .exec<MessageRow>(
-            "INSERT INTO messages (session_id, direction, text, urgency, created_at, delivered) VALUES (?, 'in', ?, NULL, ?, 0) RETURNING *",
-            f.session_id,
-            f.text,
-            now,
-          )
-          .one();
-        this.trimHistory(row.session_id);
+        const row = this.insertMessage(f.session_id, "in", f.text, null, now, 0).row;
         const msg = toMessage(row);
         this.broadcastPhones({ t: "message", message: msg, client_id: f.client_id });
         // Deliver now if the session is live; otherwise it waits for session_up/hello.
@@ -438,18 +448,7 @@ export class Hub extends DurableObject<Env> {
           return;
         }
         const delivered = this.ctx.getWebSockets("phone").length > 0 ? 1 : 0;
-        const row = this.sql
-          .exec<MessageRow>(
-            "INSERT INTO messages (session_id, direction, text, urgency, created_at, delivered) VALUES (?, 'out', ?, ?, ?, ?) RETURNING *",
-            f.session_id,
-            f.text,
-            f.urgency,
-            now,
-            delivered,
-          )
-          .one();
-        this.sql.exec("UPDATE sessions SET last_seen = ? WHERE session_id = ?", now, f.session_id);
-        this.trimHistory(row.session_id);
+        const row = this.insertMessage(f.session_id, "out", f.text, f.urgency, now, delivered).row;
         const msg = toMessage(row);
         this.sendDaemon(ws, { t: "sent", req_id: f.req_id, message_id: msg.id });
         this.broadcastPhones({ t: "message", message: msg });
@@ -474,15 +473,55 @@ export class Hub extends DurableObject<Env> {
     }
   }
 
-  /** Keep only the newest MAX_HISTORY_PER_SESSION messages of a session (index range delete). */
-  private trimHistory(sessionId: string): void {
-    this.sql.exec(
-      `DELETE FROM messages WHERE session_id = ? AND id <= (
-         SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)`,
+  /**
+   * The only message write path. Keeps sessions.msg_count in step and trims history only once every
+   * HISTORY_TRIM_SLACK inserts above the cap, so the amortized rows read per insert stay small
+   * (a trim walks ~HISTORY_TRIM_SLACK index entries from the oldest end). Undelivered inbound
+   * messages are never trimmed: the cap is soft while messages are queued for an offline session.
+   * Returns rowsRead for tests.
+   */
+  insertMessage(
+    sessionId: string,
+    direction: "in" | "out",
+    text: string,
+    urgency: string | null,
+    now: number,
+    delivered: 0 | 1,
+  ): { row: MessageRow; rowsRead: number } {
+    const ins = this.sql.exec<MessageRow>(
+      "INSERT INTO messages (session_id, direction, text, urgency, created_at, delivered) VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
       sessionId,
-      sessionId,
-      MAX_HISTORY_PER_SESSION,
+      direction,
+      text,
+      urgency,
+      now,
+      delivered,
     );
+    const row = ins.one();
+    let rowsRead = ins.rowsRead;
+    const upd = this.sql.exec<{ msg_count: number }>(
+      "UPDATE sessions SET msg_count = msg_count + 1, last_seen = ? WHERE session_id = ? RETURNING msg_count",
+      now,
+      sessionId,
+    );
+    const count = upd.one().msg_count;
+    rowsRead += upd.rowsRead;
+    if (count > MAX_HISTORY_PER_SESSION && count % HISTORY_TRIM_SLACK === 0) {
+      const del = this.sql.exec<{ id: number }>(
+        `DELETE FROM messages WHERE id IN (
+           SELECT id FROM messages WHERE session_id = ? AND NOT (direction = 'in' AND delivered = 0)
+           ORDER BY id ASC LIMIT ?) RETURNING id`,
+        sessionId,
+        count - MAX_HISTORY_PER_SESSION,
+      );
+      const removed = del.toArray().length;
+      rowsRead += del.rowsRead;
+      if (removed) {
+        const dec = this.sql.exec("UPDATE sessions SET msg_count = msg_count - ? WHERE session_id = ?", removed, sessionId);
+        rowsRead += dec.rowsRead;
+      }
+    }
+    return { row, rowsRead };
   }
 
   private upsertSession(machineId: string, s: SessionAnnounce, now: number): string | null {
