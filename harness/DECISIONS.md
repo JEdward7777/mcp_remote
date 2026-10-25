@@ -50,3 +50,7 @@
 - D14 (accepted) Location is on-demand only: the page reports position when open, or the agent sends a push you tap
   to share. Agent gets last-known position + timestamp. No background tracking, no native Android app for now;
   revisit after hands-on use.
+- D15 (accepted) Hosting: free `<worker>.<account>.workers.dev` subdomain; no custom domain.
+- D16 (accepted) Build order: walking skeleton first, and it must already support multiple concurrent sessions
+  (several Claude Code sessions per computer, any number of computers), with a session list on the phone.
+  Benchmark: parity with Claude Code Remote Control over time.
