@@ -512,14 +512,23 @@ export class Hub extends DurableObject<Env> {
       }
       case "projects": {
         const caps = { projects: f.projects, available: f.available, launch_error: f.launch_error, max_sessions: f.max_sessions };
-        this.sql.exec("UPDATE machines SET launch_caps = ? WHERE machine_id = ?", JSON.stringify(caps), machineId);
-        this.broadcastState();
+        // Sent on every reconnect; only a real change costs a state broadcast.
+        const w = this.sql.exec(
+          "UPDATE machines SET launch_caps = ?1 WHERE machine_id = ?2 AND launch_caps IS NOT ?1",
+          JSON.stringify(caps),
+          machineId,
+        ).rowsWritten;
+        if (w) this.broadcastState();
         return;
       }
       case "launches": {
         // One row write, no reads; phones get a small frame instead of a full state.
-        this.sql.exec("UPDATE machines SET launches_json = ? WHERE machine_id = ?", JSON.stringify(f.launches), machineId);
-        this.broadcastPhones({ t: "launches", machine_id: machineId, launches: f.launches });
+        const w = this.sql.exec(
+          "UPDATE machines SET launches_json = ?1 WHERE machine_id = ?2 AND launches_json IS NOT ?1",
+          JSON.stringify(f.launches),
+          machineId,
+        ).rowsWritten;
+        if (w) this.broadcastPhones({ t: "launches", machine_id: machineId, launches: f.launches });
         return;
       }
       case "launch_result": {

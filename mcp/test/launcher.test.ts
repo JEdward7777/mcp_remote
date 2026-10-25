@@ -126,6 +126,19 @@ describe("launcher", () => {
     expect(tmux.spawns).toHaveLength(2);
   });
 
+  it("counts concurrent restarts against the cap", async () => {
+    cfg = LaunchConfig.parse({ ...cfg, max_sessions: 1 });
+    const l = make();
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    await l.stop(a.launch_id);
+    const b = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    await l.stop(b.launch_id);
+    const rs = await Promise.all([l.restart(a.launch_id, false), l.restart(b.launch_id, false)]);
+    expect(rs.filter((r) => r.ok)).toHaveLength(1);
+    expect(rs.find((r) => !r.ok)).toMatchObject({ error: /max 1/ });
+  });
+
   it("accepts only the development-channels warning for our server, and reports other dialogs", async () => {
     const fx = (n: string) => readFileSync(join(__dirname, "fixtures", n), "utf8");
     tmux.onKeys = (name) => {

@@ -27,7 +27,7 @@ import { configDir, ensureConfigDir } from "./config";
 import { DEV_CHANNELS_KEYS, NO_CONVERSATION, attentionText, autoAcceptable, detectDialog, lastLine } from "./dialogs";
 import { type LaunchConfig, defaultLaunchConfig, findProject, resolveProjects } from "./launch-config";
 import { log } from "./log";
-import { Tmux, type TmuxDriver, tmuxVersionOk, which } from "./tmux";
+import { type PaneInfo, Tmux, type TmuxDriver, tmuxVersionOk, which } from "./tmux";
 
 /** Auto-restarts allowed within one crash window before giving up. */
 export const MAX_AUTO_RESTARTS = 5;
@@ -303,6 +303,11 @@ export class Launcher {
     return this.entries.find((e) => e.launch_id === id);
   }
 
+  private isActive(id: string): boolean {
+    const e = this.get(id);
+    return !!e && ACTIVE.includes(e.state);
+  }
+
   private activeCount(): number {
     return this.entries.filter((e) => ACTIVE.includes(e.state) || this.restartTimers.has(e.launch_id)).length;
   }
@@ -336,6 +341,8 @@ export class Launcher {
 
   private async spawn(e: Entry): Promise<void> {
     const tmux = this.tmux!;
+    // Count as active right away, so concurrent launch/restart requests see it against max_sessions.
+    e.state = "starting";
     const argv = this.claudeArgv(e);
     e.token = newToken();
     e.linked = false;
@@ -469,9 +476,15 @@ export class Launcher {
     if (this.checking || !this.tmux || this.disposed) return;
     this.checking = true;
     try {
-      let panes;
+      let panes: PaneInfo[];
       try {
         panes = await this.tmux.list();
+        // tmux marks a pane dead when its pty closes, slightly before it has reaped the process and
+        // recorded the exit status (seen with Claude Code exiting right away). Give it a moment.
+        for (let i = 0; i < 5 && panes.some((p) => p.dead && p.status === null && this.isActive(p.name)); i++) {
+          await new Promise((r) => setTimeout(r, 100));
+          panes = await this.tmux.list();
+        }
       } catch (err) {
         log("tmux list failed:", err);
         return;
@@ -479,7 +492,12 @@ export class Launcher {
       for (const e of this.entries) {
         if (!ACTIVE.includes(e.state) || e.busy) continue;
         const p = panes.find((x) => x.name === e.launch_id);
-        if (p && !p.dead) continue;
+        if (p && !p.dead) {
+          if (e.state === "running" && !e.linked && !e.detail) {
+            this.set(e, { detail: "Claude Code is running but its mcp-remote shim disconnected (check /mcp at the desk, or restart)" });
+          }
+          continue;
+        }
         let screen = "";
         if (p) screen = await this.tmux.capture(e.launch_id, 60).catch(() => "");
         await this.tmux.kill(e.launch_id).catch(() => {});

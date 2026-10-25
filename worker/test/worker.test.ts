@@ -760,11 +760,16 @@ describe("remote launch (phase 2)", () => {
     const stub = E.HUB.get(E.HUB.idFromName(tenantIdForDev("rowsl")));
     const r = await runInDurableObject(stub, (_i, state) => {
       state.storage.sql.exec("INSERT INTO machines (machine_id, name, created_at) VALUES ('m', 'box', 0)");
-      const c = state.storage.sql.exec("UPDATE machines SET launches_json = ? WHERE machine_id = ?", JSON.stringify([rec("mr-0123456789ab")]), "m");
+      const q = "UPDATE machines SET launches_json = ?1 WHERE machine_id = ?2 AND launches_json IS NOT ?1";
+      const v = JSON.stringify([rec("mr-0123456789ab")]);
+      const c = state.storage.sql.exec(q, v, "m");
       c.toArray();
-      return { read: c.rowsRead, written: c.rowsWritten };
+      const again = state.storage.sql.exec(q, v, "m");
+      again.toArray();
+      return { read: c.rowsRead, written: c.rowsWritten, again: again.rowsWritten };
     });
     expect(r.written).toBe(1);
     expect(r.read).toBeLessThanOrEqual(1); // primary-key lookup of the row being updated
+    expect(r.again).toBe(0); // an unchanged snapshot (every reconnect) writes nothing and is not broadcast
   });
 });

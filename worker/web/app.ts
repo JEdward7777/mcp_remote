@@ -308,6 +308,13 @@ function launchOp(frame: PhoneToHub & { client_id: string; machine_id: string },
     return;
   }
   pendingLaunchOps.set(frame.client_id, { machine: frame.machine_id, launch });
+  // The computer may drop off before answering; don't leave the buttons disabled forever.
+  window.setTimeout(() => {
+    if (pendingLaunchOps.delete(frame.client_id)) {
+      toast("No answer from the computer; check its state and try again.");
+      render();
+    }
+  }, 45_000);
   render();
 }
 
@@ -363,6 +370,7 @@ function launchRow(m: MachineRecord, l: LaunchRecord): HTMLElement {
     "div",
     { class: `launch-row st-${l.state}`, "data-launch": l.launch_id },
     h("div", { class: "launch-top" }, title, stateBadge(l), h("span", { class: "sid" }, l.launch_id)),
+    !m.online ? h("div", { class: "launch-detail" }, "Computer offline: last known state.") : null,
     l.detail ? h("div", { class: "launch-detail" }, l.detail) : null,
     launchButtons(m, l),
   );

@@ -7,6 +7,7 @@
   :root { --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --card: #f6f8fa; --line: #d0d7de; color-scheme: light; }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; }
 body { background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 #app { max-width: 720px; margin: 0 auto; min-height: 100%; display: flex; flex-direction: column; }

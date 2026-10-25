@@ -5,7 +5,7 @@
 > runs and the phone still shows "handed to session", but Claude Code silently drops the messages. The shim cannot
 > detect this, so it prints a reminder on stderr at startup.
 
-Everything below is done once on your desktop, except step 8 (phone) and steps 9-12 (per computer).
+Everything below is done once on your desktop, except step 8 (phone) and steps 9-14 (per computer).
 Free Cloudflare plan only; the app is served from `https://mcp-remote.<your-subdomain>.workers.dev` (D15).
 
 ## 0. Prerequisites
@@ -108,46 +108,49 @@ Check that the email it prints is yours. Codes expire after 10 minutes.
 If you pair a computer again (new token), revoke its previous entry under Machines; the phone flags an older
 entry with the same name as "older duplicate?".
 
-## 11. Run the daemon
+## 11. Run the daemon as a user service
 
 ```sh
-mcp-remote daemon
+mcp-remote install-service          # --dry-run prints the file instead; --no-start only writes it
 ```
 
-Keep it running (Phase 2 will install it as a user service). Until then, e.g. a systemd user unit
-`~/.config/systemd/user/mcp-remote.service`:
+- **Linux**: writes `~/.config/systemd/user/mcp-remote.service` with absolute paths to node and the CLI (systemd's
+  minimal PATH can't find an nvm/fnm/volta node), your current `PATH` (so `claude` and `tmux` are found),
+  `Restart=on-failure`, `RestartPreventExitStatus=3 4` and `KillMode=process`, then runs
+  `systemctl --user daemon-reload && systemctl --user enable --now mcp-remote`.
+  Logs: `journalctl --user -u mcp-remote -f`. For an always-on desktop that you are not logged in to:
+  `loginctl enable-linger $USER`. Re-run `install-service` after upgrading node (the path changes).
+- **macOS**: writes `~/Library/LaunchAgents/com.mcp-remote.daemon.plist` (RunAtLoad, `KeepAlive` with
+  `SuccessfulExit=false`, `AbandonProcessGroup`) and loads it with `launchctl bootstrap gui/$(id -u)`.
+  Logs: `~/Library/Logs/mcp-remote.log`. launchd can't be told "don't restart on exit 3/4", so the agent sets
+  `MCP_REMOTE_FATAL_EXIT_ZERO=1`: the daemon then exits 0 in those cases (after logging why) and launchd leaves it
+  stopped. Limit: it is started again at your next login, logs the same reason and exits again.
+- **Windows**: prints Task Scheduler steps (no installer). Remote launch needs tmux, so it is only available when
+  the daemon runs inside WSL.
 
-```ini
-[Unit]
-Description=mcp-remote daemon
+`mcp-remote uninstall-service` removes it. Without a service, `mcp-remote daemon` in a terminal works too.
 
-[Service]
-# systemd runs units with a minimal PATH, so `mcp-remote` (a `#!/usr/bin/env node` script) fails with
-# exit 127 when node comes from nvm/fnm/volta. Use absolute paths to node and to the CLI script:
-#   node:  `which node`                     e.g. /home/you/.nvm/versions/node/v22.22.0/bin/node
-#   CLI:   `readlink -f "$(which mcp-remote)"`  e.g. .../lib/node_modules/mcp-remote/dist/cli.js
-ExecStart=/ABSOLUTE/PATH/TO/node /ABSOLUTE/PATH/TO/mcp-remote/dist/cli.js daemon
-Restart=on-failure
-RestartSec=10
-# 3 = revoked / account no longer allowed, 4 = token in use by another computer: restarting can't help.
-RestartPreventExitStatus=3 4
+Exit codes: 3 = the machine was revoked or the account is no longer allowed (pair again); 4 = another computer runs a
+daemon with the same token (e.g. a copied `~/.config/mcp-remote`: pair each computer separately, never copy
+`config.json`). Restarting can't help in either case, which is why the service files above don't. Other exits
+(crash, network) are restarted; the daemon also reconnects with backoff on its own. Stopping or restarting the
+service does **not** end Claude Code sessions launched from the phone: they live in a separate tmux server and the
+next daemon re-adopts them.
 
-[Install]
-WantedBy=default.target
+## 12. Register the shim with Claude Code
+
+```sh
+mcp-remote setup-claude             # runs: claude mcp add mcp-remote --scope user -- <node> <cli.js> shim
 ```
 
-Replace both placeholder paths (if you upgrade node via nvm, update the node path too), then
-`systemctl --user daemon-reload && systemctl --user enable --now mcp-remote`; check with
-`journalctl --user -u mcp-remote -f`. The daemon exits on purpose, and must not be restarted, with code 3 if the
-machine is revoked or the account is no longer allowed (pair again), and with code 4 if another computer is running
-a daemon with the same token (e.g. a copied `~/.config/mcp-remote`: pair each computer separately, never copy
-`config.json`). `RestartPreventExitStatus=3 4` keeps systemd from restarting it in those cases; any other
-supervisor (launchd `KeepAlive`, Task Scheduler "restart on failure") must likewise not restart on exit codes 3 or 4.
-Other exits (crash, network) are fine to restart; the daemon already reconnects with backoff on its own.
+(`--dry-run` prints the command, `--force` replaces an existing `mcp-remote` entry, `--scope local` registers it for
+the current folder only.) User scope makes the shim available in every project **without** Claude Code's
+"New MCP server found in this project" approval prompt, which a project `.mcp.json` entry triggers and which would
+block a session launched from the phone (its highlighted default is "Continue without using this MCP server").
+So don't also list `mcp-remote` in a project's `.mcp.json`. (If a project does have it there, pre-approve it with
+`"enabledMcpjsonServers": ["mcp-remote"]` in that project's `.claude/settings.local.json`.)
 
-## 12. Add the shim to Claude Code
-
-Per project, `.mcp.json` in the project root:
+Manual equivalent, or a per-project `.mcp.json`:
 
 ```json
 {
@@ -157,12 +160,11 @@ Per project, `.mcp.json` in the project root:
 }
 ```
 
-or once for all projects: `claude mcp add --scope user mcp-remote -- mcp-remote shim`.
-
 Each shim registers a session named after the project folder (basename of `CLAUDE_PROJECT_DIR`, which Claude Code sets, else of the cwd) with a random session id.
-To keep a stable id (and thread) across restarts, set `MCP_REMOTE_SESSION_ID` **per project and per computer**,
-never in a committed `.mcp.json` and never at user scope (user scope would give every project on the computer the
-same id). Run this once inside each project, using `<computer>-<project>` as the id:
+Sessions started from the phone (step 14) get their id from the daemon automatically. For sessions you start
+yourself at the desk, to keep a stable id (and thread) across restarts, set `MCP_REMOTE_SESSION_ID` **per project
+and per computer**, never in a committed `.mcp.json` and never at user scope (user scope would give every project on
+the computer the same id). Run this once inside each project, using `<computer>-<project>` as the id:
 
 ```sh
 cd ~/code/myproject
@@ -186,18 +188,70 @@ takes the id over together with its history (the Hub tells the other daemons to 
 Offline sessions can be removed from the phone (open the thread -> Forget); each computer keeps at most 50 sessions,
 and the least recently active offline ones are pruned automatically.
 
-## 13. Launch Claude Code with the channel
+## 13. Launch Claude Code with the channel (at the desk)
 
 ```sh
 claude --dangerously-load-development-channels server:mcp-remote
 ```
 
-**Do not skip the flag**: it is what makes Claude Code register the shim as a channel. Accept the development-channel warning ("I am using this for local development") and the "New MCP server found"
+**Do not skip the flag**: it is what makes Claude Code register the shim as a channel. Accept the development-channel warning ("I am using this for local development") and, for a `.mcp.json` server, the "New MCP server found"
 prompt. Channels need an interactive session; `-p` / Agent SDK mode ignores the flag. Run it in the permission
 mode you want the session to use while you are away (D18: no permission relay yet).
 
 On the phone the session appears under your computer with a green dot. Send it a message; Claude receives it as
 a `<channel source="mcp-remote" ...>` event and answers with `send_message` (silent / normal / urgent).
+
+## 14. Start sessions from the phone (remote launch)
+
+Needs **tmux 3.2+** on the computer (`tmux -V`; `apt install tmux` / `brew install tmux`) and Claude Code logged in.
+
+1. Allow folders (only these can be started; the phone sees folder names and opaque ids, never paths):
+
+   ```sh
+   mcp-remote projects add ~/code/myproject        # one folder (--name to rename it)
+   mcp-remote projects add-root ~/code             # every non-hidden sub-folder of ~/code, one level deep
+   mcp-remote projects list                        # what the phone can start, plus warnings
+   mcp-remote projects remove ~/code/myproject
+   ```
+
+2. Pick the permission mode the sessions run in (passed as `--permission-mode`; `mcp-remote config modes` lists them):
+
+   ```sh
+   mcp-remote config set permission-mode acceptEdits
+   ```
+
+   `acceptEdits` (edits run without asking, other commands still prompt), `auto` (everything runs, Claude Code's
+   safety classifier blocks risky actions; needs a supported model, otherwise Claude Code silently falls back to
+   Manual), `bypassPermissions` (no checks at all; isolated machines only, refused when running as root),
+   `dontAsk`, `plan`, `default`/`manual`. Unset (`config unset permission-mode`) passes no flag. Prompts can't be
+   answered from the phone yet (D18), so a session in a prompting mode waits for you at the desk.
+   Other settings: `config set claude-path <path>`, `config set extra-args --model opus` (everything after the key,
+   as separate arguments), `config set max-sessions 4`, `config set auto-restart on` (default for the phone's
+   toggle). All of it lives in `~/.config/mcp-remote/launch.json` (0600); the running daemon re-reads it.
+
+3. One-time desk steps so an unattended start doesn't stop at a dialog Claude Code shows on first use
+   (verified with Claude Code 2.1.310; order: trust -> MCP approval -> bypass warning -> development channels):
+   - **Workspace trust**: run `claude` once in each allowed folder, or once in the root folder (trust covers
+     sub-folders), and choose "Yes, I trust this folder". `projects list` flags folders Claude Code hasn't trusted.
+   - **MCP approval**: use `mcp-remote setup-claude` (step 12) instead of `.mcp.json`.
+   - **Bypass permissions** (only if you chose it): accept the warning once at the desk; Claude Code then stores
+     `skipDangerousModePermissionPrompt: true` in `~/.claude/settings.json`.
+   - **Development channels warning**: shown on every start; the daemon answers it (it sends `1`) only when it is
+     the expected warning listing exactly `server:mcp-remote`. Nothing else is ever answered automatically.
+
+On the phone, each computer has a **Start session** picker (with "resume last conversation" = `--continue` and
+"auto-restart on crash"). A launched session shows its state: *starting*, *running*, **needs you at the desk**
+(with what to do, e.g. a trust prompt), *exited* (with the exit code and Claude Code's last line) or *failed*.
+Buttons: **Stop**, **Restart**, **Restart + resume** (`--continue`), and **Remove** for ended ones. Launched sessions
+appear in the session list like any other (badge "launched") and keep their thread across restarts.
+
+At the desk, `mcp-remote attach mr-<id>` opens a launched session's terminal (detach with `Ctrl-b d`); they run on
+a dedicated tmux server: `tmux -L mcp-remote ls`. Each runs
+`claude --dangerously-load-development-channels server:mcp-remote [--permission-mode X] [--continue] [extra args]`
+in the project folder, with `MCP_REMOTE_SESSION_ID` and a per-start `MCP_REMOTE_LAUNCH_TOKEN` in its environment
+so the shim it starts is linked to the launch. Auto-restart (off by default) restarts a crashed session (non-zero
+exit) with growing delays, resuming the conversation, and gives up after 5 crashes in a row (a run longer than
+10 minutes resets the count); a clean exit or **Stop** is never restarted.
 
 ## Troubleshooting
 
@@ -205,6 +259,12 @@ a `<channel source="mcp-remote" ...>` event and answers with `send_message` (sil
   writes shim stderr to `~/.claude/debug/<session-id>.txt`.
 - `send_message` errors "daemon is not running": start `mcp-remote daemon`. The shim reconnects by itself.
 - Revoke a lost computer: phone -> Machines -> Revoke. Its daemon is disconnected immediately.
+- A phone-launched session says **needs you at the desk**: its detail line names the dialog. `mcp-remote attach
+  mr-<id>` to answer it; the session continues on its own once the shim registers. "did not start the mcp-remote
+  shim within 90s" usually means the shim isn't registered (`mcp-remote setup-claude`), Claude Code isn't logged
+  in, or a prompt this version doesn't recognize is showing (attach to see it).
+- "exited (1) No earlier conversation in this folder to continue": use **Restart** instead of **Restart + resume**.
+- "remote launch is not available": the phone shows why (no tmux, tmux older than 3.2, invalid launch.json, Windows).
 - Worker logs: `cd worker && npx wrangler tail`.
 
 ## Local development (no Cloudflare/Google needed)

@@ -67,6 +67,7 @@ function startDaemon(onFatal?: (code: number) => void): Daemon {
   daemon = new Daemon({
     config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
     socket: join(dir, "d.sock"),
+    launcher: false,
     ...(onFatal ? { onFatal } : {}),
   });
   return daemon;
@@ -175,6 +176,7 @@ describe("daemon", () => {
     daemon = new Daemon({
       config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
       socket: join(dir, "d.sock"),
+    launcher: false,
       onFatal: (c) => (exitCode = c),
       replacedDelayMs: 10,
     });
@@ -189,6 +191,7 @@ describe("daemon", () => {
     daemon = new Daemon({
       config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
       socket: join(dir, "d.sock"),
+    launcher: false,
       onFatal: (c) => (exitCode = c),
       replacedDelayMs: 10,
       stableAfterMs: 100,
@@ -232,6 +235,7 @@ describe("daemon", () => {
     const second = new Daemon({
       config: { url: `http://127.0.0.1:${port}`, token: "t".repeat(20), machine_id: "m1" },
       socket: join(dir, "d.sock"),
+    launcher: false,
     });
     await expect(second.start()).rejects.toThrow(/already listening/);
   });
