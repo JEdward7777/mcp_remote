@@ -35,3 +35,6 @@
   Pairing codes are approved by a signed-in user and mint a machine token bound to that user's `sub`; the Worker
   routes a token only to its own Hub. No code path lists or reads across Hubs. Owner allowlist (D7) becomes a
   sign-up allowlist / invite list. Note: all users share the deployer's free-tier quota.
+- D10 (proposed) Growth path: invite-only sign-up at launch (open-signup switch exists but off). Each tenant record
+  carries a `plan` field and per-tenant rate limits enforced in its Hub, so one user can't exhaust the shared free quota.
+  If it gets popular: move to Workers Paid and add billing (e.g. Stripe) keyed on `plan`. No billing code until needed.
