@@ -17,3 +17,11 @@
   Machines authenticate once via a device-pairing flow (shim prints a code, you approve on the phone, it stores a
   long-lived machine token locally). Phone uses OAuth. Hub keeps history so offline sessions still show with their logs.
   Phone page = list of sessions grouped by machine, online/offline dots, one chat thread per session.
+- D5 (proposed) Cloudflare free plan only. From memory (UNVERIFIED: developers.cloudflare.com is blocked from this
+  session's network): Workers 100k req/day; Durable Objects on free plan with SQLite storage; WebSocket Hibernation
+  means idle sockets cost ~nothing; inbound WS messages billed ~20:1 against requests; auto-response pings don't wake the DO.
+  Rules: no polling anywhere; hibernatable WebSockets only; ping/pong via setWebSocketAutoResponse; reconnect with
+  exponential backoff + jitter; Web Push (free, VAPID) instead of paid services.
+- D6 (proposed) One always-on daemon per computer (user service: systemd/launchd/Task Scheduler) holds the single
+  WebSocket to the Hub and can launch/relaunch Claude Code sessions in a terminal multiplexer (tmux), since channels need
+  an interactive session. Per-session stdio shims talk to the local daemon over localhost, not to Cloudflare directly.
