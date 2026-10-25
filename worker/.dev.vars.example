@@ -1,0 +1,7 @@
+# Copy to worker/.dev.vars for `wrangler dev`. Never commit .dev.vars.
+# At least 32 random characters, e.g. `openssl rand -base64 48`.
+SESSION_SECRET=change-me-change-me-change-me-change-me
+# Enables /auth/dev?user=<name> fake sign-in. LOCAL ONLY: never set this as a deployed secret/var.
+DEV_AUTH=1
+# Only needed to test real Google sign-in locally.
+GOOGLE_CLIENT_SECRET=

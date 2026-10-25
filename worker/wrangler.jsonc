@@ -1,0 +1,36 @@
+// Cloudflare Worker for mcp_remote. Free plan only (D5): SQLite-backed Durable Objects,
+// WebSocket Hibernation, static assets. Secrets (SESSION_SECRET, GOOGLE_CLIENT_SECRET) are set
+// with `wrangler secret put`; local values live in .dev.vars (never committed).
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "mcp-remote",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "build": {
+    // Bundles web/app.ts -> public/app.js before every `wrangler dev` / `wrangler deploy`.
+    "command": "node build-web.mjs"
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "none"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "HUB", "class_name": "Hub" },
+      { "name": "PAIRING", "class_name": "Pairing" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Hub", "Pairing"] }
+  ],
+  "vars": {
+    // Fill in after creating the Google OAuth client (see harness/SETUP.md).
+    "GOOGLE_CLIENT_ID": "",
+    // Comma-separated sign-up allowlist; ignored when OPEN_SIGNUP is "true".
+    "ALLOWED_EMAILS": "",
+    "OPEN_SIGNUP": "false"
+  },
+  "observability": { "enabled": true }
+}

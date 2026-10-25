@@ -1,0 +1,302 @@
+// One daemon per computer (D6): a single outbound WebSocket to the tenant's Hub, plus a local
+// IPC server that per-session shims connect to. Routes Hub -> shim by session_id.
+import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { chmodSync, existsSync, unlinkSync } from "node:fs";
+import WebSocket from "ws";
+import {
+  DaemonToHub,
+  HubToDaemon,
+  PROTOCOL_VERSION,
+  ShimToDaemon,
+  type DaemonToShim,
+  type SessionAnnounce,
+  backoffDelay,
+  parseFrame,
+} from "@mcp-remote/shared";
+import { type Config, ensureConfigDir, socketPath, wsUrl } from "./config";
+import { LineConn } from "./ipc";
+import { log } from "./log";
+
+export const EXIT_REVOKED = 3;
+const PING_EVERY_MS = 30_000;
+const DEAD_AFTER_MS = 75_000;
+const SEND_TIMEOUT_MS = 15_000;
+
+interface ShimEntry {
+  conn: LineConn<ShimToDaemon>;
+  session: SessionAnnounce;
+}
+
+interface PendingSend {
+  shim: LineConn<ShimToDaemon>;
+  shimReqId: string;
+  timer: NodeJS.Timeout;
+}
+
+export interface DaemonOptions {
+  config: Config;
+  socket?: string;
+  /** Called instead of process.exit when the Hub says this machine is revoked. */
+  onRevoked?: () => void;
+}
+
+export class Daemon {
+  private readonly shims = new Map<string, ShimEntry>();
+  private readonly pending = new Map<string, PendingSend>();
+  private ws: WebSocket | null = null;
+  private hubReady = false;
+  private attempt = 0;
+  private reqSeq = 0;
+  private reconnectTimer: NodeJS.Timeout | undefined;
+  private pingTimer: NodeJS.Timeout | undefined;
+  private lastRx = 0;
+  private server: Server | null = null;
+  private stopped = false;
+  readonly socket: string;
+
+  constructor(private readonly opts: DaemonOptions) {
+    this.socket = opts.socket ?? socketPath();
+  }
+
+  async start(): Promise<void> {
+    await this.listen();
+    this.connectHub();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    clearTimeout(this.reconnectTimer);
+    clearInterval(this.pingTimer);
+    this.ws?.close(1000, "daemon stopping");
+    for (const s of this.shims.values()) s.conn.close();
+    this.server?.close();
+    if (process.platform !== "win32" && existsSync(this.socket)) {
+      try {
+        unlinkSync(this.socket);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Local IPC
+
+  private async listen(): Promise<void> {
+    if (process.platform !== "win32") {
+      ensureConfigDir();
+      if (existsSync(this.socket)) {
+        const alive = await new Promise<boolean>((resolve) => {
+          const c = createConnection(this.socket);
+          c.once("connect", () => {
+            c.destroy();
+            resolve(true);
+          });
+          c.once("error", () => resolve(false));
+        });
+        if (alive) throw new Error(`another daemon is already listening on ${this.socket}`);
+        unlinkSync(this.socket);
+      }
+    }
+    const server = createServer((sock) => this.onShim(sock));
+    this.server = server;
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      // Restrictive umask so the socket is never briefly world-accessible.
+      const old = process.platform !== "win32" ? process.umask(0o177) : 0;
+      server.listen(this.socket, () => {
+        if (process.platform !== "win32") {
+          process.umask(old);
+          chmodSync(this.socket, 0o600);
+        }
+        resolve();
+      });
+    });
+    log(`listening for shims on ${this.socket}`);
+  }
+
+  private onShim(sock: Socket): void {
+    let sessionId: string | null = null;
+    const conn: LineConn<ShimToDaemon> = new LineConn(
+      sock,
+      ShimToDaemon,
+      (f) => {
+        if (f.t === "register") {
+          if (sessionId) return conn.send({ t: "error", error: "already registered" } satisfies DaemonToShim);
+          const existing = this.shims.get(f.session.session_id);
+          if (existing) {
+            conn.send({ t: "error", error: "session id already connected" } satisfies DaemonToShim);
+            conn.close();
+            return;
+          }
+          sessionId = f.session.session_id;
+          this.shims.set(sessionId, { conn, session: f.session });
+          log(`shim up: ${f.session.project} (${sessionId})`);
+          conn.send({ t: "registered", hub_connected: this.hubReady } satisfies DaemonToShim);
+          this.toHub({ t: "session_up", session: f.session });
+          return;
+        }
+        if (!sessionId) return conn.send({ t: "error", error: "register first" } satisfies DaemonToShim);
+        if (f.t === "send") {
+          if (!this.hubReady) {
+            conn.send({ t: "send_error", req_id: f.req_id, error: "daemon is not connected to the server right now" } satisfies DaemonToShim);
+            return;
+          }
+          const hubReq = `r${++this.reqSeq}`;
+          const timer = setTimeout(() => {
+            if (this.pending.delete(hubReq)) {
+              conn.send({ t: "send_error", req_id: f.req_id, error: "timed out waiting for the server" } satisfies DaemonToShim);
+            }
+          }, SEND_TIMEOUT_MS);
+          this.pending.set(hubReq, { shim: conn, shimReqId: f.req_id, timer });
+          this.toHub({ t: "send", req_id: hubReq, session_id: sessionId, text: f.text, urgency: f.urgency });
+          return;
+        }
+        if (f.t === "ack") {
+          this.toHub({ t: "ack", session_id: sessionId, ids: f.ids });
+        }
+      },
+      (error) => conn.send({ t: "error", error } satisfies DaemonToShim),
+    );
+    sock.on("error", () => {});
+    sock.on("close", () => {
+      for (const [k, p] of this.pending) {
+        if (p.shim === conn) {
+          clearTimeout(p.timer);
+          this.pending.delete(k);
+        }
+      }
+      if (sessionId && this.shims.get(sessionId)?.conn === conn) {
+        this.shims.delete(sessionId);
+        log(`shim down: ${sessionId}`);
+        this.toHub({ t: "session_down", session_id: sessionId });
+      }
+    });
+  }
+
+  private broadcastShims(frame: DaemonToShim): void {
+    for (const s of this.shims.values()) s.conn.send(frame);
+  }
+
+  // -------------------------------------------------------------------------
+  // Hub link
+
+  private toHub(frame: DaemonToHub): void {
+    if (!this.hubReady || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify(frame));
+  }
+
+  private connectHub(): void {
+    if (this.stopped) return;
+    const url = wsUrl(this.opts.config.url, "/api/daemon/ws");
+    const ws = new WebSocket(url, {
+      headers: { authorization: `Bearer ${this.opts.config.token}` },
+      handshakeTimeout: 15_000,
+      maxPayload: 1024 * 1024,
+    });
+    this.ws = ws;
+    let revoked = false;
+
+    ws.on("unexpected-response", (_req, res) => {
+      if (res.statusCode === 401) {
+        revoked = true;
+        log("server rejected this machine's token (revoked or unknown). Run `mcp-remote pair` again.");
+      } else {
+        log(`server refused websocket: HTTP ${res.statusCode}`);
+      }
+      res.resume();
+      ws.terminate();
+    });
+    ws.on("open", () => {
+      this.attempt = 0;
+      this.hubReady = true;
+      this.lastRx = Date.now();
+      log(`connected to ${this.opts.config.url}`);
+      const sessions = [...this.shims.values()].map((s) => s.session);
+      this.toHub({ t: "hello", v: PROTOCOL_VERSION, sessions });
+      this.broadcastShims({ t: "hub_status", connected: true });
+      clearInterval(this.pingTimer);
+      this.pingTimer = setInterval(() => {
+        if (Date.now() - this.lastRx > DEAD_AFTER_MS) {
+          log("no traffic from server; reconnecting");
+          ws.terminate();
+          return;
+        }
+        if (ws.readyState === WebSocket.OPEN) ws.send("ping");
+      }, PING_EVERY_MS);
+    });
+    ws.on("message", (data, isBinary) => {
+      this.lastRx = Date.now();
+      if (isBinary) return;
+      const text = data.toString();
+      if (text === "pong") return;
+      const r = parseFrame(HubToDaemon, text);
+      if (!r.ok) {
+        log("bad frame from server:", r.error);
+        return;
+      }
+      const f = r.value;
+      switch (f.t) {
+        case "welcome":
+          log(`server knows this machine as "${f.name}" (${f.machine_id})`);
+          return;
+        case "deliver": {
+          const shim = this.shims.get(f.session_id);
+          // If the shim is gone the Hub keeps the messages undelivered and resends on session_up.
+          if (shim) shim.conn.send({ t: "deliver", messages: f.messages } satisfies DaemonToShim);
+          return;
+        }
+        case "sent": {
+          const p = this.pending.get(f.req_id);
+          if (!p) return;
+          clearTimeout(p.timer);
+          this.pending.delete(f.req_id);
+          p.shim.send({ t: "sent", req_id: p.shimReqId, message_id: f.message_id } satisfies DaemonToShim);
+          return;
+        }
+        case "error": {
+          if (f.req_id) {
+            const p = this.pending.get(f.req_id);
+            if (p) {
+              clearTimeout(p.timer);
+              this.pending.delete(f.req_id);
+              p.shim.send({ t: "send_error", req_id: p.shimReqId, error: f.error } satisfies DaemonToShim);
+              return;
+            }
+          }
+          log("server error:", f.error);
+          return;
+        }
+      }
+    });
+    ws.on("error", (e) => log("websocket error:", e.message));
+    ws.on("close", (code, reason) => {
+      if (this.ws === ws) this.ws = null;
+      const wasReady = this.hubReady;
+      this.hubReady = false;
+      clearInterval(this.pingTimer);
+      for (const [k, p] of this.pending) {
+        clearTimeout(p.timer);
+        this.pending.delete(k);
+        p.shim.send({
+          t: "send_error",
+          req_id: p.shimReqId,
+          error: "connection to the server dropped; the message may not have been delivered",
+        } satisfies DaemonToShim);
+      }
+      if (wasReady) this.broadcastShims({ t: "hub_status", connected: false });
+      if (code === 4001) revoked = true;
+      if (revoked) {
+        log("this machine was revoked; daemon exiting. Pair again with `mcp-remote pair <url>`.");
+        this.stop();
+        if (this.opts.onRevoked) this.opts.onRevoked();
+        else process.exit(EXIT_REVOKED);
+        return;
+      }
+      if (this.stopped) return;
+      const delay = backoffDelay(this.attempt++, { baseMs: 1000, capMs: 60_000 });
+      log(`disconnected (${code}${reason.length ? " " + reason.toString() : ""}); retrying in ${Math.round(delay / 1000)}s`);
+      this.reconnectTimer = setTimeout(() => this.connectHub(), delay);
+    });
+  }
+}

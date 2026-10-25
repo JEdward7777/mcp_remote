@@ -1,0 +1,29 @@
+{
+  "name": "mcp-remote",
+  "version": "0.1.0",
+  "description": "Daemon + per-session Claude Code channel shim for mcp_remote",
+  "type": "module",
+  "bin": {
+    "mcp-remote": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ws": "^8.22.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@mcp-remote/shared": "*",
+    "@types/ws": "^8.18.2"
+  }
+}
