@@ -63,3 +63,9 @@
   and in Phase 4 urgency maps to Web Push behavior.
 - D20 (accepted) Build process = "Ratchet" pipeline (see harness/RATCHET.md). Commits/pushes happen automatically
   (no user approval) at logical moments; the Stop-hook autosync was removed.
+- D21 (accepted, made during Phase 1 build) Implementation details: tenant id `g-<sub>`; machine token
+  `mrm1.<tenant>.<machine>.<rand>.<hmac>` (HMAC checked at Worker, sha256 stored in Hub); Pairing DO per code,
+  8-char code, 10-min TTL, hibernatable wait socket; dev auth needs DEV_AUTH=1 and is refused on *.workers.dev;
+  Origin checks on cookie-authenticated writes + phone WS; daemon exit 3 = revoked/not allowed, 4 = token in use
+  elsewhere; session id hand-over only from a revoked computer (resync frame on revoke/forget/evict); 50 stored /
+  64 live sessions per machine; history capped at 1000 msgs/session (amortized trim, queued inbound never trimmed).
