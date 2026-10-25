@@ -232,7 +232,11 @@ export class Daemon {
     ws.on("unexpected-response", (_req, res) => {
       if (res.statusCode === 401) {
         revoked = true;
-        log("server rejected this machine's token (revoked or unknown). Run `mcp-remote pair` again.");
+        log(
+          "server rejected this machine's token (revoked or unknown, e.g. after a SESSION_SECRET rotation). " +
+            "Run `mcp-remote pair <url>` again, then revoke this computer's old entry on the phone (Machines) " +
+            "so its session ids are freed.",
+        );
       } else if (res.statusCode === 403) {
         revoked = true;
         log("server says this account is no longer allowed to sign in (removed from the sign-up list).");

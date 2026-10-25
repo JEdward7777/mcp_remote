@@ -516,3 +516,43 @@ describe("review round 2", () => {
     expect(e.error).toMatch(/too many live sessions/);
   });
 });
+
+describe("review round 3", () => {
+  it("names the owning computer in a refusal, and resyncs daemons after forget_session", async () => {
+    const a = await newMachine("xena", "old-laptop");
+    const b = await newMachine("xena", "new-laptop");
+    const da = await daemon(a.token);
+    da.send({ t: "hello", v: 1, sessions: [{ session_id: "fx", project: "p" }] });
+    await sleep(50);
+    da.send({ t: "session_down", session_id: "fx" });
+    const db = await daemon(b.token);
+    db.send({ t: "hello", v: 1, sessions: [{ session_id: "fx", project: "p" }] });
+    const e = await waitFor(() => db.frames.find((f) => f.t === "error" && f.session_id === "fx"), "refusal");
+    expect(e.error).toMatch(/"old-laptop"/);
+    expect(e.error).toMatch(/revoke it on the phone under Machines/);
+    const p = await phone("xena");
+    await waitFor(() => last(p, "state")?.sessions.find((s: any) => s.session_id === "fx" && !s.online), "offline");
+    p.send({ t: "forget_session", session_id: "fx" });
+    await waitFor(() => db.frames.find((f) => f.t === "resync"), "resync after forget");
+    db.send({ t: "hello", v: 1, sessions: [{ session_id: "fx", project: "p" }] });
+    await waitFor(
+      () => last(p, "state")?.sessions.find((s: any) => s.session_id === "fx" && s.online && s.machine_id === b.machineId),
+      "claimed after forget",
+    );
+  });
+
+  it("resyncs other daemons when eviction frees session ids", async () => {
+    const a = await newMachine("yuri", "a");
+    const b = await newMachine("yuri", "b");
+    const da = await daemon(a.token);
+    const db = await daemon(b.token);
+    da.send({ t: "hello", v: 1, sessions: [] });
+    db.send({ t: "hello", v: 1, sessions: [] });
+    for (let i = 0; i < 51; i++) {
+      da.send({ t: "session_up", session: { session_id: `y${i}`, project: "p" } });
+      da.send({ t: "session_down", session_id: `y${i}` });
+    }
+    await waitFor(() => db.frames.find((f) => f.t === "resync"), "resync to other daemon");
+    expect(da.frames.find((f) => f.t === "resync")).toBeUndefined();
+  });
+});

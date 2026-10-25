@@ -207,10 +207,7 @@ export class Hub extends DurableObject<Env> {
     }
     // Its session ids are free now: ask the other live daemons to re-announce, so a session that
     // was refused because of the collision is picked up without any polling.
-    for (const ws of this.ctx.getWebSockets("daemon")) {
-      const a = ws.deserializeAttachment() as Attachment | null;
-      if (a?.kind === "daemon" && a.machine_id !== machineId) this.sendDaemon(ws, { t: "resync" });
-    }
+    this.resyncDaemons(machineId);
     this.broadcastState();
     return true;
   }
@@ -387,6 +384,7 @@ export class Hub extends DurableObject<Env> {
         }
         this.sql.exec("DELETE FROM messages WHERE session_id = ?", f.session_id);
         this.sql.exec("DELETE FROM sessions WHERE session_id = ?", f.session_id);
+        this.resyncDaemons(); // the id is free now; a computer refused it may claim it
         this.broadcastState();
         return;
       }
@@ -477,9 +475,13 @@ export class Hub extends DurableObject<Env> {
       // Only a revoked owner gives a session id up (e.g. re-pairing a computer). Two active
       // computers announcing the same id is a configuration error: refuse it rather than
       // bouncing the session (and its pending messages) between them.
+      const owner = this.sql
+        .exec<{ name: string }>("SELECT name FROM machines WHERE machine_id = ?", existing.machine_id)
+        .toArray()[0]?.name;
       return (
-        `session id "${s.session_id}" is already used by another computer on this account; ` +
-        "give each computer its own MCP_REMOTE_SESSION_ID (or unset it)"
+        `session id "${s.session_id}" is already used by another computer on this account ` +
+        `("${owner ?? existing.machine_id}"). If that computer was re-paired or is gone, revoke it on the phone ` +
+        "under Machines; otherwise give each computer its own MCP_REMOTE_SESSION_ID (or unset it)"
       );
     }
     if (!existing || existing.machine_id !== machineId) {
@@ -528,6 +530,19 @@ export class Hub extends DurableObject<Env> {
     for (const v of victims) {
       this.sql.exec("DELETE FROM messages WHERE session_id = ?", v.session_id);
       this.sql.exec("DELETE FROM sessions WHERE session_id = ?", v.session_id);
+    }
+    // Freed ids may be what another computer was refused; the evicting machine already knows.
+    if (victims.length) this.resyncDaemons(machineId);
+  }
+
+  /**
+   * Ask live daemons (except `exceptMachine`) to re-send hello because a session id may have
+   * become free. Only sent on revoke/forget/evict, never in reply to a hello, so it cannot loop.
+   */
+  private resyncDaemons(exceptMachine?: string): void {
+    for (const ws of this.ctx.getWebSockets("daemon")) {
+      const a = ws.deserializeAttachment() as Attachment | null;
+      if (a?.kind === "daemon" && a.machine_id !== exceptMachine) this.sendDaemon(ws, { t: "resync" });
     }
   }
 

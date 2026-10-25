@@ -23,6 +23,8 @@ let attempt = 0;
 let reconnectTimer: number | undefined;
 let pingTimer: number | undefined;
 let clientSeq = 0;
+/** Random per-page prefix so client_ids from other tabs/devices (echoed to all phones) never collide. */
+const pageId = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("");
 /** Sends waiting for the Hub's echo; the draft is only cleared once the echo arrives. */
 const pendingSends = new Map<string, { sid: string; text: string }>();
 
@@ -308,7 +310,7 @@ function buildThread(sid: string): ThreadView {
     const text = ta.value.trim();
     if (!text || [...pendingSends.values()].some((p) => p.sid === sid)) return;
     drafts.set(sid, ta.value);
-    const client_id = `c${++clientSeq}`;
+    const client_id = `${pageId}-${++clientSeq}`;
     if (!send({ t: "send", session_id: sid, text, client_id })) {
       toast("Not connected; try again in a moment.");
       return;
@@ -427,6 +429,11 @@ function buildMachines(): MachinesView {
   return { root, list };
 }
 
+/** True if another active machine with the same name was paired later (likely a re-pair). */
+function newerSameName(m: MachineRecord): boolean {
+  return state.machines.some((o) => !o.revoked && o.machine_id !== m.machine_id && o.name === m.name && o.created_at > m.created_at);
+}
+
 function updateMachines(v: MachinesView): void {
   const active = state.machines.filter((m) => !m.revoked);
   const rows: Node[] = [];
@@ -445,6 +452,9 @@ function updateMachines(v: MachinesView): void {
         h("span", { class: m.online ? "dot on" : "dot off" }),
         h("span", { class: "proj" }, m.name),
         h("span", { class: "time" }, m.last_seen ? `seen ${fmtTime(m.last_seen)}` : "never connected"),
+        newerSameName(m)
+          ? h("span", { class: "badge u-urgent", title: "A newer computer with the same name was paired. If this is its old entry, revoke it." }, "older duplicate?")
+          : null,
         btn,
       ),
     );

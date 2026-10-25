@@ -67,7 +67,9 @@ daemon socket stays up until it reconnects; revoke the machine to cut it at once
 
 Optional: `GOOGLE_REDIRECT_URI` (only if you serve from a different URL than the request origin).
 **Never** set `DEV_AUTH` on the deployed Worker (it only belongs in `worker/.dev.vars`; the code also refuses it on
-`*.workers.dev`). Rotating `SESSION_SECRET` signs everyone out and invalidates every machine token (re-pair).
+`*.workers.dev`). Rotating `SESSION_SECRET` signs everyone out and invalidates every machine token: re-pair every computer, then
+revoke each computer's **old** entry on the phone (Machines). The old entries still count as active computers, so
+until they are revoked they keep holding their session ids and a fixed `MCP_REMOTE_SESSION_ID` is refused.
 
 ## 6. Deploy
 
@@ -103,6 +105,8 @@ mcp-remote pair $URL             # optional: --name "work laptop"
 It prints a code like `K7QX-M2RP`. On the phone: **Machines -> Pair a computer**, enter the code, **Approve**.
 The CLI prints `Paired "<name>" to <your email>` and saves `~/.config/mcp-remote/config.json` (mode 0600, dir 0700).
 Check that the email it prints is yours. Codes expire after 10 minutes.
+If you pair a computer again (new token), revoke its previous entry under Machines; the phone flags an older
+entry with the same name as "older duplicate?".
 
 ## 11. Run the daemon
 

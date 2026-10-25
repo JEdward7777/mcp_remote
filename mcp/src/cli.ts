@@ -27,7 +27,9 @@ async function main(argv: string[]): Promise<void> {
       if (!url) throw new Error("missing <worker-url>\n\n" + USAGE);
       const out = await pair(url, name ? { name } : {});
       process.stderr.write(
-        `Paired "${out.machine_name}" to ${out.account}.\nSaved ${out.configPath}\nNext: run \`mcp-remote daemon\`.\n`,
+        `Paired "${out.machine_name}" to ${out.account}.\nSaved ${out.configPath}\n` +
+          `If this computer was paired before, revoke its old entry on the phone (Machines) so its session ids are freed.\n` +
+          `Next: run \`mcp-remote daemon\` (restart it if it was already running).\n`,
       );
       return;
     }
