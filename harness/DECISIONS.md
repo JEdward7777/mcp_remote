@@ -56,3 +56,5 @@
   Not aiming for Remote Control parity (see D17); multi-session support is the part we match.
 - D17 (accepted) Messaging model: discrete, intentional events in both directions. The agent decides when to message
   the user (reply/notify tools); the user's messages arrive as single channel events. No live activity/transcript feed.
+- D18 (accepted) No permission relay for now. User runs sessions in auto-approve mode; the daemon will launch sessions
+  in the user's chosen permission mode. Relay (D3 bonus) parked.
