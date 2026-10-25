@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   DaemonToHub,
+  HubToDaemon,
   HubToPhone,
+  LaunchRecord,
   MAX_FRAME_BYTES,
   MAX_TEXT_CHARS,
   PhoneToHub,
@@ -94,5 +96,51 @@ describe("backoffDelay", () => {
       expect(d).toBeGreaterThanOrEqual(250);
       expect(d).toBeLessThanOrEqual(60_000);
     }
+  });
+});
+
+describe("remote launch frames (Phase 2)", () => {
+  const rec = {
+    launch_id: "mr-0123456789ab",
+    session_id: "mr-0123456789ab",
+    project_id: "p0123456789abcde",
+    project: "alpha",
+    state: "needs_attention",
+    exit_code: null,
+    detail: "answer the dialog",
+    continued: false,
+    auto_restart: false,
+    restarts: 0,
+    started_at: 1,
+    updated_at: 2,
+  };
+
+  it("accepts launch requests that carry only opaque ids", () => {
+    const ok = parseFrame(PhoneToHub, JSON.stringify({ t: "launch", machine_id: "m1", project_id: "p0123456789abcde", continue: true, client_id: "c1" }));
+    expect(ok.ok).toBe(true);
+    for (const project_id of ["/home/you/code", "../x", "a b", "x".repeat(65), "a;rm"]) {
+      expect(parseFrame(PhoneToHub, JSON.stringify({ t: "launch", machine_id: "m1", project_id, continue: false, client_id: "c" })).ok).toBe(false);
+    }
+    // No free-form command/path fields survive parsing.
+    const extra = parseFrame(PhoneToHub, JSON.stringify({ t: "launch", machine_id: "m1", project_id: "p1", continue: false, client_id: "c", cmd: "rm -rf /", cwd: "/" }));
+    expect(extra.ok && JSON.stringify(extra.value)).not.toMatch(/rm -rf|cwd/);
+    expect(parseFrame(PhoneToHub, JSON.stringify({ t: "launch_stop", machine_id: "m1", launch_id: "mr-xyz", client_id: "c" })).ok).toBe(false);
+    expect(parseFrame(PhoneToHub, JSON.stringify({ t: "launch_restart", machine_id: "m1", launch_id: "mr-0123456789ab", client_id: "c" })).ok).toBe(false);
+    expect(parseFrame(PhoneToHub, JSON.stringify({ t: "launch", machine_id: "m1", project_id: "p1", client_id: "c" })).ok).toBe(false);
+  });
+
+  it("validates launch records and caps list sizes", () => {
+    expect(LaunchRecord.safeParse(rec).success).toBe(true);
+    expect(LaunchRecord.safeParse({ ...rec, state: "zombie" }).success).toBe(false);
+    expect(LaunchRecord.safeParse({ ...rec, detail: "x".repeat(401) }).success).toBe(false);
+    const many = Array.from({ length: 17 }, () => rec);
+    expect(parseFrame(DaemonToHub, JSON.stringify({ t: "launches", launches: many })).ok).toBe(false);
+    expect(parseFrame(DaemonToHub, JSON.stringify({ t: "launches", launches: many.slice(0, 16) })).ok).toBe(true);
+    expect(
+      parseFrame(DaemonToHub, JSON.stringify({ t: "projects", projects: [{ id: "p1", name: "alpha" }], available: true, launch_error: null, max_sessions: 4 })).ok,
+    ).toBe(true);
+    expect(parseFrame(HubToDaemon, JSON.stringify({ t: "launch", req_id: "r", project_id: "p1", continue: false })).ok).toBe(true);
+    expect(parseFrame(ShimToDaemon, JSON.stringify({ t: "register", v: 1, session: { session_id: "mr-0123456789ab", project: "a" }, launch_token: "tok" })).ok).toBe(true);
+    expect(parseFrame(ShimToDaemon, JSON.stringify({ t: "reload" })).ok).toBe(true);
   });
 });

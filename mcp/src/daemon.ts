@@ -16,6 +16,8 @@ import {
 } from "@mcp-remote/shared";
 import { type Config, ensureConfigDir, socketPath, wsUrl } from "./config";
 import { LineConn } from "./ipc";
+import { loadLaunchConfig } from "./launch-config";
+import { Launcher, type LauncherOptions } from "./launcher";
 import { log } from "./log";
 
 export const EXIT_REVOKED = 3;
@@ -33,6 +35,8 @@ const SEND_TIMEOUT_MS = 15_000;
 interface ShimEntry {
   conn: LineConn<ShimToDaemon>;
   session: SessionAnnounce;
+  /** Linked to a phone launch (the shim presented that launch's current token). */
+  launched: boolean;
   /** Set when the Hub refused this session (e.g. id used by another computer). */
   refused: string | null;
 }
@@ -52,6 +56,8 @@ export interface DaemonOptions {
   replacedDelayMs?: number;
   /** A connection that lived this long resets the replaced streak (tests shorten it). */
   stableAfterMs?: number;
+  /** Remote launch support (launch.json); `false` disables it, an object overrides launcher options (tests). */
+  launcher?: false | Partial<LauncherOptions>;
 }
 
 export class Daemon {
@@ -69,18 +75,32 @@ export class Daemon {
   private server: Server | null = null;
   private stopped = false;
   readonly socket: string;
+  readonly launcher: Launcher | null;
 
   constructor(private readonly opts: DaemonOptions) {
     this.socket = opts.socket ?? socketPath();
+    this.launcher =
+      opts.launcher === false
+        ? null
+        : new Launcher({
+            loadConfig: loadLaunchConfig,
+            // Launched shims must find this daemon whatever config dir they would otherwise use.
+            extraEnv: { MCP_REMOTE_SOCKET: this.socket },
+            ...(opts.launcher ?? {}),
+            onChange: (launches) => this.toHub({ t: "launches", launches }),
+          });
   }
 
   async start(): Promise<void> {
     await this.listen();
+    if (this.launcher) await this.launcher.init();
     this.connectHub();
   }
 
   stop(): void {
     this.stopped = true;
+    // Launched tmux sessions keep running; the next daemon re-adopts them from launches.json.
+    this.launcher?.dispose();
     clearTimeout(this.reconnectTimer);
     clearInterval(this.pingTimer);
     this.ws?.close(1000, "daemon stopping");
@@ -139,8 +159,22 @@ export class Daemon {
       (f) => {
         if (f.t === "register") {
           if (sessionId) return conn.send({ t: "error", error: "already registered" } satisfies DaemonToShim);
+          const link = this.launcher?.shimRegister(f.session.session_id, f.launch_token) ?? "none";
+          if (link === "reject") {
+            conn.send({
+              t: "register_refused",
+              error: `session id "${f.session.session_id}" belongs to a phone-launched session; only the shim that session starts can use it`,
+            } satisfies DaemonToShim);
+            conn.close();
+            return;
+          }
           const existing = this.shims.get(f.session.session_id);
-          if (existing) {
+          if (existing && link === "linked") {
+            // A previous spawn's shim that hasn't gone away yet: the current spawn wins.
+            existing.conn.send({ t: "register_refused", error: "superseded by a restarted session" } satisfies DaemonToShim);
+            this.shims.delete(f.session.session_id);
+            existing.conn.close();
+          } else if (existing) {
             conn.send({
               t: "register_refused",
               error:
@@ -151,6 +185,7 @@ export class Daemon {
             return;
           }
           if (this.shims.size >= MAX_SESSIONS_PER_MACHINE) {
+            if (link === "linked") this.launcher?.shimDown(f.session.session_id);
             conn.send({
               t: "register_refused",
               error: `too many live sessions on this computer (max ${MAX_SESSIONS_PER_MACHINE})`,
@@ -159,10 +194,16 @@ export class Daemon {
             return;
           }
           sessionId = f.session.session_id;
-          this.shims.set(sessionId, { conn, session: f.session, refused: null });
+          this.shims.set(sessionId, { conn, session: f.session, refused: null, launched: link === "linked" });
           log(`shim up: ${f.session.project} (${sessionId})`);
           conn.send({ t: "registered", hub_connected: this.hubReady } satisfies DaemonToShim);
           this.toHub({ t: "session_up", session: f.session });
+          return;
+        }
+        if (f.t === "reload") {
+          void this.reloadLaunchConfig().then((err) =>
+            conn.send({ t: "reloaded", ok: !err, ...(err ? { error: err } : {}) } satisfies DaemonToShim),
+          );
           return;
         }
         if (!sessionId) return conn.send({ t: "error", error: "register first" } satisfies DaemonToShim);
@@ -201,9 +242,11 @@ export class Daemon {
         }
       }
       if (sessionId && this.shims.get(sessionId)?.conn === conn) {
+        const launched = this.shims.get(sessionId)?.launched;
         this.shims.delete(sessionId);
         log(`shim down: ${sessionId}`);
         this.toHub({ t: "session_down", session_id: sessionId });
+        if (launched) this.launcher?.shimDown(sessionId);
       }
     });
   }
@@ -218,10 +261,39 @@ export class Daemon {
     this.toHub({ t: "hello", v: PROTOCOL_VERSION, sessions: [...this.shims.values()].map((s) => s.session) });
   }
 
+  /** Re-read launch.json and re-advertise; returns an error text when launching is unavailable. */
+  private async reloadLaunchConfig(): Promise<string | null> {
+    if (!this.launcher) return "remote launch is disabled in this daemon";
+    await this.launcher.reload();
+    this.sendLaunchInfo();
+    const i = this.launcher.info();
+    return i.available ? null : i.launch_error;
+  }
+
+  private sendLaunchInfo(): void {
+    if (!this.launcher) return;
+    const i = this.launcher.info();
+    this.toHub({ t: "projects", projects: i.projects, available: i.available, launch_error: i.launch_error, max_sessions: i.max_sessions });
+    this.toHub({ t: "launches", launches: this.launcher.records() });
+  }
+
+  private async onLaunchFrame(f: Extract<HubToDaemon, { t: "launch" | "launch_stop" | "launch_restart" | "launch_dismiss" }>): Promise<void> {
+    const l = this.launcher;
+    let r: { ok: boolean; error?: string };
+    if (!l) r = { ok: false, error: "remote launch is disabled on this computer" };
+    else if (f.t === "launch") r = await l.launch(f.project_id, { continue: f.continue, ...(f.auto_restart !== undefined ? { auto_restart: f.auto_restart } : {}) });
+    else if (f.t === "launch_stop") r = await l.stop(f.launch_id);
+    else if (f.t === "launch_restart") r = await l.restart(f.launch_id, f.continue);
+    else r = await l.dismiss(f.launch_id);
+    this.toHub({ t: "launch_result", req_id: f.req_id, ok: r.ok, ...(r.ok ? {} : { error: (r.error ?? "failed").slice(0, 400) }) });
+  }
+
   private fatal(exitCode: number): void {
     this.stop();
     if (this.opts.onFatal) this.opts.onFatal(exitCode);
-    else process.exit(exitCode);
+    // launchd (and Task Scheduler) cannot be told "don't restart on exit 3/4"; their units set
+    // MCP_REMOTE_FATAL_EXIT_ZERO=1 and restart only on non-zero exits instead (see service.ts).
+    else process.exit(process.env.MCP_REMOTE_FATAL_EXIT_ZERO === "1" ? 0 : exitCode);
   }
 
   // -------------------------------------------------------------------------
@@ -268,6 +340,7 @@ export class Daemon {
       this.lastRx = Date.now();
       log(`connected to ${this.opts.config.url}`);
       this.sendHello();
+      this.sendLaunchInfo();
       this.broadcastShims({ t: "hub_status", connected: true });
       clearInterval(this.pingTimer);
       this.pingTimer = setInterval(() => {
@@ -296,6 +369,12 @@ export class Daemon {
           return;
         case "resync":
           this.sendHello();
+          return;
+        case "launch":
+        case "launch_stop":
+        case "launch_restart":
+        case "launch_dismiss":
+          void this.onLaunchFrame(f);
           return;
         case "deliver": {
           const shim = this.shims.get(f.session_id);

@@ -6,8 +6,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket as WsSocket } from "ws";
 import { DaemonToShim } from "@mcp-remote/shared";
+import { mkdirSync, realpathSync } from "node:fs";
 import { Daemon } from "../src/daemon";
 import { LineConn } from "../src/ipc";
+import { LaunchConfig, projectIdFor } from "../src/launch-config";
+import { FakeTmux } from "./fake-tmux";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function waitFor<T>(fn: () => T | undefined | null | false, what = "condition", timeout = 4000): Promise<T> {
@@ -231,5 +234,84 @@ describe("daemon", () => {
       socket: join(dir, "d.sock"),
     });
     await expect(second.start()).rejects.toThrow(/already listening/);
+  });
+});
+
+describe("daemon remote launch", () => {
+  async function setup() {
+    const code = join(realpathSync(dir), "code");
+    mkdirSync(join(code, "alpha"), { recursive: true });
+    const cfg = LaunchConfig.parse({ roots: [code], claude_path: "/opt/fake/claude", max_sessions: 1 });
+    const tmux = new FakeTmux();
+    daemon = new Daemon({
+      config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
+      socket: join(dir, "d.sock"),
+      launcher: { loadConfig: () => cfg, tmux, tickMs: 10, livenessMs: 20, stopWaitMs: 200 },
+    });
+    await daemon.start();
+    await waitFor(() => hubSockets.length === 1, "connect");
+    return { tmux, alpha: projectIdFor(join(code, "alpha")) };
+  }
+  const hub = (f: unknown) => hubSockets[0]!.send(JSON.stringify(f));
+  const lastLaunches = () => [...hubFrames].reverse().find((f) => f.t === "launches")?.launches ?? [];
+
+  it("advertises projects after hello and launches only allowlisted ids from the Hub", async () => {
+    const { tmux, alpha } = await setup();
+    const proj = await waitFor(() => hubFrames.find((f) => f.t === "projects"), "projects frame");
+    expect(proj).toMatchObject({ available: true, max_sessions: 1, projects: [{ id: alpha, name: "alpha" }] });
+    expect(hubFrames.findIndex((f) => f.t === "hello")).toBeLessThan(hubFrames.findIndex((f) => f.t === "projects"));
+    expect(JSON.stringify(proj)).not.toContain(dir);
+
+    hub({ t: "launch", req_id: "c1", project_id: "pdeadbeefdeadbee", continue: false });
+    const bad = await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "c1"), "refusal");
+    expect(bad).toMatchObject({ ok: false, error: expect.stringMatching(/allowlist/) });
+    expect(tmux.spawns).toHaveLength(0);
+
+    hub({ t: "launch", req_id: "c2", project_id: alpha, continue: false });
+    await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "c2" && f.ok), "launch ok");
+    const id = tmux.spawns[0]!.name;
+    expect(lastLaunches()[0]).toMatchObject({ launch_id: id, session_id: id, state: "starting" });
+
+    // A shim without the launch token cannot take the launch's session id.
+    const impostor = await shim(id, "alpha");
+    expect(impostor.frames[0]).toMatchObject({ t: "register_refused", error: expect.stringMatching(/phone-launched/) });
+
+    // The real shim (token from the tmux env) links the launch and comes up as a session.
+    const sock = createConnection(join(dir, "d.sock"));
+    await new Promise<void>((r) => sock.once("connect", () => r()));
+    const frames: any[] = [];
+    const conn = new LineConn(sock, DaemonToShim, (f) => frames.push(f), () => {});
+    conn.send({ t: "register", v: 1, session: { session_id: id, project: "alpha" }, launch_token: tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN });
+    await waitFor(() => frames.find((f) => f.t === "registered"), "registered");
+    await waitFor(() => lastLaunches()[0]?.state === "running", "running");
+    expect(hubFrames.find((f) => f.t === "session_up" && f.session.session_id === id)).toBeTruthy();
+
+    // Cap of 1 concurrent launch.
+    hub({ t: "launch", req_id: "c3", project_id: alpha, continue: false });
+    await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "c3"), "cap");
+    expect(hubFrames.find((f) => f.t === "launch_result" && f.req_id === "c3")).toMatchObject({ ok: false, error: expect.stringMatching(/max 1/) });
+
+    // Claude Code exits: shim goes away, the pane is dead -> exited with the code.
+    tmux.die(id, 9, "segfault");
+    conn.close();
+    await waitFor(() => lastLaunches()[0]?.state === "exited", "exited");
+    expect(lastLaunches()[0]).toMatchObject({ exit_code: 9, detail: "segfault" });
+
+    hub({ t: "launch_dismiss", req_id: "c4", launch_id: id });
+    await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "c4" && f.ok), "dismissed");
+    expect(lastLaunches()).toEqual([]);
+  });
+
+  it("re-reads launch.json on a local reload request", async () => {
+    await setup();
+    await waitFor(() => hubFrames.find((f) => f.t === "projects"), "projects frame");
+    const sock = createConnection(join(dir, "d.sock"));
+    await new Promise<void>((r) => sock.once("connect", () => r()));
+    const frames: any[] = [];
+    const conn = new LineConn(sock, DaemonToShim, (f) => frames.push(f), () => {});
+    conn.send({ t: "reload" });
+    await waitFor(() => frames.find((f) => f.t === "reloaded"), "reloaded");
+    expect(frames[0]).toEqual({ t: "reloaded", ok: true });
+    await waitFor(() => hubFrames.filter((f) => f.t === "projects").length === 2, "re-advertised");
   });
 });

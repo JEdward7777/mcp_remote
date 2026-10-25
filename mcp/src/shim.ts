@@ -62,6 +62,8 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
     process.exit(2);
   }
   const sessionId = parsedSid.data;
+  // Set by the daemon for phone-launched sessions (it links this shim to the launch).
+  const launchToken = process.env.MCP_REMOTE_LAUNCH_TOKEN?.slice(0, 64) || undefined;
   setLogPrefix(`mcp-remote shim ${project}/${sessionId.slice(0, 8)}`);
   const sockPath = opts.socket ?? socketPath();
 
@@ -191,6 +193,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
         t: "register",
         v: PROTOCOL_VERSION,
         session: { session_id: sessionId, project: project.slice(0, 128), cwd: cwd.slice(0, 1024) },
+        ...(launchToken ? { launch_token: launchToken } : {}),
       } satisfies ShimToDaemon);
     });
     sock.on("error", () => {

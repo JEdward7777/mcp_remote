@@ -63,3 +63,26 @@ form.pair input[name=code] { font: 22px ui-monospace, monospace; letter-spacing:
 .signin { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 64px 16px; text-align: center; }
 .signin form.dev { display: flex; flex-direction: column; gap: 8px; margin-top: 32px; }
 #toast { position: fixed; left: 50%; bottom: 80px; transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 10px; max-width: 90vw; }
+/* Remote launch (Phase 2) */
+:root { --attn: #d29922; }
+form.launcher { display: flex; flex-direction: column; gap: 6px; padding: 4px 16px 10px; border-bottom: 1px solid var(--line); }
+.launcher-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.launcher-row select { flex: 1; min-width: 0; font: inherit; padding: 8px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+.launcher-row.opts { font-size: 13px; color: var(--muted); gap: 14px; }
+.launcher-row.opts label { display: flex; align-items: center; gap: 4px; }
+.launch-note { margin: 0; font-size: 13px; }
+.launch-row, .launch-bar { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+.launch-top { display: flex; align-items: center; gap: 8px; }
+.launch-top a.proj { color: inherit; }
+.launch-detail { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.launch-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.launch-actions button.small { margin-left: 0; }
+button.ghost { background: none; color: var(--muted); border: 1px solid var(--line); }
+button:disabled { opacity: .45; cursor: default; }
+.badge.st-starting { border-color: var(--accent); color: var(--accent); }
+.badge.st-running { border-color: var(--on); color: var(--on); }
+.badge.st-needs_attention { background: var(--attn); border-color: var(--attn); color: #000; font-weight: 700; }
+.badge.st-failed { background: var(--urgent); border-color: var(--urgent); color: #fff; }
+.launch-row.st-needs_attention, .launch-bar.st-needs_attention { border-left: 4px solid var(--attn); }
+.launch-row.st-needs_attention .launch-detail, .launch-bar.st-needs_attention .launch-detail { color: var(--fg); }
+.launch-row.st-failed, .launch-bar.st-failed { border-left: 4px solid var(--urgent); }

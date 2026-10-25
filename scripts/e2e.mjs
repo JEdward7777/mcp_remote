@@ -2,8 +2,8 @@
 // End-to-end test: real `wrangler dev` (workerd + Durable Objects, fully local), dev auth,
 // a paired daemon, two shims driven by the MCP SDK client (standing in for Claude Code),
 // and phone WebSockets. Run with `npm run e2e` (builds first).
-import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,6 +14,16 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI = join(root, "mcp", "dist", "cli.js");
+const FAKE_CLAUDE = join(root, "scripts", "fake-claude.mjs");
+const TMUX_SOCKET = `mr-e2e-${process.pid}`;
+const HAVE_TMUX = (() => {
+  try {
+    execFileSync("tmux", ["-V"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
 const tmp = mkdtempSync(join(tmpdir(), "mcpr-e2e-"));
 const children = [];
 const results = [];
@@ -69,6 +79,13 @@ function spawnLogged(name, cmd, args, opts = {}) {
 }
 
 function cleanup() {
+  if (HAVE_TMUX) {
+    try {
+      execFileSync("tmux", ["-L", TMUX_SOCKET, "kill-server"], { stdio: "ignore" });
+    } catch {
+      /* not running */
+    }
+  }
   for (const c of children) {
     if (c.exitCode === null && c.signalCode === null) {
       try {
@@ -114,6 +131,11 @@ function phone(base, cookie) {
       const f = JSON.parse(s);
       p.frames.push(f);
       if (f.t === "state") p.state = f;
+      // Like the PWA: launch changes arrive as small per-machine frames between state frames.
+      if (f.t === "launches") {
+        const m = p.state?.machines.find((x) => x.machine_id === f.machine_id);
+        if (m?.launch) m.launch.launches = f.launches;
+      }
     });
     ws.once("open", () => resolve(p));
     ws.once("error", reject);
@@ -242,9 +264,17 @@ async function main() {
 
   // --- daemon + phone -----------------------------------------------------------------
   logStep("starting daemon and phone sockets");
-  const daemon = spawnLogged("daemon", process.execPath, [CLI, "daemon"], {
-    env: { ...process.env, MCP_REMOTE_CONFIG_DIR: machineDir },
-  });
+  // Launch settings for the remote-launch part: a fake `claude`, our own tmux server socket.
+  const launchRoot = join(tmp, "launch-root");
+  mkdirSync(join(launchRoot, "gamma"), { recursive: true });
+  writeFileSync(
+    join(machineDir, "launch.json"),
+    JSON.stringify({ claude_path: FAKE_CLAUDE, tmux_socket: TMUX_SOCKET, startup_timeout_s: 30, permission_mode: "acceptEdits" }),
+    { mode: 0o600 },
+  );
+  const fakeLog = join(tmp, "fake-claude.log");
+  const daemonEnv = { ...process.env, MCP_REMOTE_CONFIG_DIR: machineDir, FAKE_CLAUDE_LOG: fakeLog, FAKE_CLAUDE_SHIM_CLI: CLI };
+  const daemon = spawnLogged("daemon", process.execPath, [CLI, "daemon"], { env: daemonEnv });
   await waitFor(() => /connected to/.test(daemon.output), { timeout: 15_000, what: "daemon to connect" });
   const sockStat = statSync(join(machineDir, "daemon.sock"));
   check("daemon IPC socket is mode 0600", (sockStat.mode & 0o777) === 0o600, (sockStat.mode & 0o777).toString(8));
@@ -401,9 +431,7 @@ async function main() {
   check("sessions show offline while the daemon is down", !sessionOf(pa, "sess-a")?.online);
   const down = await shimB.client.callTool({ name: "send_message", arguments: { text: "daemon down?" } });
   check("send_message errors clearly while the daemon is down", down.isError === true && /daemon/.test(down.content?.[0]?.text ?? ""), JSON.stringify(down));
-  const daemonR = spawnLogged("daemonR", process.execPath, [CLI, "daemon"], {
-    env: { ...process.env, MCP_REMOTE_CONFIG_DIR: machineDir },
-  });
+  const daemonR = spawnLogged("daemonR", process.execPath, [CLI, "daemon"], { env: daemonEnv });
   await waitFor(() => sessionOf(pa, "sess-a")?.online && sessionOf(pa, "sess-b")?.online, {
     timeout: 40_000,
     what: "shims to re-register after daemon restart",
@@ -416,9 +444,114 @@ async function main() {
   );
   check("send_message works again after reconnect (urgency silent)", !again.isError && outSilent.message.urgency === "silent");
 
+
+  // --- remote launch (Phase 2) ----------------------------------------------------------
+  let liveDaemon = daemonR;
+  if (!HAVE_TMUX) {
+    check("tmux is available for the remote-launch e2e (install tmux 3.2+)", false);
+  } else {
+    logStep("remote launch: allowlist a root folder via the CLI (daemon reloads)");
+    const add = spawnLogged("projects", process.execPath, [CLI, "projects", "add-root", launchRoot], { env: daemonEnv });
+    await waitFor(() => add.exitCode !== null, { what: "projects add-root" });
+    check("`mcp-remote projects add-root` notifies the running daemon", /daemon reloaded/.test(add.output), add.output);
+    const mstate = () => pa.state.machines.find((m) => m.machine_id === machineId);
+    const gamma = await waitFor(() => mstate()?.launch?.projects.find((p) => p.name === "gamma"), { what: "gamma advertised" });
+    check("phone sees the allowlisted project with an opaque id", /^p[0-9a-f]{15}$/.test(gamma.id) && mstate().launch.available, JSON.stringify(mstate().launch));
+    check("no filesystem path reaches the phone", !JSON.stringify(pa.state.machines).includes(tmp));
+
+    let seq = 0;
+    const op = async (frame, what) => {
+      const client_id = `L${++seq}`;
+      pa.send({ ...frame, machine_id: machineId, client_id });
+      return waitFor(() => pa.frames.find((f) => f.t === "launch_result" && f.client_id === client_id), { what, timeout: 20_000 });
+    };
+    const launchOf = (id) => mstate()?.launch?.launches.find((l) => l.launch_id === id);
+    const fakeEvents = () =>
+      existsSync(fakeLog) ? readFileSync(fakeLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+    const tmuxHas = (name) => {
+      try {
+        execFileSync("tmux", ["-L", TMUX_SOCKET, "has-session", "-t", `=${name}`], { stdio: "ignore" });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const refused = await op({ t: "launch", project_id: "p000000000000000", continue: false }, "refusal");
+    check("launch of a non-allowlisted project id is refused", refused.ok === false && /allowlist/.test(refused.error ?? ""), JSON.stringify(refused));
+
+    logStep("remote launch: start a session from the phone");
+    const started = await op({ t: "launch", project_id: gamma.id, continue: false }, "launch result");
+    check("phone launch request accepted", started.ok, JSON.stringify(started));
+    const L = await waitFor(() => mstate().launch.launches.find((l) => l.project_id === gamma.id), { what: "launch record" });
+    const lid = L.launch_id;
+    check("launch record links launch id = session id = tmux name mr-<hex>", /^mr-[0-9a-f]{12}$/.test(lid) && L.session_id === lid && tmuxHas(lid), JSON.stringify(L));
+    await waitFor(() => launchOf(lid)?.state === "running", { timeout: 30_000, what: "launch running" });
+    const sess = await waitFor(() => sessionOf(pa, lid)?.online && sessionOf(pa, lid), { what: "launched session online" });
+    check("launched session comes online on the phone, linked by session id, named after the folder", sess.project === "gamma", JSON.stringify(sess));
+    const ev = fakeEvents();
+    const st0 = ev.find((e) => e.event === "start" && e.session === lid);
+    check(
+      "fake claude ran in the project dir with the channel flag and permission mode (argv, no shell)",
+      st0 && st0.cwd === join(launchRoot, "gamma") &&
+        JSON.stringify(st0.argv) === JSON.stringify(["--dangerously-load-development-channels", "server:mcp-remote", "--permission-mode", "acceptEdits"]),
+      JSON.stringify(st0),
+    );
+    check("daemon answered the development-channels warning with '1'", ev.some((e) => e.event === "dialog_accepted" && e.key === "1" && e.session === lid));
+    check("launched session gets MCP_REMOTE_LAUNCH_TOKEN and no inherited CLAUDECODE", st0?.has_token === true && st0?.claudecode === null, JSON.stringify(st0));
+
+    pa.send({ t: "send", session_id: lid, text: "hello launched" });
+    const echo = await waitFor(
+      () => pa.frames.find((f) => f.t === "message" && f.message.session_id === lid && f.message.text === "echo: hello launched"),
+      { what: "echo from launched session", timeout: 15_000 },
+    );
+    check("phone <-> launched session messaging works end to end", !!echo);
+
+    logStep("remote launch: restart with --continue");
+    const rs = await op({ t: "launch_restart", launch_id: lid, continue: true }, "restart result");
+    check("restart (resume) accepted", rs.ok, JSON.stringify(rs));
+    await waitFor(() => fakeEvents().filter((e) => e.event === "mcp_connected" && e.session === lid).length === 2, { timeout: 30_000, what: "second spawn" });
+    await waitFor(() => launchOf(lid)?.state === "running" && sessionOf(pa, lid)?.online, { timeout: 30_000, what: "running after restart" });
+    const starts = fakeEvents().filter((e) => e.event === "start" && e.session === lid);
+    check("restart re-spawned claude with --continue under the same session id", starts.length === 2 && starts[1].argv.includes("--continue") && launchOf(lid).continued, JSON.stringify(starts));
+    check("the old process got SIGHUP from tmux", fakeEvents().some((e) => e.event === "signal" && e.sig === "SIGHUP" && e.pid === starts[0].pid));
+    pa.send({ t: "history", session_id: lid });
+    const h = await waitFor(() => pa.frames.find((f) => f.t === "history" && f.session_id === lid), { what: "history" });
+    check("thread history survives the restart", h.messages.some((m) => m.text === "echo: hello launched"));
+
+    logStep("remote launch: stop");
+    const sp = await op({ t: "launch_stop", launch_id: lid }, "stop result");
+    await waitFor(() => launchOf(lid)?.state === "exited" && !sessionOf(pa, lid)?.online, { timeout: 15_000, what: "stopped" });
+    check("stop ends the tmux session and reports exited (stopped)", sp.ok && !tmuxHas(lid) && launchOf(lid).detail === "stopped from the phone", JSON.stringify(launchOf(lid)));
+
+    logStep("remote launch: fresh restart, then a crash");
+    const rf = await op({ t: "launch_restart", launch_id: lid, continue: false }, "fresh restart");
+    await waitFor(() => launchOf(lid)?.state === "running" && sessionOf(pa, lid)?.online, { timeout: 30_000, what: "running again" });
+    check("restart after stop works (fresh)", rf.ok && !fakeEvents().filter((e) => e.event === "start" && e.session === lid).at(-1).argv.includes("--continue"));
+    pa.send({ t: "send", session_id: lid, text: "crash" });
+    await waitFor(() => launchOf(lid)?.state === "exited", { timeout: 30_000, what: "exited after crash" });
+    check("a crash is reported as exited with the exit code and last output", launchOf(lid).exit_code === 7 && /simulated crash/.test(launchOf(lid).detail ?? ""), JSON.stringify(launchOf(lid)));
+
+    logStep("remote launch: daemon restart re-adopts a running session");
+    const again = await op({ t: "launch_restart", launch_id: lid, continue: true }, "restart for re-adopt");
+    await waitFor(() => launchOf(lid)?.state === "running", { timeout: 30_000, what: "running before daemon restart" });
+    const pidBefore = fakeEvents().filter((e) => e.event === "start" && e.session === lid).at(-1).pid;
+    liveDaemon.kill("SIGTERM");
+    await waitFor(() => liveDaemon.exitCode !== null || liveDaemon.signalCode !== null, { what: "daemon stopped" });
+    check("stopping the daemon leaves the launched tmux session running", again.ok && tmuxHas(lid));
+    liveDaemon = spawnLogged("daemonL", process.execPath, [CLI, "daemon"], { env: daemonEnv });
+    await waitFor(() => launchOf(lid)?.state === "running" && sessionOf(pa, lid)?.online, { timeout: 45_000, what: "re-adopted" });
+    check(
+      "new daemon re-adopts it (same process, shim reconnected with its token)",
+      fakeEvents().filter((e) => e.event === "start" && e.session === lid).at(-1).pid === pidBefore,
+    );
+    await op({ t: "launch_stop", launch_id: lid }, "final stop");
+    await waitFor(() => launchOf(lid)?.state === "exited", { timeout: 15_000, what: "final stop" });
+  }
+
   // --- revoke -----------------------------------------------------------------------------
   logStep("revoking the machine");
-  const daemonLive = daemonR;
+  const daemonLive = liveDaemon;
   const rv = await api(base, alice, `/api/machines/${machineId}`, { method: "DELETE" });
   check("owner revokes the machine", rv.ok, String(rv.status));
   await waitFor(() => daemonLive.exitCode !== null, { timeout: 10_000, what: "daemon to exit after revoke" });

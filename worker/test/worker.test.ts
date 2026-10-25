@@ -668,3 +668,103 @@ describe("review round 6", () => {
     expect(c2).toBe(5);
   });
 });
+
+describe("remote launch (phase 2)", () => {
+  const rec = (id: string, state = "starting") => ({
+    launch_id: id,
+    session_id: id,
+    project_id: "palpha0000000000",
+    project: "alpha",
+    state,
+    exit_code: null,
+    detail: null,
+    continued: false,
+    auto_restart: false,
+    restarts: 0,
+    started_at: 1,
+    updated_at: 2,
+  });
+
+  it("stores the daemon's projects + launches on the machine and relays launch requests both ways", async () => {
+    const { machineId, token } = await newMachine("lara");
+    const d = await daemon(token);
+    d.send({ t: "hello", v: 1, sessions: [] });
+    d.send({ t: "projects", projects: [{ id: "palpha0000000000", name: "alpha" }], available: true, launch_error: null, max_sessions: 4 });
+    const p = await phone("lara");
+    const st = await waitFor(() => last(p, "state")?.machines[0]?.launch && last(p, "state"), "launch info in state");
+    expect(st.machines[0].launch).toEqual({ projects: [{ id: "palpha0000000000", name: "alpha" }], launches: [], available: true, launch_error: null, max_sessions: 4 });
+
+    p.send({ t: "launch", machine_id: machineId, project_id: "palpha0000000000", continue: true, client_id: "k1" });
+    const fwd = await waitFor(() => d.frames.find((f) => f.t === "launch"), "launch at daemon");
+    expect(fwd).toEqual({ t: "launch", req_id: "k1", project_id: "palpha0000000000", continue: true });
+
+    d.send({ t: "launch_result", req_id: "k1", ok: true });
+    d.send({ t: "launches", launches: [rec("mr-0123456789ab")] });
+    const res = await waitFor(() => p.frames.find((f) => f.t === "launch_result"), "result at phone");
+    expect(res).toEqual({ t: "launch_result", client_id: "k1", ok: true });
+    const lf = await waitFor(() => p.frames.find((f) => f.t === "launches"), "launches at phone");
+    expect(lf).toMatchObject({ machine_id: machineId, launches: [{ launch_id: "mr-0123456789ab", state: "starting" }] });
+
+    p.send({ t: "launch_restart", machine_id: machineId, launch_id: "mr-0123456789ab", continue: false, client_id: "k2" });
+    p.send({ t: "launch_stop", machine_id: machineId, launch_id: "mr-0123456789ab", client_id: "k3" });
+    p.send({ t: "launch_dismiss", machine_id: machineId, launch_id: "mr-0123456789ab", client_id: "k4" });
+    await waitFor(() => d.frames.filter((f) => f.t.startsWith("launch_")).length === 3, "3 ops");
+    expect(d.frames.filter((f) => f.t.startsWith("launch_"))).toEqual([
+      { t: "launch_restart", req_id: "k2", launch_id: "mr-0123456789ab", continue: false },
+      { t: "launch_stop", req_id: "k3", launch_id: "mr-0123456789ab" },
+      { t: "launch_dismiss", req_id: "k4", launch_id: "mr-0123456789ab" },
+    ]);
+
+    // Persisted: a new phone (and a hibernated Hub) still sees the last snapshot.
+    await evictDurableObject(E.HUB.get(E.HUB.idFromName(tenantIdForDev("lara"))));
+    const p2 = await phone("lara");
+    const st2 = await waitFor(() => last(p2, "state"), "state");
+    expect(st2.machines[0].launch.launches[0].launch_id).toBe("mr-0123456789ab");
+  });
+
+  it("refuses launches for offline, revoked or unknown computers and rejects path-like ids", async () => {
+    const { machineId, token } = await newMachine("mona");
+    const p = await phone("mona");
+    p.send({ t: "launch", machine_id: machineId, project_id: "palpha0000000000", continue: false, client_id: "o1" });
+    const off = await waitFor(() => p.frames.find((f) => f.t === "launch_result" && f.client_id === "o1"), "offline");
+    expect(off).toMatchObject({ ok: false, error: "this computer is offline" });
+    p.send({ t: "launch", machine_id: "mnope", project_id: "palpha0000000000", continue: false, client_id: "o2" });
+    expect(await waitFor(() => p.frames.find((f) => f.t === "launch_result" && f.client_id === "o2"), "unknown")).toMatchObject({ error: "unknown computer" });
+    p.send({ t: "launch", machine_id: machineId, project_id: "/etc", continue: false, client_id: "o3" });
+    expect((await waitFor(() => p.frames.find((f) => f.t === "error"), "invalid")).error).toMatch(/invalid frame/);
+
+    const d = await daemon(token);
+    d.send({ t: "hello", v: 1, sessions: [] });
+    await SELF.fetch(`${ORIGIN}/api/machines/${machineId}`, { method: "DELETE", headers: { cookie: await cookieFor("mona"), origin: ORIGIN } });
+    await waitFor(() => d.closed, "daemon closed");
+    p.send({ t: "launch", machine_id: machineId, project_id: "palpha0000000000", continue: false, client_id: "o4" });
+    expect(await waitFor(() => p.frames.find((f) => f.t === "launch_result" && f.client_id === "o4"), "revoked")).toMatchObject({
+      error: "this computer was revoked",
+    });
+    expect(d.frames.find((f) => f.t === "launch")).toBeUndefined();
+  });
+
+  it("keeps tenants apart for launch requests", async () => {
+    const { machineId, token } = await newMachine("nina");
+    const d = await daemon(token);
+    d.send({ t: "hello", v: 1, sessions: [] });
+    await sleep(30);
+    const other = await phone("otto");
+    other.send({ t: "launch", machine_id: machineId, project_id: "palpha0000000000", continue: false, client_id: "x1" });
+    expect(await waitFor(() => other.frames.find((f) => f.t === "launch_result"), "refused")).toMatchObject({ ok: false, error: "unknown computer" });
+    await sleep(50);
+    expect(d.frames.find((f) => f.t === "launch")).toBeUndefined();
+  });
+
+  it("writes one row and reads none for a launches snapshot", async () => {
+    const stub = E.HUB.get(E.HUB.idFromName(tenantIdForDev("rowsl")));
+    const r = await runInDurableObject(stub, (_i, state) => {
+      state.storage.sql.exec("INSERT INTO machines (machine_id, name, created_at) VALUES ('m', 'box', 0)");
+      const c = state.storage.sql.exec("UPDATE machines SET launches_json = ? WHERE machine_id = ?", JSON.stringify([rec("mr-0123456789ab")]), "m");
+      c.toArray();
+      return { read: c.rowsRead, written: c.rowsWritten };
+    });
+    expect(r.written).toBe(1);
+    expect(r.read).toBeLessThanOrEqual(1); // primary-key lookup of the row being updated
+  });
+});

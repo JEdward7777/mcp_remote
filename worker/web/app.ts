@@ -1,5 +1,14 @@
 // Phone PWA (no framework). Bundled to public/app.js by build-web.mjs.
-import type { HubToPhone, MachineRecord, MessageRecord, PhoneToHub, SessionRecord, Urgency } from "@mcp-remote/shared";
+import type {
+  HubToPhone,
+  LaunchRecord,
+  LaunchState,
+  MachineRecord,
+  MessageRecord,
+  PhoneToHub,
+  SessionRecord,
+  Urgency,
+} from "@mcp-remote/shared";
 import { backoffDelay } from "@mcp-remote/shared/backoff";
 
 interface Me {
@@ -27,6 +36,8 @@ let clientSeq = 0;
 const pageId = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("");
 /** Sends waiting for the Hub's echo; the draft is only cleared once the echo arrives. */
 const pendingSends = new Map<string, { sid: string; text: string }>();
+/** Launch requests waiting for the daemon's answer; their buttons stay disabled meanwhile. */
+const pendingLaunchOps = new Map<string, { machine: string; launch: string | null }>();
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => {
   const el = document.querySelector<T>(sel);
@@ -46,6 +57,10 @@ function h<K extends keyof HTMLElementTagNameMap>(
   }
   for (const c of children) if (c !== null && c !== undefined) el.append(c);
   return el;
+}
+
+function nodes(...items: (Node | string | null | undefined)[]): (Node | string)[] {
+  return items.filter((x): x is Node | string => x !== null && x !== undefined);
 }
 
 function fmtTime(ms: number | null): string {
@@ -107,6 +122,10 @@ function connect(): void {
       // Unconfirmed sends: keep the text in the compose box so nothing typed is lost.
       pendingSends.clear();
       toast("Connection lost before the message was confirmed; it is still in the box.");
+      render();
+    }
+    if (pendingLaunchOps.size) {
+      pendingLaunchOps.clear();
       render();
     }
     clearInterval(pingTimer);
@@ -201,6 +220,25 @@ function onFrame(f: HubToPhone): void {
       toast(f.error);
       render();
       return;
+    case "launches": {
+      const m = state.machines.find((x) => x.machine_id === f.machine_id);
+      if (m?.launch) {
+        const before = new Map(m.launch.launches.map((l) => [l.launch_id, l.state]));
+        m.launch.launches = f.launches;
+        // A session that just started needing the user at the desk deserves a buzz.
+        if (f.launches.some((l) => l.state === "needs_attention" && before.get(l.launch_id) !== "needs_attention")) {
+          navigator.vibrate?.([100, 60, 100]);
+        }
+      }
+      render();
+      return;
+    }
+    case "launch_result": {
+      const mine = pendingLaunchOps.delete(f.client_id);
+      if (mine && !f.ok) toast(f.error ?? "The computer refused the request");
+      if (mine) render();
+      return;
+    }
   }
 }
 
@@ -239,52 +277,258 @@ function machineName(id: string): string {
   return state.machines.find((m) => m.machine_id === id)?.name ?? "unknown machine";
 }
 
-function renderSessions(): HTMLElement {
-  const root = h("section", { class: "list" });
-  if (state.sessions.length === 0) {
-    root.append(
-      h(
-        "p",
-        { class: "empty" },
-        state.machines.length === 0
-          ? "No computers paired yet. Open Machines to pair one."
-          : "No sessions yet. Start Claude Code with the mcp-remote shim on a paired computer.",
-      ),
-    );
-    return root;
+// ---------------------------------------------------------------------------
+// Remote launch (D6)
+
+const STATE_LABEL: Record<LaunchState, string> = {
+  starting: "starting\u2026",
+  running: "running",
+  needs_attention: "NEEDS YOU AT THE DESK",
+  exited: "exited",
+  failed: "failed",
+};
+const ACTIVE_STATES: LaunchState[] = ["starting", "running", "needs_attention"];
+
+function launchFor(sid: string): { machine: MachineRecord; launch: LaunchRecord } | null {
+  for (const m of state.machines) {
+    const l = m.launch?.launches.find((x) => x.session_id === sid);
+    if (l) return { machine: m, launch: l };
   }
+  return null;
+}
+
+function launchBusy(machine: string, launch: string | null): boolean {
+  for (const p of pendingLaunchOps.values()) if (p.machine === machine && p.launch === launch) return true;
+  return false;
+}
+
+function launchOp(frame: PhoneToHub & { client_id: string; machine_id: string }, launch: string | null): void {
+  if (!send(frame)) {
+    toast("Not connected; try again in a moment.");
+    return;
+  }
+  pendingLaunchOps.set(frame.client_id, { machine: frame.machine_id, launch });
+  render();
+}
+
+function newClientId(): string {
+  return `${pageId}-${++clientSeq}`;
+}
+
+function stateBadge(l: LaunchRecord): HTMLElement {
+  const code = l.state === "exited" && l.exit_code !== null ? ` (${l.exit_code})` : "";
+  return h("span", { class: `badge st-${l.state}`, title: `launch state: ${l.state}` }, STATE_LABEL[l.state] + code);
+}
+
+/** Stop / Restart / Restart --continue / Remove for one launch. */
+function launchButtons(m: MachineRecord, l: LaunchRecord): HTMLElement {
+  const box = h("div", { class: "launch-actions" });
+  const off = !m.online || m.revoked || launchBusy(m.machine_id, l.launch_id);
+  const active = ACTIVE_STATES.includes(l.state);
+  const mk = (label: string, cls: string, enabled: boolean, onclick: () => void) => {
+    const b = h("button", { class: `small ${cls}`, type: "button" }, label);
+    b.disabled = off || !enabled;
+    b.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      onclick();
+    };
+    box.append(b);
+  };
+  const restart = (cont: boolean) => {
+    if (active && !confirm(`Restart ${l.project}? The running Claude Code session is ended first.`)) return;
+    launchOp({ t: "launch_restart", machine_id: m.machine_id, launch_id: l.launch_id, continue: cont, client_id: newClientId() }, l.launch_id);
+  };
+  const pendingRestart = l.state === "exited" && !!l.detail?.includes("restarting in");
+  mk("Stop", "danger", active || pendingRestart, () => {
+    if (!confirm(`Stop ${l.project}? This ends the Claude Code session on ${m.name}.`)) return;
+    launchOp({ t: "launch_stop", machine_id: m.machine_id, launch_id: l.launch_id, client_id: newClientId() }, l.launch_id);
+  });
+  mk("Restart", "", true, () => restart(false));
+  mk("Restart + resume", "", true, () => restart(true));
+  if (!active && !pendingRestart) {
+    mk("Remove", "ghost", true, () =>
+      launchOp({ t: "launch_dismiss", machine_id: m.machine_id, launch_id: l.launch_id, client_id: newClientId() }, l.launch_id),
+    );
+  }
+  return box;
+}
+
+function launchRow(m: MachineRecord, l: LaunchRecord): HTMLElement {
+  const hasSession = state.sessions.some((s) => s.session_id === l.session_id);
+  const title = hasSession
+    ? h("a", { class: "proj", href: `#/s/${l.session_id}` }, l.project)
+    : h("span", { class: "proj" }, l.project);
+  return h(
+    "div",
+    { class: `launch-row st-${l.state}`, "data-launch": l.launch_id },
+    h("div", { class: "launch-top" }, title, stateBadge(l), h("span", { class: "sid" }, l.launch_id)),
+    l.detail ? h("div", { class: "launch-detail" }, l.detail) : null,
+    launchButtons(m, l),
+  );
+}
+
+interface LauncherForm {
+  root: HTMLElement;
+  select: HTMLSelectElement;
+  cont: HTMLInputElement;
+  auto: HTMLInputElement;
+  btn: HTMLButtonElement;
+  note: HTMLElement;
+  key: string;
+}
+
+function buildLauncher(machineId: string): LauncherForm {
+  const root = h("form", { class: "launcher" });
+  const select = h("select", { "aria-label": "project" });
+  const cont = h("input", { type: "checkbox" });
+  const auto = h("input", { type: "checkbox" });
+  const btn = h("button", { type: "submit" }, "Start session");
+  const note = h("p", { class: "muted launch-note" });
+  root.append(
+    h("div", { class: "launcher-row" }, select, btn),
+    h(
+      "div",
+      { class: "launcher-row opts" },
+      h("label", {}, cont, " resume last conversation"),
+      h("label", {}, auto, " auto-restart on crash"),
+    ),
+    note,
+  );
+  root.onsubmit = (ev) => {
+    ev.preventDefault();
+    if (!select.value) return;
+    launchOp(
+      {
+        t: "launch",
+        machine_id: machineId,
+        project_id: select.value,
+        continue: cont.checked,
+        ...(auto.checked ? { auto_restart: true } : {}),
+        client_id: newClientId(),
+      },
+      null,
+    );
+  };
+  return { root, select, cont, auto, btn, note, key: "" };
+}
+
+function updateLauncher(f: LauncherForm, m: MachineRecord): void {
+  const info = m.launch;
+  const projects = info?.projects ?? [];
+  const key = projects.map((p) => `${p.id}:${p.name}`).join("|");
+  if (key !== f.key) {
+    // Rebuild options only when the list changed, keeping the user's choice.
+    const keep = f.select.value;
+    f.select.replaceChildren(...projects.map((p) => h("option", { value: p.id }, p.name)));
+    if (projects.some((p) => p.id === keep)) f.select.value = keep;
+    f.key = key;
+  }
+  const active = info ? info.launches.filter((l) => ACTIVE_STATES.includes(l.state)).length : 0;
+  let why = "";
+  if (!info) why = "This computer's daemon has not reported launch support (update mcp-remote on it).";
+  else if (!info.available) why = info.launch_error ?? "Remote launch is not available on this computer.";
+  else if (!projects.length) why = "No projects allowed yet. At the desk: mcp-remote projects add <dir>";
+  else if (!m.online) why = "Computer offline.";
+  else if (active >= info.max_sessions) why = `At the limit of ${info.max_sessions} launched sessions.`;
+  const blocked = !!why || launchBusy(m.machine_id, null);
+  f.select.disabled = !info || !info.available || !projects.length;
+  f.btn.disabled = blocked;
+  f.btn.textContent = launchBusy(m.machine_id, null) ? "Starting\u2026" : "Start session";
+  f.note.textContent = why;
+  f.note.hidden = !why;
+}
+
+interface MachineSection {
+  root: HTMLElement;
+  head: HTMLElement;
+  launcher: LauncherForm;
+  launches: HTMLElement;
+  sessions: HTMLElement;
+}
+
+interface SessionsView {
+  root: HTMLElement;
+  empty: HTMLElement;
+  sections: Map<string, MachineSection>;
+}
+
+function buildSessions(): SessionsView {
+  const root = h("section", { class: "list" });
+  const empty = h("p", { class: "empty" });
+  root.append(empty);
+  return { root, empty, sections: new Map() };
+}
+
+function updateSessions(v: SessionsView): void {
   const byMachine = new Map<string, SessionRecord[]>();
   for (const s of state.sessions) {
     const arr = byMachine.get(s.machine_id) ?? [];
     arr.push(s);
     byMachine.set(s.machine_id, arr);
   }
-  for (const [mid, sessions] of byMachine) {
-    const m = state.machines.find((x) => x.machine_id === mid);
-    const head = h(
-      "h2",
-      { class: "machine" },
-      h("span", { class: m?.online ? "dot on" : "dot off" }),
-      machineName(mid),
-      m?.revoked ? h("span", { class: "muted" }, " (revoked)") : null,
-    );
-    root.append(head);
-    sessions.sort((a, b) => Number(b.online) - Number(a.online) || (b.last_message_at ?? 0) - (a.last_message_at ?? 0));
-    for (const s of sessions) {
-      const a = h(
-        "a",
-        { class: "session", href: `#/s/${s.session_id}`, "data-session": s.session_id },
-        h("span", { class: s.online ? "dot on" : "dot off", title: s.online ? "online" : "offline" }),
-        h("span", { class: "proj" }, s.project),
-        h("span", { class: "sid" }, s.session_id.slice(0, 8)),
-        urgencyBadge(s.last_urgency),
-        s.pending_in ? h("span", { class: "pending", title: "messages waiting for the session" }, String(s.pending_in)) : null,
-        h("span", { class: "time" }, fmtTime(s.last_message_at ?? s.last_seen)),
-      );
-      root.append(a);
+  // Every active computer gets a section (to start sessions on it); revoked ones only while they have sessions.
+  const ids = state.machines.filter((m) => !m.revoked || byMachine.has(m.machine_id)).map((m) => m.machine_id);
+  for (const mid of byMachine.keys()) if (!ids.includes(mid)) ids.push(mid);
+
+  v.empty.hidden = ids.length > 0;
+  v.empty.textContent = "No computers paired yet. Open Machines to pair one.";
+
+  for (const [mid, sec] of v.sections) {
+    if (!ids.includes(mid)) {
+      sec.root.remove();
+      v.sections.delete(mid);
     }
   }
-  return root;
+  let prev: Element = v.empty;
+  for (const mid of ids) {
+    let sec = v.sections.get(mid);
+    if (!sec) {
+      const root = h("div", { class: "machine-section", "data-machine": mid });
+      const head = h("h2", { class: "machine" });
+      const launcher = buildLauncher(mid);
+      const launches = h("div", { class: "launches" });
+      const sessions = h("div", { class: "sessions" });
+      root.append(head, launcher.root, launches, sessions);
+      sec = { root, head, launcher, launches, sessions };
+      v.sections.set(mid, sec);
+    }
+    // Keep DOM order without detaching nodes that are already in place (focus / open <select> survive).
+    if (prev.nextElementSibling !== sec.root) prev.after(sec.root);
+    prev = sec.root;
+
+    const m = state.machines.find((x) => x.machine_id === mid);
+    sec.head.replaceChildren(
+      ...nodes(
+        h("span", { class: m?.online ? "dot on" : "dot off" }),
+        machineName(mid),
+        m?.revoked ? h("span", { class: "muted" }, " (revoked)") : null,
+      ),
+    );
+    sec.launcher.root.hidden = !m || m.revoked;
+    if (m && !m.revoked) updateLauncher(sec.launcher, m);
+
+    const launches = m && !m.revoked ? (m.launch?.launches ?? []) : [];
+    sec.launches.replaceChildren(...launches.map((l) => launchRow(m!, l)));
+
+    const sessions = (byMachine.get(mid) ?? []).slice();
+    sessions.sort((a, b) => Number(b.online) - Number(a.online) || (b.last_message_at ?? 0) - (a.last_message_at ?? 0));
+    sec.sessions.replaceChildren(
+      ...sessions.map((s) =>
+        h(
+          "a",
+          { class: "session", href: `#/s/${s.session_id}`, "data-session": s.session_id },
+          h("span", { class: s.online ? "dot on" : "dot off", title: s.online ? "online" : "offline" }),
+          h("span", { class: "proj" }, s.project),
+          launches.some((l) => l.session_id === s.session_id) ? h("span", { class: "badge", title: "started from the phone" }, "launched") : null,
+          h("span", { class: "sid" }, s.session_id.slice(0, 8)),
+          urgencyBadge(s.last_urgency),
+          s.pending_in ? h("span", { class: "pending", title: "messages waiting for the session" }, String(s.pending_in)) : null,
+          h("span", { class: "time" }, fmtTime(s.last_message_at ?? s.last_seen)),
+        ),
+      ),
+    );
+  }
 }
 
 // The thread and machines views are built once per visit and then updated in place, so the
@@ -294,6 +538,7 @@ interface ThreadView {
   sid: string;
   root: HTMLElement;
   head: HTMLElement;
+  launchBar: HTMLElement;
   cwd: HTMLElement;
   list: HTMLElement;
   ta: HTMLTextAreaElement;
@@ -304,6 +549,7 @@ interface ThreadView {
 function buildThread(sid: string): ThreadView {
   const root = h("section", { class: "thread" });
   const head = h("div", { class: "thread-head" });
+  const launchBar = h("div", { class: "launch-bar" });
   const cwd = h("div", { class: "cwd muted" });
   const list = h("div", { class: "messages", id: "messages" });
   const form = h("form", { class: "compose" });
@@ -325,8 +571,8 @@ function buildThread(sid: string): ThreadView {
     pendingSends.set(client_id, { sid, text });
     render();
   };
-  root.append(head, cwd, list, form);
-  return { sid, root, head, cwd, list, ta, btn, filled: false };
+  root.append(head, launchBar, cwd, list, form);
+  return { sid, root, head, launchBar, cwd, list, ta, btn, filled: false };
 }
 
 function updateThread(v: ThreadView): void {
@@ -341,7 +587,19 @@ function updateThread(v: ThreadView): void {
     h("strong", {}, s ? s.project : sid),
     h("span", { class: "muted" }, s ? ` on ${machineName(s.machine_id)}` : ""),
   );
-  if (s && !s.online) {
+  const lf = launchFor(sid);
+  v.launchBar.hidden = !lf;
+  if (lf) {
+    v.launchBar.className = `launch-bar st-${lf.launch.state}`;
+    v.launchBar.replaceChildren(
+      ...nodes(
+        h("div", { class: "launch-top" }, h("span", { class: "muted" }, "Started from the phone"), stateBadge(lf.launch)),
+        lf.launch.detail ? h("div", { class: "launch-detail" }, lf.launch.detail) : null,
+        launchButtons(lf.machine, lf.launch),
+      ),
+    );
+  }
+  if (s && !s.online && !(lf && ACTIVE_STATES.includes(lf.launch.state))) {
     const forget = h("button", { class: "danger small" }, "Forget");
     forget.onclick = () => {
       if (!confirm(`Forget offline session ${s.project} (${s.session_id.slice(0, 8)}) and its history?`)) return;
@@ -470,12 +728,14 @@ function updateMachines(v: MachinesView): void {
 let lastView = "";
 let threadView: ThreadView | null = null;
 let machinesView: MachinesView | null = null;
+let sessionsView: SessionsView | null = null;
 
 function render(_force = false): void {
   const main = document.querySelector("#main");
   if (!main || !state.me) return;
   const sid = currentSession();
   const view = sid ? `s:${sid}` : location.hash === "#/machines" ? "machines" : "sessions";
+  if (sid) sessionsView = null;
   for (const tab of document.querySelectorAll<HTMLAnchorElement>("nav a")) {
     tab.classList.toggle("active", (tab.dataset.view ?? "") === (sid ? "sessions" : view));
   }
@@ -491,6 +751,7 @@ function render(_force = false): void {
   }
   threadView = null;
   if (view === "machines") {
+    sessionsView = null;
     if (changed || !machinesView) {
       machinesView = buildMachines();
       main.replaceChildren(machinesView.root);
@@ -499,7 +760,11 @@ function render(_force = false): void {
     return;
   }
   machinesView = null;
-  main.replaceChildren(renderSessions());
+  if (changed || !sessionsView) {
+    sessionsView = buildSessions();
+    main.replaceChildren(sessionsView.root);
+  }
+  updateSessions(sessionsView);
 }
 
 function renderSignedOut(): void {

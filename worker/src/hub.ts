@@ -7,6 +7,8 @@ import {
   HISTORY_PAGE,
   HubToDaemon,
   HubToPhone,
+  LaunchInfo,
+  LaunchRecord,
   MAX_FRAME_BYTES,
   MAX_SESSIONS_PER_MACHINE,
   MachineRecord,
@@ -31,7 +33,13 @@ type MachineRow = {
   created_at: number;
   last_seen: number | null;
   revoked_at: number | null;
+  /** JSON of the daemon's last `projects` frame (Phase 2); null until reported. */
+  launch_caps: string | null;
+  /** JSON array of the daemon's last `launches` snapshot. */
+  launches_json: string | null;
 };
+
+const LaunchCaps = LaunchInfo.omit({ launches: true });
 
 type SessionRow = {
   session_id: string;
@@ -147,6 +155,19 @@ function toMessage(r: MessageRow): MessageRecord {
   };
 }
 
+/** Stored launch columns -> LaunchInfo (null if never reported or unreadable). */
+function launchInfo(m: MachineRow): LaunchInfo | null {
+  if (!m.launch_caps) return null;
+  try {
+    const caps = LaunchCaps.safeParse(JSON.parse(m.launch_caps));
+    if (!caps.success) return null;
+    const l = m.launches_json ? LaunchRecord.array().safeParse(JSON.parse(m.launches_json)) : null;
+    return { ...caps.data, launches: l?.success ? l.data : [] };
+  } catch {
+    return null;
+  }
+}
+
 export class Hub extends DurableObject<Env> {
   private sql: SqlStorage;
 
@@ -165,6 +186,13 @@ export class Hub extends DurableObject<Env> {
       this.sql.exec("ALTER TABLE sessions ADD COLUMN msg_count INTEGER NOT NULL DEFAULT 0");
     } catch {
       /* column already exists */
+    }
+    for (const col of ["launch_caps", "launches_json"]) {
+      try {
+        this.sql.exec(`ALTER TABLE machines ADD COLUMN ${col} TEXT`);
+      } catch {
+        /* column already exists */
+      }
     }
     if (!this.getMeta("msg_count_v1")) {
       // One-time backfill (per session, via the (session_id, id) index); guarded by the meta flag.
@@ -189,7 +217,7 @@ export class Hub extends DurableObject<Env> {
       now,
     );
     this.broadcastState();
-    return { machine_id: machineId, name, created_at: now, last_seen: null, online: false, revoked: false };
+    return { machine_id: machineId, name, created_at: now, last_seen: null, online: false, revoked: false, launch: null };
   }
 
   /**
@@ -389,6 +417,34 @@ export class Hub extends DurableObject<Env> {
         }
         return;
       }
+      case "launch":
+      case "launch_stop":
+      case "launch_restart":
+      case "launch_dismiss": {
+        // Only routes the request; the daemon is the authority on which project ids it will launch.
+        const m = this.sql
+          .exec<{ revoked_at: number | null }>("SELECT revoked_at FROM machines WHERE machine_id = ?", f.machine_id)
+          .toArray()[0];
+        const d = m && m.revoked_at === null ? this.daemonSocket(f.machine_id) : undefined;
+        if (!d) {
+          this.sendPhone(ws, {
+            t: "launch_result",
+            client_id: f.client_id,
+            ok: false,
+            error: !m ? "unknown computer" : m.revoked_at !== null ? "this computer was revoked" : "this computer is offline",
+          });
+          return;
+        }
+        const req_id = f.client_id;
+        const out: HubToDaemon =
+          f.t === "launch"
+            ? { t: "launch", req_id, project_id: f.project_id, continue: f.continue, ...(f.auto_restart !== undefined ? { auto_restart: f.auto_restart } : {}) }
+            : f.t === "launch_restart"
+              ? { t: "launch_restart", req_id, launch_id: f.launch_id, continue: f.continue }
+              : { t: f.t, req_id, launch_id: f.launch_id };
+        this.sendDaemon(d, out);
+        return;
+      }
       case "forget_session": {
         const s = this.getSession(f.session_id);
         if (!s) return;
@@ -452,6 +508,22 @@ export class Hub extends DurableObject<Env> {
         const msg = toMessage(row);
         this.sendDaemon(ws, { t: "sent", req_id: f.req_id, message_id: msg.id });
         this.broadcastPhones({ t: "message", message: msg });
+        return;
+      }
+      case "projects": {
+        const caps = { projects: f.projects, available: f.available, launch_error: f.launch_error, max_sessions: f.max_sessions };
+        this.sql.exec("UPDATE machines SET launch_caps = ? WHERE machine_id = ?", JSON.stringify(caps), machineId);
+        this.broadcastState();
+        return;
+      }
+      case "launches": {
+        // One row write, no reads; phones get a small frame instead of a full state.
+        this.sql.exec("UPDATE machines SET launches_json = ? WHERE machine_id = ?", JSON.stringify(f.launches), machineId);
+        this.broadcastPhones({ t: "launches", machine_id: machineId, launches: f.launches });
+        return;
+      }
+      case "launch_result": {
+        this.broadcastPhones({ t: "launch_result", client_id: f.req_id, ok: f.ok, ...(f.error ? { error: f.error } : {}) });
         return;
       }
       case "ack": {
@@ -692,6 +764,7 @@ export class Hub extends DurableObject<Env> {
         last_seen: m.last_seen,
         online: m.revoked_at === null && live.has(m.machine_id),
         revoked: m.revoked_at !== null,
+        launch: launchInfo(m),
       }));
   }
 

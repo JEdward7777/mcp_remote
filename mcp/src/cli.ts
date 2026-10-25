@@ -1,6 +1,8 @@
-// mcp-remote CLI: pair | daemon | shim
+// mcp-remote CLI: pair | daemon | shim | projects | config | setup-claude | attach | install-service | uninstall-service
 import { Daemon } from "./daemon";
 import { configPath, loadConfig } from "./config";
+import { attach, configCommand, projectsCommand, setupClaude } from "./desk";
+import { installService, uninstallService } from "./service";
 import { log, setLogPrefix } from "./log";
 import { pair } from "./pair";
 import { runShim } from "./shim";
@@ -10,10 +12,26 @@ const USAGE = `usage:
   mcp-remote daemon                                     run the per-computer daemon
   mcp-remote shim                                       stdio MCP channel server (Claude Code runs this)
 
+  remote launch (start Claude Code sessions from the phone, in tmux):
+  mcp-remote projects list                              show launch settings and launchable projects
+  mcp-remote projects add <dir> [--name <name>]         allow the phone to start sessions in <dir>
+  mcp-remote projects add-root <dir>                    allow every sub-folder of <dir> (one level)
+  mcp-remote projects remove <dir|name|id>
+  mcp-remote config get | modes                         show launch settings / permission modes
+  mcp-remote config set <key> <value> | unset <key>     keys: permission-mode, claude-path, extra-args,
+                                                        max-sessions, auto-restart, tmux-path,
+                                                        server-name, startup-timeout
+  mcp-remote setup-claude [--scope user|local] [--force] [--dry-run]
+                                                        register the shim with Claude Code (claude mcp add)
+  mcp-remote attach <mr-id>                             open a phone-launched session's terminal
+  mcp-remote install-service [--dry-run] [--no-start]   run the daemon as a user service (systemd/launchd)
+  mcp-remote uninstall-service
+
 env:
   MCP_REMOTE_CONFIG_DIR   config directory (default ~/.config/mcp-remote)
   MCP_REMOTE_SOCKET       daemon IPC socket path (default <config dir>/daemon.sock)
   MCP_REMOTE_SESSION_ID   fixed session id for this shim (default: random per launch)
+  MCP_REMOTE_FATAL_EXIT_ZERO=1  exit 0 instead of 3/4 when restarting can't help (launchd/Task Scheduler)
 `;
 
 async function main(argv: string[]): Promise<void> {
@@ -49,6 +67,26 @@ async function main(argv: string[]): Promise<void> {
     }
     case "shim":
       await runShim();
+      return;
+    case "projects":
+      setLogPrefix("mcp-remote");
+      await projectsCommand(rest);
+      return;
+    case "config":
+      setLogPrefix("mcp-remote");
+      await configCommand(rest);
+      return;
+    case "setup-claude":
+      setupClaude(rest);
+      return;
+    case "attach":
+      attach(rest);
+      return;
+    case "install-service":
+      installService({ dryRun: rest.includes("--dry-run"), noStart: rest.includes("--no-start") });
+      return;
+    case "uninstall-service":
+      uninstallService();
       return;
     case undefined:
     case "-h":
