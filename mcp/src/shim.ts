@@ -79,6 +79,9 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   let registered = false;
   let hubConnected = false;
   let attempt = 0;
+  let refusedAttempt = 0;
+  /** Last reason the daemon refused our registration; reported by send_message. */
+  let registerRefused: string | null = null;
   let reqSeq = 0;
   let stopping = false;
   const waiting = new Map<string, { resolve: (r: { ok: true; id: number } | { ok: false; error: string }) => void; timer: NodeJS.Timeout }>();
@@ -134,8 +137,14 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
       DaemonToShim,
       (f) => {
         switch (f.t) {
+          case "register_refused":
+            registerRefused = f.error;
+            log(`daemon refused this session: ${f.error}`);
+            return;
           case "registered":
             registered = true;
+            registerRefused = null;
+            refusedAttempt = 0;
             hubConnected = f.hub_connected;
             attempt = 0;
             log(`registered with daemon (server ${hubConnected ? "connected" : "not connected"})`);
@@ -190,6 +199,12 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
       hubConnected = false;
       failAll("lost connection to the local mcp-remote daemon");
       if (stopping) return;
+      if (registerRefused) {
+        // A refusal won't fix itself quickly (e.g. the other session must end first): retry slowly.
+        const slow = backoffDelay(refusedAttempt++, { baseMs: 30_000, capMs: 600_000, minMs: 15_000 });
+        setTimeout(connectDaemon, slow);
+        return;
+      }
       const delay = backoffDelay(attempt++, { baseMs: 500, capMs: 30_000 });
       if (wasRegistered || attempt === 1) {
         log(`daemon not reachable at ${sockPath}; retrying (next in ${Math.round(delay / 100) / 10}s)`);
@@ -199,6 +214,9 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   }
 
   function sendToPhone(text: string, urgency: Urgency): Promise<{ ok: true; id: number } | { ok: false; error: string }> {
+    if (!registered && registerRefused) {
+      return Promise.resolve({ ok: false, error: `the mcp-remote daemon refused this session: ${registerRefused}` });
+    }
     if (!conn || !registered) {
       return Promise.resolve({
         ok: false,

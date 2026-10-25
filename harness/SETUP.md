@@ -155,11 +155,21 @@ Per project, `.mcp.json` in the project root:
 or once for all projects: `claude mcp add --scope user mcp-remote -- mcp-remote shim`.
 
 Each shim registers a session named after the project folder (basename of the cwd) with a random session id.
-To keep a stable id (and thread) across restarts, set `MCP_REMOTE_SESSION_ID`, but **per computer, never in a
-committed `.mcp.json`**: put it in your user-scope config (`claude mcp add --scope user -e MCP_REMOTE_SESSION_ID=laptop-myproject
-mcp-remote -- mcp-remote shim`) or export it in the shell that launches `claude`, and include the computer in the
-name (e.g. `laptop-myproject`). Two active computers announcing the same id is refused: the second one's
-`send_message` fails with "already used by another computer on this account", and the phone keeps showing the first.
+To keep a stable id (and thread) across restarts, set `MCP_REMOTE_SESSION_ID` **per project and per computer**,
+never in a committed `.mcp.json` and never at user scope (user scope would give every project on the computer the
+same id). Run this once inside each project, using `<computer>-<project>` as the id:
+
+```sh
+cd ~/code/myproject
+claude mcp add --scope local -e MCP_REMOTE_SESSION_ID=laptop-myproject mcp-remote -- mcp-remote shim
+```
+
+(`--scope local` is private to you and this project directory.) Only **one live session** can use an id at a time:
+a second concurrent Claude Code session in the same project with the same id is refused by the daemon, and its
+`send_message` says "another live session on this computer already uses session id ...". If you want several
+concurrent sessions in one project, don't set a fixed id for that project: every launch then gets its own random id.
+Two active computers announcing the same id is refused too: the second one's `send_message` fails with "already
+used by another computer on this account", and the phone keeps showing the first.
 The only hand-over is from a **revoked** computer: after you revoke a computer and pair its replacement, the new one
 takes the id over together with its history (the Hub tells the other daemons to re-announce, no polling).
 

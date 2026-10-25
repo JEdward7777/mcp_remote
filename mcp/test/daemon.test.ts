@@ -85,7 +85,7 @@ async function shim(sessionId: string, project = "p"): Promise<FakeShim> {
   s.conn = new LineConn(sock, DaemonToShim, (f) => s.frames.push(f), () => {});
   sock.on("close", () => (s.closed = true));
   s.conn.send({ t: "register", v: 1, session: { session_id: sessionId, project } });
-  await waitFor(() => s.frames.find((f) => f.t === "registered" || f.t === "error"), "register reply");
+  await waitFor(() => s.frames.find((f) => f.t === "registered" || f.t === "error" || f.t === "register_refused"), "register reply");
   return s;
 }
 
@@ -127,8 +127,22 @@ describe("daemon", () => {
     await startDaemon().start();
     await shim("dup");
     const second = await shim("dup");
-    expect(second.frames[0]).toMatchObject({ t: "error", error: "session id already connected" });
+    expect(second.frames[0]).toMatchObject({ t: "register_refused" });
+    expect(second.frames[0].error).toMatch(/already uses session id "dup"/);
     await waitFor(() => second.closed, "closed");
+  });
+
+  it("caps registrations at MAX_SESSIONS_PER_MACHINE", async () => {
+    await startDaemon().start();
+    await waitFor(() => hubSockets.length === 1, "connect");
+    for (let i = 0; i < 64; i++) await shim(`c${i}`);
+    const extra = await shim("c64");
+    expect(extra.frames[0]).toMatchObject({ t: "register_refused" });
+    expect(extra.frames[0].error).toMatch(/too many live sessions/);
+    // Reconnect hello stays within the protocol's max(64).
+    hubSockets[0]!.close(1012, "restart");
+    await waitFor(() => hubFrames.filter((f) => f.t === "hello").length === 2, "second hello", 8000);
+    expect(hubFrames.filter((f) => f.t === "hello")[1].sessions.length).toBe(64);
   });
 
   it("re-announces live sessions in hello after reconnecting", async () => {

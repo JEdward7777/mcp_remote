@@ -145,6 +145,10 @@ function onFrame(f: HubToPhone): void {
     case "state":
       state.machines = f.machines;
       state.sessions = f.sessions;
+      // Drop cached threads of sessions the Hub no longer has (e.g. a confirmed Forget).
+      for (const k of [...state.threads.keys()]) {
+        if (!f.sessions.some((x) => x.session_id === k)) state.threads.delete(k);
+      }
       render();
       return;
     case "message": {
@@ -163,6 +167,7 @@ function onFrame(f: HubToPhone): void {
       if (s) {
         s.last_message_at = f.message.created_at;
         if (f.message.direction === "out") s.last_urgency = f.message.urgency;
+        else if (!f.message.delivered) s.pending_in++;
       }
       if (f.message.direction === "out" && f.message.urgency === "urgent" && "vibrate" in navigator) {
         navigator.vibrate?.([200, 100, 200]);
@@ -186,6 +191,8 @@ function onFrame(f: HubToPhone): void {
     case "delivered": {
       const list = state.threads.get(f.session_id);
       if (list) for (const m of list) if (f.ids.includes(m.id)) m.delivered = true;
+      const ds = state.sessions.find((x) => x.session_id === f.session_id);
+      if (ds) ds.pending_in = Math.max(0, ds.pending_in - f.ids.length);
       render();
       return;
     }
@@ -338,10 +345,8 @@ function updateThread(v: ThreadView): void {
     const forget = h("button", { class: "danger small" }, "Forget");
     forget.onclick = () => {
       if (!confirm(`Forget offline session ${s.project} (${s.session_id.slice(0, 8)}) and its history?`)) return;
-      if (send({ t: "forget_session", session_id: sid })) {
-        state.threads.delete(sid);
-        location.hash = "#/";
-      }
+      // The cached thread is dropped when the Hub's next state frame no longer lists the session.
+      if (send({ t: "forget_session", session_id: sid })) location.hash = "#/";
     };
     v.head.append(forget);
   }

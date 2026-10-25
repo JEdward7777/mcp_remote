@@ -6,6 +6,7 @@ import WebSocket from "ws";
 import {
   DaemonToHub,
   HubToDaemon,
+  MAX_SESSIONS_PER_MACHINE,
   PROTOCOL_VERSION,
   ShimToDaemon,
   type DaemonToShim,
@@ -140,7 +141,20 @@ export class Daemon {
           if (sessionId) return conn.send({ t: "error", error: "already registered" } satisfies DaemonToShim);
           const existing = this.shims.get(f.session.session_id);
           if (existing) {
-            conn.send({ t: "error", error: "session id already connected" } satisfies DaemonToShim);
+            conn.send({
+              t: "register_refused",
+              error:
+                `another live session on this computer already uses session id "${f.session.session_id}" ` +
+                "(MCP_REMOTE_SESSION_ID?). Only one session can use an id at a time; give each project its own id or unset it",
+            } satisfies DaemonToShim);
+            conn.close();
+            return;
+          }
+          if (this.shims.size >= MAX_SESSIONS_PER_MACHINE) {
+            conn.send({
+              t: "register_refused",
+              error: `too many live sessions on this computer (max ${MAX_SESSIONS_PER_MACHINE})`,
+            } satisfies DaemonToShim);
             conn.close();
             return;
           }

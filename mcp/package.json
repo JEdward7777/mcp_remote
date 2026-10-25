@@ -15,7 +15,7 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run",
+    "test": "node build.mjs && vitest run",
     "prepack": "node build.mjs"
   },
   "dependencies": {
