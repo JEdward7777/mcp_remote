@@ -11,3 +11,9 @@
   Channels are research preview: custom ones need `claude --dangerously-load-development-channels server:<name>`.
   Bonus: channels can relay tool-permission prompts (`claude/channel/permission`) so approvals can happen from the phone.
   The Worker holds state, OAuth and phone UI; the shim is just a relay. Codex = nice-to-have (Phase 5).
+- D4 (proposed) Multi-machine, multi-project routing:
+  One per-user "Hub" Durable Object (WebSocket Hibernation, SQLite storage) holds every shim socket and every phone socket.
+  Each shim registers as session {machine, project, session_id}; machine = hostname, project = repo folder name.
+  Machines authenticate once via a device-pairing flow (shim prints a code, you approve on the phone, it stores a
+  long-lived machine token locally). Phone uses OAuth. Hub keeps history so offline sessions still show with their logs.
+  Phone page = list of sessions grouped by machine, online/offline dots, one chat thread per session.
