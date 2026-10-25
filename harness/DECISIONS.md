@@ -47,3 +47,6 @@
   metadata and counters (sign-ups, daily active users, requests per tenant), never message content; this is the one
   sanctioned cross-tenant store (refines D9). Owner-only /admin page in the PWA. Web Push to the owner when daily usage
   passes thresholds (e.g. 50% / 80% of free quota) or sign-ups spike.
+- D14 (accepted) Location is on-demand only: the page reports position when open, or the agent sends a push you tap
+  to share. Agent gets last-known position + timestamp. No background tracking, no native Android app for now;
+  revisit after hands-on use.
