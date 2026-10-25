@@ -19,6 +19,10 @@ describe("service files", () => {
 
   it("escapes systemd specials", () => {
     expect(sdQuote('a "b" 100% $HOME \\x')).toBe('"a \\"b\\" 100%% $$HOME \\\\x"');
+    // Environment= does not expand $ (round-1 nit): keep it literal there.
+    expect(sdQuote("PATH=/opt/$x/bin", "env")).toBe('"PATH=/opt/$x/bin"');
+    expect(systemdUnit({ ...spec, path: "/a$b:/bin" })).toContain('Environment="PATH=/a$b:/bin"');
+    expect(systemdUnit({ ...spec, node: "/n$x/node" })).toContain('ExecStart="/n$$x/node"');
     expect(() => sdQuote("a\nb")).toThrow();
   });
 

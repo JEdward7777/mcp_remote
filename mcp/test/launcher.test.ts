@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { LaunchRecord } from "@mcp-remote/shared";
 import { LaunchConfig, projectIdFor } from "../src/launch-config";
-import { Launcher, MAX_AUTO_RESTARTS } from "../src/launcher";
+import { Launcher, MAX_AUTO_RESTARTS, deadStatus } from "../src/launcher";
 import { FakeTmux } from "./fake-tmux";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -175,7 +175,7 @@ describe("launcher", () => {
     tmux.sessions.get(a.launch_id)!.screen = fx;
     await waitFor(() => rec(l, a.launch_id).state === "needs_attention", "needs_attention", 3000);
     expect(tmux.keys).toHaveLength(3);
-    expect(rec(l, a.launch_id).detail).toMatch(/could not be dismissed/);
+    expect(rec(l, a.launch_id).detail).toMatch(/not answered automatically/);
   });
 
   it("reports exit codes and Claude Code's last line; stop is not a crash", async () => {
@@ -313,5 +313,77 @@ describe("launcher", () => {
     } finally {
       process.env.PATH = path;
     }
+  });
+
+  it("never reads or types into a re-adopted session, even if the warning is on its screen (round-1 finding)", async () => {
+    const dialog = readFileSync(join(__dirname, "fixtures", "dev-channels-raw.txt"), "utf8");
+    const l1 = make();
+    await l1.init();
+    const a = (await l1.launch(alphaId(), { continue: false })) as { launch_id: string };
+    l1.shimRegister(a.launch_id, tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN);
+    l1.dispose();
+    // Orphan too (state file doesn't know it).
+    await tmux.spawn({
+      name: "mr-aaaaaaaaaaaa",
+      cwd: proj,
+      env: { MCP_REMOTE_SESSION_ID: "mr-aaaaaaaaaaaa", MCP_REMOTE_LAUNCH_TOKEN: "t1", MCP_REMOTE_PROJECT_ID: alphaId() },
+      argv: ["claude", "x"],
+    });
+    for (const s of tmux.sessions.values()) s.screen = dialog;
+    const capt: string[] = [];
+    const orig = tmux.capture.bind(tmux);
+    tmux.capture = async (n: string, h?: number) => {
+      capt.push(n);
+      return orig(n, h);
+    };
+    const l2 = make();
+    await l2.init();
+    await sleep(200);
+    expect(tmux.keys).toEqual([]);
+    expect(capt).toEqual([]);
+    expect(l2.records().map((r) => r.state)).toEqual(["starting", "starting"]);
+  });
+
+  it("stops looking for dialogs once the spawn's shim linked", async () => {
+    const dialog = readFileSync(join(__dirname, "fixtures", "dev-channels-raw.txt"), "utf8");
+    const l = make();
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    l.shimRegister(a.launch_id, tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN);
+    l.shimDown(a.launch_id); // e.g. shim crashed; Claude Code keeps running
+    tmux.sessions.get(a.launch_id)!.screen = dialog;
+    await sleep(150);
+    expect(tmux.keys).toEqual([]);
+  });
+
+  it("keeps a pending auto-restart across a daemon restart", async () => {
+    const l1 = make({ restartBaseMs: 300 });
+    await l1.init();
+    const a = (await l1.launch(alphaId(), { continue: false, auto_restart: true })) as { launch_id: string };
+    tmux.die(a.launch_id, 3, "boom");
+    await waitFor(() => rec(l1, a.launch_id).detail?.includes("restarting in"), "pending");
+    l1.dispose();
+    expect(JSON.parse(readFileSync(l1.statePath, "utf8")).launches[0].restart_at).toBeGreaterThan(Date.now() - 1000);
+    const l2 = make({ restartBaseMs: 300 });
+    await l2.init();
+    await waitFor(() => tmux.spawns.length === 2, "re-armed restart", 3000);
+    expect(rec(l2, a.launch_id).state).toBe("starting");
+  });
+
+  it("auto-restart re-checks the allowlist", async () => {
+    const l = make({ restartBaseMs: 100 });
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: false, auto_restart: true })) as { launch_id: string };
+    cfg = LaunchConfig.parse({ ...cfg, roots: [] }); // project removed while it runs
+    tmux.die(a.launch_id, 3, "boom");
+    await waitFor(() => rec(l, a.launch_id).state === "failed", "failed", 3000);
+    expect(rec(l, a.launch_id).detail).toMatch(/no longer in the computer's allowlist/);
+    expect(tmux.spawns).toHaveLength(1);
+  });
+
+  it("reads the exit status from tmux's dead-pane line when list-panes has none yet", () => {
+    expect(deadStatus("x\nPane is dead (status 7, Sun Oct 25 21:57:43 2026)\n")).toBe(7);
+    expect(deadStatus("Pane is dead (signal 9, Sun Oct 25 21:57:43 2026)")).toBeNull();
+    expect(deadStatus("")).toBeNull();
   });
 });

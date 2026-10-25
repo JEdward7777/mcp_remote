@@ -1,6 +1,12 @@
 // tmux driver for phone-launched sessions (D6). Every call is execFile with an argv array: no shell is
 // ever involved, and tmux itself executes a multi-argument command directly (verified on tmux 3.4:
 // `new-session -- printf '%s' '$(id)'` prints the literal text).
+//
+// tmux format-expands some arguments (`#(cmd)` runs cmd through /bin/sh, `#{...}` substitutes). Verified on
+// tmux 3.4: `new-session -c <dir>` IS expanded; `-e K=V` values and the command's arguments are NOT. So the
+// project folder is never passed as an argument: new-session starts in the tmux client's own working
+// directory, which we set with execFile's `cwd` (verified, also when the server is already running). Every
+// other argument is either a constant or a validated `mr-<12 hex>` session name.
 import { execFile } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
@@ -64,6 +70,12 @@ export function which(cmd: string, pathEnv = process.env.PATH ?? ""): string | n
   return null;
 }
 
+const NAME_RE = /^mr-[0-9a-f]{12}$/;
+/** Session names are the only variable part of tmux targets; anything else is refused. */
+export function assertName(name: string): void {
+  if (!NAME_RE.test(name)) throw new Error(`bad tmux session name ${JSON.stringify(name)}`);
+}
+
 /** Base argv: our own socket and no user tmux.conf, so options are predictable. */
 export function baseArgs(o: TmuxOptions): string[] {
   return ["-L", o.socket, "-f", "/dev/null"];
@@ -76,7 +88,7 @@ export function baseArgs(o: TmuxOptions): string[] {
  * rejects extra arguments ending in ';' so user arguments can never be read as one.
  */
 export function spawnArgs(o: TmuxOptions, spec: SpawnSpec): string[] {
-  if (!/^mr-[0-9a-f]{12}$/.test(spec.name)) throw new Error(`bad tmux session name ${spec.name}`);
+  assertName(spec.name);
   if (spec.argv.length < 2) throw new Error("command must have at least 2 arguments (tmux runs a single one through a shell)");
   for (const a of spec.argv) if (a.endsWith(";") || a.includes("\0")) throw new Error(`refusing argument ${JSON.stringify(a)}`);
   const env: string[] = [];
@@ -94,8 +106,7 @@ export function spawnArgs(o: TmuxOptions, spec: SpawnSpec): string[] {
     "200",
     "-y",
     "50",
-    "-c",
-    spec.cwd,
+    // No -c: the folder is the client's cwd (see top of file).
     ...env,
     "--",
     ...spec.argv,
@@ -128,9 +139,15 @@ export function parseList(out: string): PaneInfo[] {
   return res;
 }
 
-function run(bin: string, args: string[], env?: NodeJS.ProcessEnv, timeoutMs = 10_000): Promise<{ stdout: string; stderr: string }> {
+function run(
+  bin: string,
+  args: string[],
+  env?: NodeJS.ProcessEnv,
+  cwd?: string,
+  timeoutMs = 10_000,
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(bin, args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true, ...(env ? { env } : {}) }, (err, stdout, stderr) => {
+    execFile(bin, args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true, ...(env ? { env } : {}), ...(cwd ? { cwd } : {}) }, (err, stdout, stderr) => {
       if (err) {
         const e = err as NodeJS.ErrnoException & { stderr?: string };
         e.stderr = String(stderr);
@@ -149,8 +166,8 @@ function isNoServer(e: unknown): boolean {
 export class Tmux implements TmuxDriver {
   constructor(private readonly o: TmuxOptions) {}
 
-  private run(args: string[]): Promise<{ stdout: string; stderr: string }> {
-    return run(this.o.bin, args, this.o.env);
+  private run(args: string[], cwd?: string): Promise<{ stdout: string; stderr: string }> {
+    return run(this.o.bin, args, this.o.env, cwd);
   }
 
   async version(): Promise<string> {
@@ -158,7 +175,8 @@ export class Tmux implements TmuxDriver {
   }
 
   async spawn(spec: SpawnSpec): Promise<void> {
-    await this.run(spawnArgs(this.o, spec));
+    // The folder becomes the session's start directory without ever being parsed by tmux.
+    await this.run(spawnArgs(this.o, spec), spec.cwd);
   }
 
   async list(): Promise<PaneInfo[]> {
@@ -172,6 +190,7 @@ export class Tmux implements TmuxDriver {
   }
 
   async capture(name: string, history?: number): Promise<string> {
+    assertName(name);
     try {
       const h = history ? ["-S", `-${Math.floor(history)}`] : [];
       return (await this.run([...baseArgs(this.o), "capture-pane", "-p", ...h, "-t", `=${name}:`])).stdout;
@@ -182,10 +201,12 @@ export class Tmux implements TmuxDriver {
   }
 
   async sendKeys(name: string, keys: string[]): Promise<void> {
+    assertName(name);
     await this.run([...baseArgs(this.o), "send-keys", "-t", `=${name}:`, ...keys]);
   }
 
   async kill(name: string): Promise<void> {
+    assertName(name);
     try {
       await this.run([...baseArgs(this.o), "kill-session", "-t", `=${name}`]);
     } catch (e) {
@@ -194,6 +215,7 @@ export class Tmux implements TmuxDriver {
   }
 
   async showEnv(name: string): Promise<Record<string, string>> {
+    assertName(name);
     const out: Record<string, string> = {};
     try {
       const r = await this.run([...baseArgs(this.o), "show-environment", "-t", `=${name}`]);

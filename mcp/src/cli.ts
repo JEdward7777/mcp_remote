@@ -3,6 +3,9 @@ import { Daemon } from "./daemon";
 import { configPath, loadConfig } from "./config";
 import { attach, configCommand, projectsCommand, setupClaude } from "./desk";
 import { installService, uninstallService } from "./service";
+import { runClaude } from "./run-claude";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { log, setLogPrefix } from "./log";
 import { pair } from "./pair";
 import { runShim } from "./shim";
@@ -55,7 +58,8 @@ async function main(argv: string[]): Promise<void> {
       setLogPrefix("mcp-remote daemon");
       const config = loadConfig();
       log(`using ${configPath()} (machine ${config.machine_name ?? config.machine_id})`);
-      const d = new Daemon({ config });
+      // Launched sessions run under `mcp-remote run-claude` (this same CLI) so their exit status is recorded.
+      const d = new Daemon({ config, launcher: { wrapper: [realpathSync(process.execPath), realpathSync(fileURLToPath(import.meta.url))] } });
       const stop = () => {
         d.stop();
         process.exit(0);
@@ -78,6 +82,9 @@ async function main(argv: string[]): Promise<void> {
       return;
     case "setup-claude":
       setupClaude(rest);
+      return;
+    case "run-claude":
+      runClaude(rest);
       return;
     case "attach":
       attach(rest);

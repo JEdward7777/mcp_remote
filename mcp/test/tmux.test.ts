@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { Tmux, parseList, spawnArgs, tmuxVersionOk, which } from "../src/tmux";
+import { Tmux, assertName, parseList, spawnArgs, tmuxVersionOk, which } from "../src/tmux";
 
 const O = { bin: "tmux", socket: "mcp-remote" };
 const spec = {
@@ -20,7 +20,6 @@ describe("tmux argv", () => {
     const dd = a.indexOf("--");
     expect(a.slice(4, dd)).toEqual([
       "new-session", "-d", "-s", "mr-0123456789ab", "-x", "200", "-y", "50",
-      "-c", "/home/you/code/my project",
       "-e", "MCP_REMOTE_SESSION_ID=mr-0123456789ab", "-e", "MCP_REMOTE_LAUNCH_TOKEN=tok",
     ]);
     const sep = a.indexOf(";");
@@ -28,7 +27,9 @@ describe("tmux argv", () => {
     expect(a.slice(sep + 1)).toEqual(["set-option", "-w", "-t", "mr-0123456789ab", "remain-on-exit", "on"]);
     expect(a.filter((x) => x === ";")).toHaveLength(1);
     expect(a).not.toContain("sh");
-    expect(a).not.toContain("-c ");
+    // The folder is never a tmux argument (tmux format-expands -c): it is execFile's cwd instead.
+    expect(a).not.toContain("-c");
+    expect(a.join(" ")).not.toContain("my project");
   });
 
   it("refuses names, args and env that could escape", () => {
@@ -37,6 +38,7 @@ describe("tmux argv", () => {
     expect(() => spawnArgs(O, { ...spec, argv: [...spec.argv, "x;"] })).toThrow(/refusing/);
     expect(() => spawnArgs(O, { ...spec, env: { "BAD KEY": "1" } })).toThrow(/bad env/);
     expect(() => spawnArgs(O, { ...spec, env: { K: "v;" } })).toThrow(/bad env/);
+    for (const n of ["#(id)", "mr-0123456789ab#{x}", "=mr-0123456789ab", "mr-0123456789ab:1"]) expect(() => assertName(n)).toThrow();
   });
 
   it("parses list-panes output and versions", () => {
@@ -55,7 +57,7 @@ describe("tmux argv", () => {
 
 const tmuxBin = which("tmux");
 const socket = `mr-test-${process.pid}`;
-const work = mkdtempSync(join(tmpdir(), "mcpr-tmux-"));
+const work = realpathSync(mkdtempSync(join(tmpdir(), "mcpr-tmux-")));
 afterAll(() => {
   if (tmuxBin) {
     try {
@@ -93,5 +95,50 @@ describe.skipIf(!tmuxBin)("real tmux", () => {
     await t.kill(name);
     await t.kill(name); // idempotent
     expect((await t.list()).find((x) => x.name === name)).toBeUndefined();
+  });
+
+  it("starts in folders with hostile names without tmux expanding them (round-1 finding)", async () => {
+    const t = new Tmux({ bin: tmuxBin!, socket });
+    const base = join(work, "hostile");
+    mkdirSync(base);
+    const names = ["#(touch PWNED)", "#{session_name}", "x#(touch PWNED2)y", "trail;", "semi;colon", "q\"u'o $(touch PWNED3)", "new\nline", "#[fg=red]##"];
+    let i = 0;
+    for (const n of names) {
+      const dir = join(base, n);
+      mkdirSync(dir);
+      const name = `mr-${(0xc0de00 + i).toString(16).padStart(12, "0")}`;
+      const out = join(work, `cwd-${i++}.txt`);
+      await t.spawn({
+        name,
+        cwd: dir,
+        env: { V: n.replace(/;$/, "") },
+        argv: [process.execPath, "-e", "require('fs').writeFileSync(process.argv[1], process.cwd() + '\\0' + process.env.V)", out],
+      });
+      for (let k = 0; k < 100 && !existsSync(out); k++) await new Promise((r) => setTimeout(r, 30));
+      const [cwd, v] = readFileSync(out, "utf8").split("\0");
+      expect(cwd).toBe(dir);
+      expect(v).toBe(n.replace(/;$/, ""));
+      await t.kill(name);
+    }
+    const all = [...(readdirSync(work, { recursive: true }) as string[]), ...readdirSync(process.cwd())];
+    expect(all.filter((f) => /(^|\/)PWNED/.test(f))).toEqual([]);
+  });
+
+  it("run-claude records the exit status even when tmux does not (round-1 follow-up)", async () => {
+    const cli = join(__dirname, "..", "dist", "cli.js"); // built by `npm test`
+    const t = new Tmux({ bin: tmuxBin!, socket });
+    for (let i = 0; i < 12; i++) {
+      const name = `mr-${(0xe0e000 + i).toString(16).padStart(12, "0")}`;
+      const file = join(work, `${name}.exit`);
+      await t.spawn({
+        name,
+        cwd: work,
+        env: { MCP_REMOTE_LAUNCH_TOKEN: `tok${i}` },
+        argv: [process.execPath, cli, "run-claude", "--status-file", file, "--", process.execPath, "-e", "console.log('bye'); process.exit(7)"],
+      });
+      for (let k = 0; k < 100 && !existsSync(file); k++) await new Promise((r) => setTimeout(r, 30));
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ token: `tok${i}`, code: 7, signal: null });
+      await t.kill(name);
+    }
   });
 });

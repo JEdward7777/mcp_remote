@@ -29,15 +29,20 @@ export interface ServiceSpec {
   logDir?: string;
 }
 
-/** Quote one systemd ExecStart/Environment word: "..." with \ and " escaped, % as %%, $ as $$. */
-export function sdQuote(s: string): string {
+/**
+ * Quote one systemd word: "..." with \ and " escaped and % (specifiers) as %%. ExecStart= also expands
+ * $VAR, so there $ becomes $$; Environment= does not expand variables, so $ stays as is (systemd.exec(5)).
+ */
+export function sdQuote(s: string, kind: "exec" | "env" = "exec"): string {
   if (/[\n\r\0]/.test(s)) throw new Error("newline in unit value");
-  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%").replace(/\$/g, "$$$$")}"`;
+  let q = s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/%/g, "%%");
+  if (kind === "exec") q = q.replace(/\$/g, "$$$$");
+  return `"${q}"`;
 }
 
 export function systemdUnit(spec: ServiceSpec): string {
-  const env = [`Environment=${sdQuote(`PATH=${spec.path}`)}`];
-  if (spec.configDir) env.push(`Environment=${sdQuote(`MCP_REMOTE_CONFIG_DIR=${spec.configDir}`)}`);
+  const env = [`Environment=${sdQuote(`PATH=${spec.path}`, "env")}`];
+  if (spec.configDir) env.push(`Environment=${sdQuote(`MCP_REMOTE_CONFIG_DIR=${spec.configDir}`, "env")}`);
   return `# Written by \`mcp-remote install-service\`. Remove with \`mcp-remote uninstall-service\`.
 [Unit]
 Description=mcp-remote daemon (phone <-> Claude Code relay)

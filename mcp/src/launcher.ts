@@ -12,7 +12,7 @@
 //     dialogs (see dialogs.ts)
 //   - one `tmux list-panes` every LIVENESS_MS while any launch is active, to notice exits
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -27,6 +27,7 @@ import { configDir, ensureConfigDir } from "./config";
 import { DEV_CHANNELS_KEYS, NO_CONVERSATION, attentionText, autoAcceptable, detectDialog, lastLine } from "./dialogs";
 import { type LaunchConfig, defaultLaunchConfig, findProject, resolveProjects } from "./launch-config";
 import { log } from "./log";
+import { type ExitRecord, exitCodeOf } from "./run-claude";
 import { type PaneInfo, Tmux, type TmuxDriver, tmuxVersionOk, which } from "./tmux";
 
 /** Auto-restarts allowed within one crash window before giving up. */
@@ -40,14 +41,23 @@ const Entry = LaunchRecord.extend({
   path: z.string(),
   spawned_at: z.number().int(),
   ever_running: z.boolean(),
+  /** When a pending auto-restart is due (persisted so a daemon restart doesn't lose it). */
+  restart_at: z.number().int().nullable().default(null),
 });
 type Entry = z.infer<typeof Entry> & {
   linked?: boolean;
+  /**
+   * Spawned by this daemon and its shim has never linked: the only state in which startup dialogs are
+   * looked for, and the only one in which keys are ever sent. Re-adopted sessions are never fresh.
+   */
+  fresh?: boolean;
   stopping?: boolean;
   busy?: boolean;
   dialogTries?: number;
   lastDialog?: string | null;
   noConversation?: boolean;
+  /** First time the pane was seen dead without an exit status. */
+  deadSince?: number;
 };
 const StateFile = z.object({ v: z.literal(1), launches: z.array(Entry).max(MAX_LAUNCHES_PER_MACHINE) });
 
@@ -67,6 +77,12 @@ export interface LauncherOptions {
   restartBaseMs?: number;
   stopWaitMs?: number;
   platform?: NodeJS.Platform;
+  /**
+   * [node, cli.js]: run Claude Code under `mcp-remote run-claude`, which records its exit status in
+   * runDir (tmux sometimes loses it). Unset: run claude directly and rely on tmux's status only.
+   */
+  wrapper?: string[];
+  runDir?: string;
 }
 
 function newId(): string {
@@ -92,6 +108,12 @@ function sanitizedEnv(): NodeJS.ProcessEnv {
     env[k] = v;
   }
   return env;
+}
+
+/** tmux's own "Pane is dead (status N, <date>)" line, as a fallback when list-panes had no status yet. */
+export function deadStatus(screen: string): number | null {
+  const m = /Pane is dead \(status (-?\d+),/.exec(screen);
+  return m ? Number(m[1]) : null;
 }
 
 export class Launcher {
@@ -128,6 +150,11 @@ export class Launcher {
     await this.reload();
     this.loadState();
     if (this.tmux && this.available) await this.readopt();
+    // Re-arm auto-restarts that were pending when the previous daemon stopped.
+    for (const e of this.entries) {
+      if (e.restart_at !== null && e.state === "exited") this.scheduleRestart(e, Math.max(0, e.restart_at - Date.now()));
+      else e.restart_at = null;
+    }
     this.ensureLiveness();
     this.changed();
   }
@@ -212,6 +239,7 @@ export class Launcher {
       path: project.path,
       spawned_at: now,
       ever_running: false,
+      restart_at: null,
     };
     this.entries.push(e);
     await this.spawn(e);
@@ -283,6 +311,7 @@ export class Launcher {
     if (!e) return "none";
     if (!token || token !== e.token) return "reject";
     e.linked = true;
+    e.fresh = false;
     this.clearStartup(e);
     this.set(e, { state: "running", detail: null, exit_code: null, ever_running: true });
     return "linked";
@@ -339,13 +368,42 @@ export class Launcher {
     return argv;
   }
 
+  private statusFile(e: Entry): string {
+    return join(this.o.runDir ?? join(configDir(), "run"), `${e.launch_id}.exit`);
+  }
+
+  /** Exit status recorded by run-claude for the current spawn (and remove the file). */
+  private takeExit(e: Entry): number | null {
+    if (!this.o.wrapper) return null;
+    const f = this.statusFile(e);
+    try {
+      const r = JSON.parse(readFileSync(f, "utf8")) as ExitRecord;
+      rmSync(f, { force: true });
+      return r.token === e.token ? exitCodeOf(r) : null;
+    } catch {
+      return null;
+    }
+  }
+
   private async spawn(e: Entry): Promise<void> {
     const tmux = this.tmux!;
     // Count as active right away, so concurrent launch/restart requests see it against max_sessions.
     e.state = "starting";
-    const argv = this.claudeArgv(e);
+    let argv = this.claudeArgv(e);
+    if (this.o.wrapper && typeof argv !== "string") {
+      const f = this.statusFile(e);
+      try {
+        mkdirSync(join(f, ".."), { recursive: true, mode: 0o700 });
+        rmSync(f, { force: true });
+      } catch (err) {
+        log(`cannot prepare ${f}:`, err);
+      }
+      argv = [...this.o.wrapper, "run-claude", "--status-file", f, "--", ...argv];
+    }
     e.token = newToken();
     e.linked = false;
+    e.fresh = true;
+    e.restart_at = null;
     e.stopping = false;
     e.dialogTries = 0;
     e.lastDialog = null;
@@ -382,7 +440,9 @@ export class Launcher {
     const tick = async () => {
       this.startupTimers.delete(e.launch_id);
       if (this.disposed || e.linked || !ACTIVE.includes(e.state) || e.stopping) return;
-      await this.startupTick(e);
+      // Only a fresh spawn is still in front of Claude Code's startup dialogs. A re-adopted session is
+      // past them (its shim was running), so its screen is never read or typed into.
+      if (e.fresh) await this.startupTick(e);
       if (this.disposed || e.linked || !ACTIVE.includes(e.state) || e.stopping) return;
       if (Date.now() - e.spawned_at > this.cfg.startup_timeout_s * 1000) {
         if (e.state === "starting") {
@@ -458,6 +518,7 @@ export class Launcher {
     const t = this.restartTimers.get(e.launch_id);
     if (t) clearTimeout(t);
     this.restartTimers.delete(e.launch_id);
+    e.restart_at = null;
   }
 
   private ensureLiveness(): void {
@@ -500,8 +561,18 @@ export class Launcher {
         }
         let screen = "";
         if (p) screen = await this.tmux.capture(e.launch_id, 60).catch(() => "");
+        const status = this.takeExit(e) ?? (p ? (p.status ?? deadStatus(screen)) : null);
+        if (p && status === null && !this.o.wrapper) {
+          // Without the wrapper: give tmux a moment to record the status (it sometimes never does).
+          e.deadSince ??= Date.now();
+          if (Date.now() - e.deadSince < 3_000) {
+            setTimeout(() => void this.checkAll(), 500).unref?.();
+            continue;
+          }
+        }
+        e.deadSince = undefined;
         await this.tmux.kill(e.launch_id).catch(() => {});
-        this.onExit(e, p ? p.status : null, screen, !p);
+        this.onExit(e, status, screen, !p);
       }
     } finally {
       this.checking = false;
@@ -540,24 +611,46 @@ export class Launcher {
       }
       const delay = backoffDelay(e.restarts, { baseMs: this.o.restartBaseMs ?? 10_000, capMs: 300_000, minMs: Math.min(5_000, this.o.restartBaseMs ?? 5_000) });
       e.restarts++;
-      this.set(e, {
-        state: "exited",
-        exit_code: status,
-        detail: `crashed (${detail ?? "no output"}); restarting in ${Math.ceil(delay / 1000)}s (${e.restarts}/${MAX_AUTO_RESTARTS})`,
-      });
-      this.restartTimers.set(
-        e.launch_id,
-        setTimeout(() => {
-          this.restartTimers.delete(e.launch_id);
-          if (this.disposed) return;
-          // Resume the conversation if there was one; if --continue found none, start fresh.
-          e.continued = e.ever_running && !e.noConversation;
-          void this.spawn(e);
-        }, delay),
-      );
+      // Resume the conversation if there was one; if --continue found none, start fresh.
+      e.continued = e.ever_running && !e.noConversation;
+      e.state = "exited";
+      e.exit_code = status;
+      e.detail = clip(`crashed (${detail ?? "no output"}); restarting in ${Math.ceil(delay / 1000)}s (${e.restarts}/${MAX_AUTO_RESTARTS})`);
+      this.scheduleRestart(e, delay); // persists restart_at via changed()
       return;
     }
     this.set(e, { state: "exited", exit_code: status, detail });
+  }
+
+  private scheduleRestart(e: Entry, delay: number): void {
+    this.cancelRestart(e);
+    e.restart_at = Date.now() + delay;
+    this.restartTimers.set(
+      e.launch_id,
+      setTimeout(() => void this.autoRestart(e), delay),
+    );
+    this.set(e, {});
+  }
+
+  /** Same checks as a phone restart: current config, launching available, project still allowlisted. */
+  private async autoRestart(e: Entry): Promise<void> {
+    if (this.disposed || !this.restartTimers.has(e.launch_id)) return;
+    await this.reload();
+    if (this.disposed || !this.restartTimers.has(e.launch_id)) return; // stopped meanwhile
+    this.restartTimers.delete(e.launch_id);
+    e.restart_at = null;
+    if (!this.available || !this.tmux) {
+      this.set(e, { state: "failed", detail: `auto-restart skipped: ${this.launchError ?? "remote launch is not available"}` });
+      return;
+    }
+    const project = findProject(this.cfg, e.project_id);
+    if (!project) {
+      this.set(e, { state: "failed", detail: "auto-restart skipped: this project is no longer in the computer's allowlist" });
+      return;
+    }
+    e.path = project.path;
+    e.project = project.name;
+    await this.spawn(e);
   }
 
   private async readopt(): Promise<void> {
@@ -573,17 +666,18 @@ export class Launcher {
       if (!ACTIVE.includes(e.state)) continue;
       const p = panes.find((x) => x.name === e.launch_id);
       if (!p) {
-        this.set(e, { state: "exited", exit_code: null, detail: "ended while the mcp-remote daemon was not running" });
+        this.set(e, { state: "exited", exit_code: this.takeExit(e), detail: "ended while the mcp-remote daemon was not running" });
         continue;
       }
       if (p.dead) {
         const screen = await tmux.capture(e.launch_id, 60).catch(() => "");
         await tmux.kill(e.launch_id).catch(() => {});
-        this.onExit(e, p.status, screen, false);
+        this.onExit(e, this.takeExit(e) ?? p.status ?? deadStatus(screen), screen, false);
         continue;
       }
       log(`re-adopting ${e.launch_id} (${e.project})`);
       e.spawned_at = Date.now();
+      e.fresh = false;
       this.set(e, { state: "starting", detail: "re-adopted after a daemon restart; waiting for its shim to reconnect" });
       this.startStartup(e);
     }
@@ -617,6 +711,8 @@ export class Launcher {
         path: project.path,
         spawned_at: now,
         ever_running: true,
+        restart_at: null,
+        fresh: false,
       };
       this.entries.push(e);
       this.startStartup(e);

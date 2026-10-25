@@ -248,8 +248,11 @@ appear in the session list like any other (badge "launched") and keep their thre
 At the desk, `mcp-remote attach mr-<id>` opens a launched session's terminal (detach with `Ctrl-b d`); they run on
 a dedicated tmux server: `tmux -L mcp-remote ls`. Each runs
 `claude --dangerously-load-development-channels server:mcp-remote [--permission-mode X] [--continue] [extra args]`
-in the project folder, with `MCP_REMOTE_SESSION_ID` and a per-start `MCP_REMOTE_LAUNCH_TOKEN` in its environment
-so the shim it starts is linked to the launch. Auto-restart (off by default) restarts a crashed session (non-zero
+in the project folder (under a small `mcp-remote run-claude` wrapper that records its exit code, which tmux
+sometimes loses), with `MCP_REMOTE_SESSION_ID` and a per-start `MCP_REMOTE_LAUNCH_TOKEN` in its environment
+so the shim it starts is linked to the launch. The daemon only reads a session's screen (and only answers the
+development-channels warning) right after it started it, before its shim connects; sessions it re-adopts after a
+restart are never typed into. Auto-restart (off by default) restarts a crashed session (non-zero
 exit) with growing delays, resuming the conversation, and gives up after 5 crashes in a row (a run longer than
 10 minutes resets the count); a clean exit or **Stop** is never restarted.
 

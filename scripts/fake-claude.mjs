@@ -79,6 +79,12 @@ client.fallbackNotificationHandler = async (n) => {
 };
 await client.connect(transport);
 log("mcp_connected");
+if (process.env.FAKE_CLAUDE_CRASH_MS) {
+  setTimeout(() => {
+    process.stdout.write("fatal: simulated crash\n");
+    process.exit(7);
+  }, Number(process.env.FAKE_CLAUDE_CRASH_MS));
+}
 
 const bye = async (sig) => {
   log("signal", { sig });

@@ -19,11 +19,17 @@ Remote launch (Phase 2, D6/D18):
 - `mcp-remote attach mr-<id>` - attach to a launched session (`tmux -L mcp-remote attach -t mr-<id>`).
 - `mcp-remote install-service [--dry-run] [--no-start]` / `uninstall-service` - systemd user unit / launchd agent.
 
-The daemon runs each launch as `tmux -L mcp-remote new-session -d -s mr-<id> -c <dir> -e MCP_REMOTE_SESSION_ID=mr-<id>
--e MCP_REMOTE_LAUNCH_TOKEN=... -- claude --dangerously-load-development-channels server:mcp-remote [...]` (execFile,
-no shell; `remain-on-exit` so the exit status and last output can be read), watches startup with `capture-pane`
-for Claude Code's dialogs (answers only the development-channels warning for its own server), and tracks state in
-`launches.json` so a restarted daemon re-adopts running sessions.
+The daemon runs each launch as `tmux -L mcp-remote new-session -d -s mr-<id> -e MCP_REMOTE_SESSION_ID=mr-<id>
+-e MCP_REMOTE_LAUNCH_TOKEN=... -- node cli.js run-claude --status-file <config>/run/mr-<id>.exit --
+claude --dangerously-load-development-channels server:mcp-remote [...]` (execFile,
+no shell; `remain-on-exit` keeps the last output readable; `run-claude` records the exit status because tmux 3.4
+sometimes leaves `#{pane_dead_status}` empty, and forwards SIGHUP/SIGTERM to Claude Code). The project folder is the tmux
+client's working directory (execFile `cwd`), never a tmux argument, because tmux format-expands `-c` (a folder
+named `#(cmd)` would run `cmd`). While a session it just spawned starts up (before its shim has ever connected),
+it reads the screen with `capture-pane` to spot Claude Code's dialogs, and answers only the development-channels
+warning for its own server, matched by its exact full-screen layout. Re-adopted sessions are never read or typed
+into. State is kept in `launches.json` (including pending auto-restarts) so a restarted daemon re-adopts running
+sessions.
 
 Env: `MCP_REMOTE_CONFIG_DIR`, `MCP_REMOTE_SOCKET`, `MCP_REMOTE_SESSION_ID`, `MCP_REMOTE_LAUNCH_TOKEN` (set by the
 daemon for launched sessions), `MCP_REMOTE_FATAL_EXIT_ZERO=1` (exit 0 instead of 3/4; used by the launchd agent).

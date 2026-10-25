@@ -318,4 +318,36 @@ describe("daemon remote launch", () => {
     expect(frames[0]).toEqual({ t: "reloaded", ok: true });
     await waitFor(() => hubFrames.filter((f) => f.t === "projects").length === 2, "re-advertised");
   });
+
+  it("refuses a nested process that inherited the launch's id and token; the real shim keeps the session (round-1 finding)", async () => {
+    const { tmux, alpha } = await setup();
+    hub({ t: "launch", req_id: "n1", project_id: alpha, continue: false });
+    await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "n1" && f.ok), "launch ok");
+    const id = tmux.spawns[0]!.name;
+    const token = tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN;
+    const connect = async () => {
+      const sock = createConnection(join(dir, "d.sock"));
+      await new Promise<void>((r) => sock.once("connect", () => r()));
+      const c = { frames: [] as any[], closed: false, conn: null as unknown as LineConn<DaemonToShim> };
+      c.conn = new LineConn(sock, DaemonToShim, (f) => c.frames.push(f), () => {});
+      sock.on("close", () => (c.closed = true));
+      c.conn.send({ t: "register", v: 1, session: { session_id: id, project: "alpha" }, launch_token: token });
+      await waitFor(() => c.frames.find((f) => f.t === "registered" || f.t === "register_refused"), "reply");
+      return c;
+    };
+    const real = await connect();
+    expect(real.frames[0]).toMatchObject({ t: "registered" });
+    await waitFor(() => lastLaunches()[0]?.state === "running", "running");
+    const nested = await connect();
+    expect(nested.frames[0]).toMatchObject({ t: "register_refused", error: expect.stringMatching(/already connected/) });
+    await waitFor(() => nested.closed, "nested closed");
+    await sleep(50);
+    expect(real.closed).toBe(false);
+    const msg = { id: 5, session_id: id, direction: "in", text: "for the real one", urgency: null, created_at: 1, delivered: false };
+    hub({ t: "deliver", session_id: id, messages: [msg] });
+    await waitFor(() => real.frames.find((f) => f.t === "deliver"), "deliver to real shim");
+    expect(nested.frames.find((f) => f.t === "deliver")).toBeUndefined();
+    expect(hubFrames.filter((f) => f.t === "session_down" && f.session_id === id)).toEqual([]);
+    expect(lastLaunches()[0].state).toBe("running");
+  });
 });

@@ -37,6 +37,8 @@ interface ShimEntry {
   session: SessionAnnounce;
   /** Linked to a phone launch (the shim presented that launch's current token). */
   launched: boolean;
+  /** The launch token it registered with, if any. */
+  token: string | undefined;
   /** Set when the Hub refused this session (e.g. id used by another computer). */
   refused: string | null;
 }
@@ -159,6 +161,20 @@ export class Daemon {
       (f) => {
         if (f.t === "register") {
           if (sessionId) return conn.send({ t: "error", error: "already registered" } satisfies DaemonToShim);
+          const prior = this.shims.get(f.session.session_id);
+          if (prior && f.launch_token && prior.token === f.launch_token) {
+            // Same spawn's token while its shim is connected: a second process inherited the session's
+            // environment (e.g. `claude` run from a Bash tool or hook inside the launched session). The
+            // connected shim stays; only a newer spawn (different, current token) may replace it.
+            conn.send({
+              t: "register_refused",
+              error:
+                `session "${f.session.session_id}" is already connected; this process inherited its MCP_REMOTE_SESSION_ID ` +
+                "and MCP_REMOTE_LAUNCH_TOKEN (a claude started inside a phone-launched session?)",
+            } satisfies DaemonToShim);
+            conn.close();
+            return;
+          }
           const link = this.launcher?.shimRegister(f.session.session_id, f.launch_token) ?? "none";
           if (link === "reject") {
             conn.send({
@@ -194,7 +210,7 @@ export class Daemon {
             return;
           }
           sessionId = f.session.session_id;
-          this.shims.set(sessionId, { conn, session: f.session, refused: null, launched: link === "linked" });
+          this.shims.set(sessionId, { conn, session: f.session, refused: null, launched: link === "linked", token: f.launch_token });
           log(`shim up: ${f.session.project} (${sessionId})`);
           conn.send({ t: "registered", hub_connected: this.hubReady } satisfies DaemonToShim);
           this.toHub({ t: "session_up", session: f.session });

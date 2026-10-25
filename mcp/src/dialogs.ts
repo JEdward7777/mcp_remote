@@ -7,23 +7,61 @@
 //   default is the refusing option, so pressing Enter blindly would exit or disable the shim.
 //
 // Policy: the daemon answers exactly one dialog, the development-channels warning, and only when it lists
-// nothing but our own server (the user opted into it by configuring launches). Everything else is a
+// nothing but our own server (the user opted into it by configuring launches), only when the screen is
+// exactly that dialog (strict layout check), and only for a session it just spawned whose shim has never
+// connected (Claude Code starts MCP servers only after this warning, so a linked shim means it is past it). Everything else is a
 // decision the user makes at the desk, reported to the phone as needs_attention with what to do.
 
 export type Dialog =
-  | { kind: "dev_channels"; channels: string[]; option1: boolean }
+  /** `wellFormed`: the screen is exactly the full-screen warning (see devChannelsDialog); only then is it answerable. */
+  | { kind: "dev_channels"; channels: string[]; wellFormed: boolean }
   | { kind: "trust" }
   | { kind: "mcp_consent"; server: string }
   | { kind: "bypass" }
   | { kind: "login" };
 
+const DEV_HEADER = "WARNING: Loading development channels";
+const DEV_OPTION1 = /^(?:\u276F\s*)?1\.\s*I am using this for local development$/;
+const DEV_OPTION2 = /^(?:\u276F\s*)?2\.\s*Exit$/;
+const FOOTER = /^Enter to confirm \u00B7 Esc to cancel$/;
+const RULE = /^[\u2500\u2501\u2550-]{20,}$/;
+/** Text of any other Claude Code prompt; if it is on screen too, nothing is answered. */
+const OTHER_PROMPTS = /Do you want to|Yes, I trust this folder|New MCP server found|Bypass Permissions mode|Select login method|\b(?:3|4)\.\s/;
+
+/**
+ * The development-channels warning, strictly: a full-screen dialog whose top border is the first non-blank
+ * line, the header right below it, then the Channels line, option 1, option 2 ("Exit") and the footer in
+ * that order, nothing but blank lines after the footer, and no other prompt's text anywhere on screen.
+ * (Layout verified on Claude Code 2.1.310: test/fixtures/dev-channels-raw.txt.) Anything that merely
+ * contains the wording, e.g. Claude printing it in a live session, is not well-formed.
+ */
+function devChannelsDialog(screen: string): Dialog | null {
+  if (!screen.includes(DEV_HEADER) || !screen.includes("I am using this for local development")) return null;
+  const lines = screen.split("\n").map((l) => l.trim());
+  const m = /Channels:\s*(.+)/.exec(screen);
+  const channels = m ? m[1]!.trim().split(/\s+/).filter(Boolean) : [];
+  const bad: Dialog = { kind: "dev_channels", channels, wellFormed: false };
+  const nonBlank = lines.map((l, i) => [l, i] as const).filter(([l]) => l.length > 0);
+  if (nonBlank.length < 6) return bad;
+  const [first, header] = nonBlank;
+  if (!RULE.test(first![0]) || header![0] !== DEV_HEADER) return bad;
+  if (lines.filter((l) => l === DEV_HEADER).length !== 1) return bad;
+  const idx = (re: RegExp) => lines.findIndex((l) => re.test(l));
+  const ch = idx(/^Channels:\s/);
+  const o1 = idx(DEV_OPTION1);
+  const o2 = idx(DEV_OPTION2);
+  const ft = idx(FOOTER);
+  if (!(header![1] < ch && ch < o1 && o1 < o2 && o2 < ft)) return bad;
+  if (ft - header![1] > 20) return bad;
+  if (lines.slice(ft + 1).some((l) => l.length > 0)) return bad;
+  if (OTHER_PROMPTS.test(screen)) return bad;
+  return { kind: "dev_channels", channels, wellFormed: true };
+}
+
 export function detectDialog(screen: string): Dialog | null {
   const s = screen.replace(/\r/g, "");
-  if (/WARNING: Loading development channels/.test(s) && /I am using this for local development/.test(s)) {
-    const m = /Channels:\s*(.+)/.exec(s);
-    const channels = m ? m[1]!.trim().split(/\s+/).filter(Boolean) : [];
-    return { kind: "dev_channels", channels, option1: /1\.\s*I am using this for local development/.test(s) };
-  }
+  const dev = devChannelsDialog(s);
+  if (dev) return dev;
   if (/Yes, I trust this folder/.test(s) || /Is this a project you created or one you trust\?/.test(s)) return { kind: "trust" };
   const mcp = /New MCP server found in this project:\s*(\S+)/.exec(s);
   if (mcp) return { kind: "mcp_consent", server: mcp[1]! };
@@ -35,7 +73,7 @@ export function detectDialog(screen: string): Dialog | null {
 
 /** May the daemon answer this dialog itself? */
 export function autoAcceptable(d: Dialog, serverName: string): boolean {
-  return d.kind === "dev_channels" && d.option1 && d.channels.length === 1 && d.channels[0] === `server:${serverName}`;
+  return d.kind === "dev_channels" && d.wellFormed && d.channels.length === 1 && d.channels[0] === `server:${serverName}`;
 }
 
 /** Keys that select "1. I am using this for local development" (verified: the digit selects and confirms). */
@@ -54,7 +92,7 @@ export function attentionText(d: Dialog, ctx: { project: string; serverName: str
       return `Claude Code needs you to log in. Run \`claude\` at the desk and log in, then restart. (${ctx.attach})`;
     case "dev_channels":
       return d.channels.length === 1 && d.channels[0] === `server:${ctx.serverName}`
-        ? `The development-channels warning could not be dismissed automatically. Answer it at the desk: ${ctx.attach}`
+        ? `The development-channels warning (or text like it) is on screen and was not answered automatically. Answer it at the desk: ${ctx.attach}`
         : `The development-channels warning lists other channels too (${d.channels.join(" ")}); not answered automatically. Check extra_args, or answer it at the desk: ${ctx.attach}`;
   }
 }
