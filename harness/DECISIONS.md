@@ -25,3 +25,7 @@
 - D6 (proposed) One always-on daemon per computer (user service: systemd/launchd/Task Scheduler) holds the single
   WebSocket to the Hub and can launch/relaunch Claude Code sessions in a terminal multiplexer (tmux), since channels need
   an interactive session. Per-session stdio shims talk to the local daemon over localhost, not to Cloudflare directly.
+- D7 (proposed) Auth: Google OAuth done directly in the Worker (user has done this before). Authorization-code + PKCE,
+  allowlist of the owner's Google account `sub`, then the Worker issues its own signed HttpOnly session cookie.
+  No workers-oauth-provider needed: the Worker is not an OAuth server for third-party MCP clients.
+  Machines use separate pairing tokens (D4), revocable from the phone.
