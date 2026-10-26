@@ -117,7 +117,9 @@ mcp-remote install-service          # --dry-run prints the file instead; --no-st
 - **Linux**: writes `~/.config/systemd/user/mcp-remote.service` with absolute paths to node and the CLI (systemd's
   minimal PATH can't find an nvm/fnm/volta node), your current `PATH` (so `claude` and `tmux` are found),
   `Restart=on-failure`, `RestartPreventExitStatus=3 4 5` and `KillMode=process`, then runs
-  `systemctl --user daemon-reload && systemctl --user enable --now mcp-remote`.
+  `systemctl --user daemon-reload`, `systemctl --user enable mcp-remote` and `systemctl --user restart mcp-remote`
+  (restart, so re-running `install-service` after a node or mcp-remote upgrade moves a running daemon onto the new
+  paths; launched sessions keep running and are re-adopted; `--no-start` skips these).
   Logs: `journalctl --user -u mcp-remote -f`. For an always-on desktop that you are not logged in to:
   `loginctl enable-linger $USER`. Re-run `install-service` after upgrading node (the path changes).
 - **macOS**: writes `~/Library/LaunchAgents/com.mcp-remote.daemon.plist` (RunAtLoad, `KeepAlive` with
@@ -138,7 +140,8 @@ belong in the unit/plist** (they are world-readable files): put them in `~/.conf
 `KEY=value` or `export KEY=value`, one per line; `#` starts a comment (also after an unquoted value);
 `'single quotes'` are literal; `"double quotes"` and unquoted values expand `$VAR` / `${VAR}` from the daemon's
 environment and earlier lines (so `PATH="$HOME/.local/bin:$PATH"` works); no other shell syntax (`$(...)`,
-backslashes) — such lines are skipped with a warning naming the key. `HOME`, `XDG_CONFIG_HOME`, `APPDATA`,
+backslashes, `${VAR:-default}`, an unquoted `~`: write `$HOME` instead) — such lines are skipped with a warning
+naming the key. `HOME`, `XDG_CONFIG_HOME`, `APPDATA`,
 `USERPROFILE`, `MCP_REMOTE_CONFIG_DIR` and `MCP_REMOTE_SOCKET` are ignored there (they would move the config dir
 the daemon already read). The file must be a regular file you own (not a symlink); a looser mode is tightened to
 0600. E.g. `CLAUDE_CODE_OAUTH_TOKEN=...` (from `claude setup-token`, the usual login for an always-on

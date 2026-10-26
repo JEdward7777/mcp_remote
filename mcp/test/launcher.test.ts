@@ -669,6 +669,7 @@ describe("launcher", () => {
     await waitFor(() => rec(l, a.launch_id).state === "exited" && tmux.spawns.length === 2, "exited 2");
     await sleep(200);
     expect(tmux.spawns).toHaveLength(2);
-    expect(rec(l, a.launch_id).detail).toMatch(/background session/);
+    expect(rec(l, a.launch_id).detail).toMatch(/another machine or container.*claude --resume.*--fork-session.*Restart/);
+    expect(rec(l, a.launch_id).detail).not.toMatch(/claude agents/);
   });
 });

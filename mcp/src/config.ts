@@ -113,7 +113,7 @@ export const SERVICE_ENV_TEMPLATE = `# Environment for the mcp-remote daemon and
 # Syntax: KEY=value or export KEY=value, one per line; # starts a comment (also after an unquoted value).
 # 'single quotes' are literal; "double quotes" and unquoted values expand $VAR and \${VAR} from the daemon's
 # environment and earlier lines (e.g. PATH="$HOME/.local/bin:$PATH"). Lines with other shell syntax ($(...),
-# backticks, backslashes, \${VAR:-default}) are skipped with a warning.
+# backticks, backslashes, \${VAR:-default}, an unquoted ~) are skipped with a warning: write $HOME instead of ~.
 # HOME, XDG_CONFIG_HOME, APPDATA, USERPROFILE, MCP_REMOTE_CONFIG_DIR and MCP_REMOTE_SOCKET are ignored here.
 # Examples:
 #   CLAUDE_CODE_OAUTH_TOKEN=...        (from \`claude setup-token\`)
@@ -159,6 +159,8 @@ export function parseEnvValue(raw: string, env: NodeJS.ProcessEnv): string | nul
     return expand(inner);
   }
   const unquoted = v.replace(/\s+#.*$/, "");
+  // A shell would expand an unquoted leading ~ (also after ':'); we don't: refuse rather than keep it literally.
+  if (/(^|:)~/.test(unquoted)) return null;
   if (/["'`\\]/.test(unquoted) || /\$\(/.test(unquoted) || badBraces(unquoted)) return null; // shell syntax we don't support
   return expand(unquoted);
 }

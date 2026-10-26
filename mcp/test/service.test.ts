@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mcpAddArgs } from "../src/desk";
-import { launchdPlist, sdQuote, systemdUnit, windowsSteps } from "../src/service";
+import { SYSTEMD_INSTALL_COMMANDS, launchdPlist, sdQuote, systemdUnit, windowsSteps } from "../src/service";
 
 const spec = { node: "/home/you/.nvm/versions/node/v22.22.0/bin/node", cli: "/home/you/My Apps/mcp-remote/dist/cli.js", path: "/usr/bin:/bin" };
 
@@ -19,6 +19,15 @@ describe("service files", () => {
     expect(systemdUnit({ ...spec, claudeConfigDir: "/home/you/.claude-work" })).toContain('Environment="CLAUDE_CONFIG_DIR=/home/you/.claude-work"');
     expect(u).not.toContain('Environment="CLAUDE_CONFIG_DIR');
     expect(u).toMatch(/service\.env/); // points at where secrets go
+  });
+
+  it("re-install restarts a running daemon onto the new paths (round-9 finding)", () => {
+    expect(SYSTEMD_INSTALL_COMMANDS).toEqual([
+      ["--user", "daemon-reload"],
+      ["--user", "enable", "mcp-remote"],
+      ["--user", "restart", "mcp-remote"],
+    ]);
+    expect(SYSTEMD_INSTALL_COMMANDS.flat()).not.toContain("--now");
   });
 
   it("escapes systemd specials", () => {

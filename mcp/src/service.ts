@@ -1,7 +1,7 @@
 // `mcp-remote install-service` / `uninstall-service` (D6): run the daemon as a per-user service.
 //
-// Linux: systemd user unit. Restart=on-failure + RestartPreventExitStatus=3 4 (revoked / token in use
-// elsewhere: restarting can't help). KillMode=process so stopping or restarting the daemon does not kill the
+// Linux: systemd user unit. Restart=on-failure + RestartPreventExitStatus=3 4 5 (revoked / token in use
+// elsewhere / unusable settings: restarting can't help). KillMode=process so stopping or restarting the daemon does not kill the
 // tmux server that holds phone-launched Claude Code sessions; the next daemon re-adopts them.
 //
 // macOS: launchd agent. launchd has no "don't restart on these exit codes" setting: KeepAlive
@@ -147,6 +147,17 @@ export function currentSpec(): ServiceSpec {
   return spec;
 }
 
+/**
+ * After writing the unit: reload, enable, and *restart* (not `enable --now`, which leaves an already running
+ * daemon on the old node/CLI paths after a re-install). Safe: KillMode=process keeps the tmux server and its
+ * launched sessions, which the new daemon re-adopts.
+ */
+export const SYSTEMD_INSTALL_COMMANDS: string[][] = [
+  ["--user", "daemon-reload"],
+  ["--user", "enable", "mcp-remote"],
+  ["--user", "restart", "mcp-remote"],
+];
+
 export function systemdUnitPath(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
   return join(xdg && xdg.startsWith("/") ? xdg : join(homedir(), ".config"), "systemd", "user", SYSTEMD_UNIT);
@@ -193,11 +204,10 @@ export function installService(opts: { dryRun?: boolean; noStart?: boolean; plat
     writeFileSync(path, unit, { mode: 0o644 });
     out.write(`wrote ${path}\n`);
     if (opts.noStart) {
-      out.write("start it with: systemctl --user daemon-reload && systemctl --user enable --now mcp-remote\n");
+      out.write("start it with: systemctl --user daemon-reload && systemctl --user enable mcp-remote && systemctl --user restart mcp-remote\n");
       return;
     }
-    runVisible("systemctl", ["--user", "daemon-reload"]);
-    runVisible("systemctl", ["--user", "enable", "--now", "mcp-remote"]);
+    for (const args of SYSTEMD_INSTALL_COMMANDS) runVisible("systemctl", args);
     out.write(
       "Logs: journalctl --user -u mcp-remote -f\n" +
         "To keep it running while you are logged out (always-on desktop): loginctl enable-linger $USER\n",

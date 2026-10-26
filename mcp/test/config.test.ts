@@ -115,6 +115,10 @@ describe("service.env syntax and safety (round-7 findings)", () => {
       expect(parseEnvValue(bad, env), bad).toBeNull();
     }
     expect(parseEnvValue('"${HOME}/$PATH"', env)).toBe("/home/you//usr/bin:/bin");
+    // Round 9: an unquoted ~ (leading or after ':') is refused, not kept literally.
+    for (const bad of ["~/.local/bin", "/usr/bin:~/bin"]) expect(parseEnvValue(bad, env), bad).toBeNull();
+    expect(parseEnvValue("a~b", env)).toBe("a~b");
+    expect(parseEnvValue("'~/x'", env)).toBe("~/x");
     expect(parseEnvValue("'${VAR:-x} $(y) `z`'", env)).toBe("${VAR:-x} $(y) `z`"); // literal in single quotes
   });
 

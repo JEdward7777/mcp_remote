@@ -782,9 +782,12 @@ export class Launcher {
         : "No earlier conversation in this folder to continue; restart without resume";
     } else if (startupExit && e.continued && BACKGROUND_CONVERSATION.test(screen)) {
       noRetry = true;
-      detail =
-        "The folder's most recent conversation is running in a Claude Code background session, so it can't be " +
-        "resumed here. Attach to it at the desk (`claude agents`), or use Restart for a new conversation";
+      detail = /moved to a background session/.test(screen)
+        ? "The folder's most recent conversation moved to a background session registered from another machine or " +
+          "container, so it can't be resumed here. At the desk use `claude --resume` (or add --fork-session to branch " +
+          "off a copy), or use Restart for a new conversation"
+        : "The folder's most recent conversation is running in a Claude Code background session, so it can't be " +
+          "resumed here. Attach to it at the desk (`claude agents`), or use Restart for a new conversation";
     } else if (startupExit && /cannot be used with root\/sudo/.test(screen)) {
       detail = "Claude Code refuses bypassPermissions when running as root (mcp-remote config set permission-mode ...)";
     } else if (vanished) {
