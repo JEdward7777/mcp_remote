@@ -228,6 +228,28 @@ export class Hub extends DurableObject<Env> {
     this.meter.load(now, best);
   }
 
+  /**
+   * Reconnect storms (a buggy client, many tabs) cost a DO request + a state frame each: cap them.
+   * Returns the refusal response, or null when the connect may proceed.
+   */
+  private connectLimited(kind: "phone" | "daemon", now: number): Response | null {
+    const wait = this.limited("connects", now);
+    if (wait === null) return null;
+    this.saveSnap(undefined, now);
+    const secs = Math.ceil(wait / 1000);
+    if (kind === "phone") {
+      // A browser can't read an HTTP status on a failed upgrade: accept, then close with a reason.
+      const pair = new WebSocketPair();
+      pair[1].accept();
+      pair[1].close(CLOSE_RATE_LIMITED, `too many connections; retry in ${secs}s`);
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+    return new Response(`too many connections for this account; retry in ${secs}s`, {
+      status: 429,
+      headers: { "retry-after": String(secs) },
+    });
+  }
+
   /** Take one token; returns ms to wait when limited, else null. */
   private limited(name: MemLimit, now: number): number | null {
     const r = this.limiter.take(name, now);
@@ -280,13 +302,11 @@ export class Hub extends DurableObject<Env> {
   }
 
   /** This tenant's usage, newest day first (for the phone and Phase 4b's admin view; never cross-tenant). */
-  async usage(days = 35): Promise<{ plan: string; message_cap: number; days: UsageDay[] }> {
+  async usage(days = 35): Promise<Limited<{ plan: string; message_cap: number; days: UsageDay[] }>> {
     const now = Date.now();
-    this.wake(now);
-    this.meter.add("requests", now);
-    const out = { plan: this.plan, message_cap: this.limits.daily_messages, days: this.meter.history(now, days) };
-    this.saveSnap(undefined, now);
-    return out;
+    const wait = this.httpGate(now);
+    if (wait !== null) return { ok: false, retryAfterMs: wait };
+    return { ok: true, value: { plan: this.plan, message_cap: this.limits.daily_messages, days: this.meter.history(now, days) } };
   }
 
   /** Counts an HTTP-facing RPC and applies the tenant's `http` bucket. */
@@ -432,26 +452,12 @@ export class Hub extends DurableObject<Env> {
     const now = Date.now();
     this.wake(now);
     this.meter.add("requests", now);
-    // Reconnect storms (a buggy client, many tabs) cost a DO request + a state frame each: cap them.
-    const connectWait = kind === "phone" || kind === "daemon" ? this.limited("connects", now) : null;
-    if (connectWait !== null) {
-      this.saveSnap(undefined, now);
-      const secs = Math.ceil(connectWait / 1000);
-      if (kind === "phone") {
-        // A browser can't read an HTTP status on a failed upgrade: accept, then close with a reason.
-        const pair = new WebSocketPair();
-        pair[1].accept();
-        pair[1].close(CLOSE_RATE_LIMITED, `too many connections; retry in ${secs}s`);
-        return new Response(null, { status: 101, webSocket: pair[0] });
-      }
-      return new Response(`too many connections for this account; retry in ${secs}s`, {
-        status: 429,
-        headers: { "retry-after": String(secs) },
-      });
-    }
     if (tenant) this.rememberTenant(tenant);
 
     if (kind === "phone") {
+      // The Worker already checked the session cookie and Origin.
+      const limited = this.connectLimited(kind, now);
+      if (limited) return limited;
       const email = request.headers.get(H_EMAIL);
       if (email) this.rememberEmail(email);
       const pair = new WebSocketPair();
@@ -478,6 +484,9 @@ export class Hub extends DurableObject<Env> {
       if (!accountAllowed(tid, this.getMeta("email"), this.env)) {
         return new Response("account is no longer allowed to sign in", { status: 403 });
       }
+      // Charged only after the token checked out, so a revoked/stolen token can't use up the budget.
+      const limited = this.connectLimited(kind, now);
+      if (limited) return limited;
       // One live socket per machine: a reconnecting daemon replaces a stale one.
       for (const old of this.ctx.getWebSockets(`m:${machineId}`)) {
         try {
@@ -976,7 +985,9 @@ export class Hub extends DurableObject<Env> {
   // Queries / helpers
 
   private rememberTenant(tenant: string): void {
-    this.sql.exec("INSERT OR IGNORE INTO meta (k, v) VALUES ('tenant', ?)", tenant);
+    // The tenant record (D10): its id and its plan, which selects the limits (only "free" exists yet;
+    // a future billing step changes this row). Both are no-ops once set.
+    this.sql.exec("INSERT OR IGNORE INTO meta (k, v) VALUES ('tenant', ?), ('plan', ?)", tenant, DEFAULT_PLAN);
   }
 
   private rememberEmail(email: string): void {

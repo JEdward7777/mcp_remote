@@ -23,19 +23,24 @@ Android PWA  <--wss-->  Cloudflare Worker (workers.dev)  -->  per-user Hub Durab
   as `<channel>` events, and Claude replies with the `send_message` tool, choosing an urgency
   (`silent` / `normal` / `urgent`, D19). Messaging is discrete and intentional (D17).
 
-Free Cloudflare plan only. See `harness/DECISIONS.md` for the design contract and `harness/SETUP.md` for
+Free Cloudflare plan only. Everyone shares the deployer's quota, so each account has its own limits (messages
+per minute and per day, launches, connects, ...) enforced in its own Hub, the public endpoints (pairing,
+sign-in) are throttled per IP, and the phone shows today's usage; numbers and tuning in `harness/SETUP.md`
+("Limits and the free plan"). See `harness/DECISIONS.md` for the design contract and `harness/SETUP.md` for
 deployment and desktop setup.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `shared/` | `@mcp-remote/shared`: wire protocol (zod schemas + types) for every link, frame limits, backoff helper |
+| `shared/` | `@mcp-remote/shared`: wire protocol (zod schemas + types) for every link, frame limits, backoff, `link.ts` (heartbeat / half-open detection, reconnect spreading) |
 | `worker/src/index.ts` | Worker router: `/auth/*` (Google OAuth, dev auth), `/api/*` (pairing, machines, WebSockets) |
 | `worker/src/hub.ts` | `Hub` Durable Object: machines, sessions, messages; phone + daemon sockets |
 | `worker/src/pairing.ts` | `Pairing` Durable Object: pending pairing codes (outside any tenant Hub) |
+| `worker/src/budget.ts` | the one place for assumed free-plan numbers (sources / UNVERIFIED) and every limit |
+| `worker/src/ratelimit.ts`, `usage.ts`, `throttle.ts` | token buckets, per-account usage counters, `Throttle` DO for unauthenticated endpoints |
 | `worker/src/auth.ts`, `crypto.ts`, `oauth.ts` | session cookies, machine tokens, Google ID-token verification |
-| `worker/web/app.ts` | the PWA (bundled to `worker/public/app.js`) |
+| `worker/web/app.ts`, `link.ts` | the PWA (bundled to `worker/public/app.js`); `link.ts` = its WebSocket/reconnect logic |
 | `worker/public/` | static assets: `index.html`, `style.css`, manifest, favicon, `_headers` (CSP) |
 | `worker/test/` | vitest tests running inside workerd (`@cloudflare/vitest-plugin`) |
 | `mcp/src/` | `mcp-remote` CLI: `pair`, `daemon`, `shim`, plus remote launch: `launcher.ts` (lifecycle), `tmux.ts` (argv-only tmux driver), `dialogs.ts` (startup dialog detection), `launch-config.ts` (allowlist), `desk.ts` (`projects`, `config`, `setup-claude`, `attach`), `service.ts` (`install-service`) |

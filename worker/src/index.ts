@@ -335,7 +335,8 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   }
 
   if (path === "/api/usage" && request.method === "GET") {
-    return json(await hubFor(env, session.tid).usage());
+    const r = unwrap(await hubFor(env, session.tid).usage());
+    return r instanceof Response ? r : json(r.value);
   }
 
   const revoke = /^\/api\/machines\/([A-Za-z0-9_-]{1,64})$/.exec(path);

@@ -302,6 +302,128 @@ restart are never typed into. Auto-restart (off by default) restarts a crashed s
 exit) with growing delays, resuming the conversation, and gives up after 5 crashes in a row (a run longer than
 10 minutes resets the count); a clean exit or **Stop** is never restarted.
 
+## Limits and the free plan (Phase 3)
+
+Everyone who signs up shares the deployer's free Cloudflare quota (D9), so every account gets its own limits,
+enforced in its own Hub (D10), and the endpoints anyone on the internet can call are throttled before they
+can wake Durable Objects. All numbers live in `worker/src/budget.ts`; the assumed Cloudflare free-plan numbers
+there are mostly **unverified** (see the checklist below).
+
+### Per-account limits (plan `free`)
+
+A limit is a token bucket: `burst` requests at once, refilled continuously at the given rate.
+
+| What | Default | Env var | Over the limit |
+| --- | --- | --- | --- |
+| Phone messages | `10,20/min` | `LIMIT_PHONE_SEND` | phone: "rate limited: too many messages; try again in 3s" (the text stays in the box) |
+| Agent `send_message` (all sessions together) | `10,20/min` | `LIMIT_AGENT_SEND` | tool result: "Message NOT sent: rate limited: too many messages from your sessions (20 per minute); try again in 3s" |
+| Messages per UTC day (phone + agent) | `500` | `DAILY_MESSAGE_CAP` | "daily message limit reached (500 messages per day on the "free" plan, ...); it resets at 00:00 UTC, in 5 h" |
+| Start / stop / restart / remove from the phone | `20,20/min` | `LIMIT_LAUNCH` | "rate limited: too many start/stop requests; try again in ..." |
+| History pages | `20,60/min` | `LIMIT_HISTORY` | "rate limited: too many history requests; ..." |
+| Any phone frame | `60,120/min` | `LIMIT_PHONE_FRAMES` | socket closed with code 4029; the PWA waits the hinted time (at least 60 s) |
+| Any daemon frame (all computers together) | `200,600/min` | `LIMIT_DAEMON_FRAMES` | socket closed with 4029; the daemon waits the hinted time |
+| WebSocket connects (phones + daemons) | `20,20/min` | `LIMIT_CONNECTS` | phone: close 4029; daemon: HTTP 429 + `Retry-After` |
+| `/api/state`, `/api/machines`, `/api/usage`, revoke | `30,60/min` | `LIMIT_HTTP` | HTTP 429 + `Retry-After` |
+| Pairing approvals (right or wrong code) | `5,10/h` | `LIMIT_PAIR_APPROVE` | HTTP 429 "too many pairing approvals on this account; try again in N min" |
+
+Why 500 messages/day: a message costs about 1/20 of a request (inbound WebSocket frame), a few SQLite rows
+written and a broadcast; the ~100,000 rows written/day of the free plan is the first wall at roughly
+15-20k messages/day for the whole deployment, so 500 per account leaves room for ~20-30 active accounts.
+
+Each account record carries a `plan` (Hub `meta` row, `free` for everyone); it selects the limits. Only the
+`free` plan exists; the env vars above override its defaults. Billing is parked (D10).
+
+### Unauthenticated endpoints (per client IP; IPv6 by /64)
+
+| Endpoint | Default | Env var | How |
+| --- | --- | --- | --- |
+| `POST /api/pair/start` | `5,10/h` per IP | `LIMIT_PAIR_START_IP` | `Throttle` Durable Object (8 shards, persisted) |
+| `POST /api/pair/start`, everyone together | `80,120/h` | `LIMIT_PAIR_START_GLOBAL` | split evenly over the 8 shards |
+| `/api/pair/wait` | `30,120/h` per IP | `LIMIT_PAIR_WAIT_IP` | isolate memory only (best effort, free) |
+| `/auth/login`, `/auth/callback` | `30,120/h` per IP | `LIMIT_AUTH_IP` | isolate memory only (they never touch a Durable Object) |
+| Approve attempts on one pairing code | 5 | - | the code locks: "run `mcp-remote pair` on the computer again" |
+
+Why a Durable Object for `/api/pair/start` only: each start creates a Pairing Durable Object (a write, an alarm
+and a wipe 10 minutes later, ~3 DO requests); the throttle check costs one DO request and writes a row only
+when the start is allowed, and a refusal is then remembered in the Worker's memory, so a client that keeps
+trying is mostly turned away without touching any Durable Object. For `/api/pair/wait` and `/auth/*` a DO check
+would cost as much as what it protects, so those use free per-isolate memory. Bodies over 4 KiB are refused
+(413) from `Content-Length`, or after reading 4 KiB of a chunked body, before anything else runs; malformed
+pairing waits (bad code, id or secret format) are refused (400) by the Worker without waking the Pairing DO.
+`CF-Connecting-IP` is set by Cloudflare and cannot be forged by the client there (locally under
+`wrangler dev` every request shares one key).
+
+Optional: the [Workers Rate Limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+exists in the installed wrangler (`ratelimits` in `wrangler.jsonc`, periods 10 or 60 s), but whether it is
+available on the free plan could not be checked. If it is, add it in front of the Throttle DO (it is consulted
+first; the Throttle DO still runs):
+
+```jsonc
+"ratelimits": [
+  { "name": "PAIR_START_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } }
+]
+```
+
+### Tuning
+
+Set any of the env vars as a plain var, e.g. in `worker/wrangler.jsonc` under `"vars"`
+(`"LIMIT_PHONE_SEND": "20,40/min"`, `"DAILY_MESSAGE_CAP": "1000"`) and `npx wrangler deploy`. Format:
+`<burst>,<rate>/<unit>` with unit `s`, `min`, `h` or `day`. An invalid value is ignored with a warning in
+`wrangler tail` and the default applies. Each Hub reads the values when it starts; a deploy restarts the
+Durable Objects, so new values are in effect right after it.
+
+### Usage counters
+
+Each Hub counts its own account's messages, launches and requests (WebSocket frames, connects and API calls
+that reached the Hub) per UTC day: in memory, written as one row per 50 events, at socket close and at
+midnight; counts not yet written survive hibernation inside the WebSocket attachment. They never read another
+account's data (D9). The phone shows "Today (UTC): N of 500 messages on the free plan" under the session list;
+`GET /api/usage` returns the last 35 days (ready for the Phase 4b admin view). A deploy can lose up to 49
+not-yet-written events per account.
+
+### Reconnects
+
+- Keepalive: daemon and PWA send `ping` every 30 s; the Hub's auto-response answers `pong` without waking the
+  Durable Object. No frame within 15 s after a ping means the connection is half-open: it is dropped and
+  replaced. No other periodic traffic exists (no polling).
+- After a working connection drops (e.g. a Worker deploy drops every socket at once), the first retry waits a
+  random 0.5-15 s (daemon) or 0.25-3 s (PWA) so clients don't all reconnect in the same second; failed attempts
+  then back off with jitter up to 2 min (daemon) / 30 s (PWA).
+- HTTP 429 or close 4029: wait the server's `Retry-After` / "retry in Ns" (at least 60 s without one), plus
+  jitter. HTTP 5xx: at least 5 s.
+- PWA on Android: while the app is in the background a dropped socket is not reconnected; when it comes back
+  to the foreground an open socket is checked with a 5 s ping deadline and a missing one reconnects at once.
+
+### Verify at the desk
+
+`developers.cloudflare.com` was unreachable while Phase 3 was written. Check each assumption below against the
+named page and fix `worker/src/budget.ts` (and the defaults above) if it is wrong:
+
+- [ ] Workers requests, free plan: 100,000/day; CPU time 10 ms per invocation —
+      <https://developers.cloudflare.com/workers/platform/limits/>
+- [ ] Durable Objects on the free plan: requests 100,000/day, duration 13,000 GB-s/day; SQLite storage:
+      5 million rows read/day, 100,000 rows written/day, 5 GB stored —
+      <https://developers.cloudflare.com/durable-objects/platform/pricing/>
+- [ ] Incoming WebSocket messages billed 20:1 against requests; outgoing messages free; whether an
+      auto-responded `ping` counts at all — same page, and
+      <https://developers.cloudflare.com/durable-objects/best-practices/websockets/>
+- [ ] Do index updates count as extra rows written in Durable Object SQLite (the 500/day sizing assumes yes) —
+      <https://developers.cloudflare.com/durable-objects/platform/pricing/>
+- [ ] Maximum WebSocket message size (assumed 1 MiB; we never send more than 64 KiB) and WebSocket attachment
+      size (local workerd allows 16 KiB; older docs said 2 KiB; our snapshots stay under 1.5 KiB) —
+      <https://developers.cloudflare.com/durable-objects/platform/limits/>
+- [ ] Idle WebSocket timeout (assumed ~100 s; our ping is every 30 s) —
+      <https://developers.cloudflare.com/workers/runtime-apis/websockets/>
+- [ ] How long an idle Durable Object stays in memory before hibernating (~10 s) —
+      <https://developers.cloudflare.com/durable-objects/reference/in-memory-state/>
+- [ ] Workers Rate Limiting binding: available and free on the free plan? `namespace_id` rules —
+      <https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/>
+- [ ] Close code / behavior clients see when a deploy restarts Durable Objects (we treat any close the same) —
+      <https://developers.cloudflare.com/durable-objects/reference/durable-object-lifecycle/>
+
+Also on the first `npx wrangler deploy` after Phase 3: it applies migration `v2` (new `Throttle` class);
+wrangler should say so.
+
 ## Troubleshooting
 
 - `/mcp` inside Claude Code shows the shim's status; `claude --debug --dangerously-load-development-channels server:mcp-remote`
@@ -325,6 +447,13 @@ exit) with growing delays, resuming the conversation, and gives up after 5 crash
   Register the shim with `mcp-remote setup-claude` (absolute node + CLI paths); an `npx`-style registration or a
   hook that runs `claude` itself at session start can make the daemon take the wrong process for the session's shim.
 - "remote launch is not available": the phone shows why (no tmux, tmux older than 3.2, invalid launch.json, Windows).
+- "rate limited: ... try again in Ns" (phone toast or `send_message` result) or "daily message limit reached":
+  a per-account limit (see "Limits and the free plan"); wait, or raise it with the env var named there.
+- `mcp-remote pair` says "too many pairing attempts from your network": wait the time it names (default 5
+  starts per hour per IP), or raise `LIMIT_PAIR_START_IP`. On the phone "too many approval attempts for this
+  code": run `mcp-remote pair` again for a fresh code.
+- Daemon log "server is rate limiting this account's connections (HTTP 429 ...)": something reconnects in a
+  loop (several daemons with one token, a phone tab reloading); it retries after the named time on its own.
 - Worker logs: `cd worker && npx wrangler tail`.
 
 ## Local development (no Cloudflare/Google needed)

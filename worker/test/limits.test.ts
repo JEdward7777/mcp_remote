@@ -286,6 +286,38 @@ describe("per-tenant limits in the Hub (D10)", () => {
     expect(u.days[0]).toMatchObject({ day: utcDay(Date.now()), messages: 3 });
   });
 
+  it("adds no SQL to the per-message hot path (limits and usage are in memory)", async () => {
+    const { d, p, sid } = await setup("hot-path");
+    // Record every statement the Hub runs from here on.
+    const seen: string[] = [];
+    await withHub("hot-path", (hub) => {
+      const real = hub.sql;
+      const spy = { exec: (q: string, ...a: unknown[]) => (seen.push(q.replace(/\s+/g, " ").trim()), real.exec(q, ...a)) };
+      hub.sql = spy;
+      hub.meter.sql = spy;
+    });
+    p.send({ t: "send", session_id: sid, text: "hot", client_id: "h1" });
+    await waitFor(() => p.frames.find((f) => f.t === "message" && f.client_id === "h1"), "phone message");
+    const phoneSend = seen.splice(0);
+    d.send({ t: "send", req_id: "h2", session_id: sid, text: "hot back", urgency: "normal" });
+    await waitFor(() => d.frames.find((f) => f.t === "sent" && f.req_id === "h2"), "agent message");
+    const agentSend = seen.splice(0);
+    // Exactly what Phase 1/2 already did: session lookup, machine check, insert, session counter.
+    expect(phoneSend.map((q) => q.split(" ").slice(0, 3).join(" "))).toEqual([
+      "SELECT * FROM",
+      "SELECT COUNT(*) AS",
+      "INSERT INTO messages",
+      "UPDATE sessions SET",
+    ]);
+    expect(agentSend.map((q) => q.split(" ").slice(0, 3).join(" "))).toEqual([
+      "SELECT COUNT(*) AS",
+      "SELECT * FROM",
+      "INSERT INTO messages",
+      "UPDATE sessions SET",
+    ]);
+    expect([...phoneSend, ...agentSend].some((q) => /usage|meta/.test(q))).toBe(false);
+  });
+
   it("rate limits the HTTP API per tenant with 429 + Retry-After", async () => {
     const cookie = await cookieFor("rl-http");
     await withHub("rl-http", () => {});
