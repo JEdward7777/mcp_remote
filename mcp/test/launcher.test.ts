@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { LaunchRecord } from "@mcp-remote/shared";
 import { LaunchConfig, projectIdFor } from "../src/launch-config";
-import { Launcher, MAX_AUTO_RESTARTS, deadStatus } from "../src/launcher";
+import { Launcher, MAX_AUTO_RESTARTS, deadStatus, sanitizedEnv } from "../src/launcher";
 import { FakeTmux } from "./fake-tmux";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -574,5 +574,71 @@ describe("launcher", () => {
     await waitFor(() => rec(l, a.launch_id).state === "exited", "exited");
     await l.restart(a.launch_id, true);
     expect(tmux.spawns[2]!.argv).toContain("--fork-session");
+  });
+
+  it("passes auth/provider settings to launched sessions and strips only nested-session markers (round-6 finding)", () => {
+    const env = sanitizedEnv({
+      PATH: "/bin",
+      CLAUDE_CODE_OAUTH_TOKEN: "tok",
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      CLAUDE_CODE_USE_VERTEX: "1",
+      CLAUDE_CODE_SHELL: "/bin/zsh",
+      CLAUDE_CONFIG_DIR: "/home/you/.claude-work",
+      ANTHROPIC_API_KEY: "sk",
+      HTTPS_PROXY: "http://proxy:3128",
+      CLAUDECODE: "1",
+      CLAUDE_CODE_ENTRYPOINT: "cli",
+      CLAUDE_CODE_SSE_PORT: "1234",
+      CLAUDE_CODE_SESSION_ID: "x",
+      CLAUDE_PROJECT_DIR: "/p",
+      MCP_REMOTE_LAUNCH_TOKEN: "t",
+      TMUX: "/tmp/tmux-0/default,1,0",
+    });
+    expect(env).toEqual({
+      PATH: "/bin",
+      CLAUDE_CODE_OAUTH_TOKEN: "tok",
+      CLAUDE_CODE_USE_BEDROCK: "1",
+      CLAUDE_CODE_USE_VERTEX: "1",
+      CLAUDE_CODE_SHELL: "/bin/zsh",
+      CLAUDE_CONFIG_DIR: "/home/you/.claude-work",
+      ANTHROPIC_API_KEY: "sk",
+      HTTPS_PROXY: "http://proxy:3128",
+    });
+  });
+
+  it("finds a fork's transcript under a shortened slug (long paths) (round-6 nit)", async () => {
+    const claudeDir = join(dir, "claude-config");
+    const l = make({ claudeConfigDir: claudeDir });
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: true })) as { launch_id: string };
+    const fork = tmux.spawns[0]!.argv[tmux.spawns[0]!.argv.indexOf("--session-id") + 1]!;
+    mkdirSync(join(claudeDir, "projects", "-truncated-slug-abc123"), { recursive: true });
+    writeFileSync(join(claudeDir, "projects", "-truncated-slug-abc123", `${fork}.jsonl`), "{}\n");
+    await l.stop(a.launch_id);
+    await l.restart(a.launch_id, true);
+    expect(tmux.spawns[1]!.argv[tmux.spawns[1]!.argv.indexOf("--resume") + 1]).toBe(fork);
+  });
+
+  it("reads 'No conversation found' / root refusal only from a continued spawn that never linked (round-6 nit)", async () => {
+    const l = make();
+    await l.init();
+    // A session that ran (shim linked) and later exited with those words on screen: plain exit.
+    const a = (await l.launch(alphaId(), { continue: true })) as { launch_id: string };
+    l.shimRegister(a.launch_id, tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN);
+    const before = (l as unknown as { entries: { claude_session: string | null }[] }).entries[0]!.claude_session;
+    tmux.die(a.launch_id, 1, "Claude said: No conversation found to continue\n--dangerously-skip-permissions cannot be used with root/sudo privileges");
+    await waitFor(() => rec(l, a.launch_id).state === "exited", "exited");
+    expect(rec(l, a.launch_id).detail).toMatch(/root\/sudo privileges$/); // just the last line
+    expect((l as unknown as { entries: { claude_session: string | null }[] }).entries[0]!.claude_session).toBe(before);
+    // A fresh (not continued) spawn that never linked: no "nothing to resume" message either.
+    const b = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    tmux.die(b.launch_id, 1, "No conversation found to continue");
+    await waitFor(() => rec(l, b.launch_id).state === "exited", "exited b");
+    expect(rec(l, b.launch_id).detail).toBe("No conversation found to continue");
+    // A continued spawn that never linked: recognized.
+    await l.restart(a.launch_id, true);
+    tmux.die(a.launch_id, 1, "No conversation found to continue");
+    await waitFor(() => rec(l, a.launch_id).state === "exited" && tmux.spawns.length === 3, "exited again");
+    await waitFor(() => /restart without resume/.test(rec(l, a.launch_id).detail ?? ""), "recognized");
   });
 });

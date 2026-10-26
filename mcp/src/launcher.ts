@@ -12,7 +12,7 @@
 //     dialogs (see dialogs.ts)
 //   - one `tmux list-panes` every LIVENESS_MS while any launch is active, to notice exits
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -84,6 +84,8 @@ type Entry = z.infer<typeof Entry> & {
   lastRefusal?: string;
   /** Current spawn resumes the folder's last conversation forked under a new id (--continue --fork-session). */
   forking?: boolean;
+  /** A shim of the current spawn linked at some point (so it got past startup). Re-adopted: assumed. */
+  spawnLinked?: boolean;
 };
 const StateFile = z.object({ v: z.literal(1), launches: z.array(Entry).max(MAX_LAUNCHES_PER_MACHINE) });
 
@@ -128,11 +130,28 @@ function clip(s: string | null): string | null {
   return s.length > MAX_DETAIL_CHARS ? s.slice(0, MAX_DETAIL_CHARS - 1) + "…" : s;
 }
 
-/** Environment variables we never hand to a launched Claude Code (would confuse it or the shim). */
-function sanitizedEnv(): NodeJS.ProcessEnv {
+/**
+ * Markers of the Claude Code process the daemon itself may have been started from (only those): with them a
+ * launched `claude` would think it is nested (CLAUDECODE=1 makes 2.1.310 refuse to start), attach to that
+ * session's IDE port, or reuse its session ids. Everything else, including CLAUDE_CODE_OAUTH_TOKEN, the
+ * Bedrock/Vertex/Foundry provider switches and CLAUDE_CODE_SHELL, is passed through.
+ */
+export const NESTED_SESSION_VARS = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_SSE_PORT",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_REMOTE_SESSION_ID",
+  "CLAUDE_SESSION_ID",
+  "CLAUDE_CODE_PROJECT_DIR_NAME",
+  "CLAUDE_PROJECT_DIR",
+];
+
+/** Environment for the tmux server (and so for launched sessions). */
+export function sanitizedEnv(src: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k === "CLAUDECODE" || k.startsWith("CLAUDE_CODE_") || k === "CLAUDE_PROJECT_DIR") continue;
+  for (const [k, v] of Object.entries(src)) {
+    if (NESTED_SESSION_VARS.includes(k)) continue;
     if (k === "MCP_REMOTE_SESSION_ID" || k === "MCP_REMOTE_LAUNCH_TOKEN" || k === "MCP_REMOTE_PROJECT_ID") continue;
     if (k === "TMUX" || k === "TMUX_PANE") continue;
     env[k] = v;
@@ -361,6 +380,7 @@ export class Launcher {
     if (!e.shim_parent && ancestors?.[0]) e.shim_parent = ancestors[0];
     e.lastRefusal = undefined;
     e.linked = true;
+    e.spawnLinked = true;
     e.fresh = false;
     this.clearStartup(e);
     this.set(e, { state: "running", detail: null, exit_code: null, ever_running: true });
@@ -483,8 +503,15 @@ export class Launcher {
    */
   private transcriptExists(e: Entry): boolean {
     if (!e.claude_session) return false;
-    const root = this.o.claudeConfigDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
-    return existsSync(join(root, "projects", e.path.replace(/[^A-Za-z0-9]/g, "-"), `${e.claude_session}.jsonl`));
+    const projects = join(this.o.claudeConfigDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "projects");
+    const file = `${e.claude_session}.jsonl`;
+    if (existsSync(join(projects, e.path.replace(/[^A-Za-z0-9]/g, "-"), file))) return true;
+    // Long paths get a shortened slug (truncated + hash); ids are unique, so look in every project folder.
+    try {
+      return readdirSync(projects).some((d) => existsSync(join(projects, d, file)));
+    } catch {
+      return false;
+    }
   }
 
   private statusFile(e: Entry): string {
@@ -538,6 +565,7 @@ export class Launcher {
     }
     e.token = newToken();
     e.linked = false;
+    e.spawnLinked = false;
     e.fresh = true;
     e.restart_at = null;
     e.stopping = false;
@@ -729,7 +757,10 @@ export class Launcher {
       return;
     }
     let detail: string | null;
-    if (NO_CONVERSATION.test(screen)) {
+    // Startup failures can only come from a spawn that never got as far as its shim; a session that ran
+    // could have printed these words itself (e.g. Claude quoting them).
+    const startupExit = !e.spawnLinked;
+    if (startupExit && e.continued && NO_CONVERSATION.test(screen)) {
       e.noConversation = true;
       // `--resume` of a forked id that Claude Code doesn't have: forget it, so the next resume forks the
       // folder's conversation again rather than failing the same way. (A fresh start's id is kept: there
@@ -738,7 +769,7 @@ export class Launcher {
       detail = !e.forking
         ? "No conversation to resume for this session yet (nothing was said in it); restart without resume"
         : "No earlier conversation in this folder to continue; restart without resume";
-    } else if (/cannot be used with root\/sudo/.test(screen)) {
+    } else if (startupExit && /cannot be used with root\/sudo/.test(screen)) {
       detail = "Claude Code refuses bypassPermissions when running as root (mcp-remote config set permission-mode ...)";
     } else if (vanished) {
       detail = "the tmux session disappeared (killed outside mcp-remote?)";
@@ -824,6 +855,7 @@ export class Launcher {
         continue;
       }
       if (p.dead) {
+        e.spawnLinked = e.state === "running"; // as last recorded by the previous daemon
         const screen = await tmux.capture(e.launch_id, 60).catch(() => "");
         await tmux.kill(e.launch_id).catch(() => {});
         this.onExit(e, this.takeExit(e) ?? p.status ?? deadStatus(screen), screen, false);
@@ -832,6 +864,7 @@ export class Launcher {
       log(`re-adopting ${e.launch_id} (${e.project})`);
       e.spawned_at = Date.now();
       e.fresh = false;
+      e.spawnLinked = true;
       e.panePid = p.pid;
       this.set(e, { state: "starting", detail: "re-adopted after a daemon restart; waiting for its shim to reconnect" });
       this.startStartup(e);
@@ -872,6 +905,7 @@ export class Launcher {
         fork_pending: false,
         from_fork: false,
         fresh: false,
+        spawnLinked: true,
         panePid: p.pid,
       };
       this.entries.push(e);
