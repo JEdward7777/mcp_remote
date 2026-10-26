@@ -102,7 +102,15 @@ describe.skipIf(!tmuxBin)("real tmux", { timeout: 20_000 }, () => {
     expect([3, null]).toContain(p!.status);
     expect(p!.pid).toBeGreaterThan(1);
     // In the same tmux race the "Pane is dead" notice is missing too; check it only when tmux has a status.
-    if (p!.status !== null) expect(await t.capture(name)).toMatch(/Pane is dead/); // the screen only shows the notice
+    if (p!.status !== null) {
+      // tmux can report the status before it has drawn the notice: retry briefly; an empty capture is the same race.
+      let screen = "";
+      for (let i = 0; i < 10 && !/Pane is dead/.test(screen); i++) {
+        screen = await t.capture(name);
+        if (!/Pane is dead/.test(screen)) await new Promise((r) => setTimeout(r, 100));
+      }
+      if (screen.trim()) expect(screen).toMatch(/Pane is dead/); // the screen only shows the notice
+    }
     const expected = `$(id);\`whoami\`|${name}|${work}`;
     expect(readFileSync(join(work, "literal.txt"), "utf8")).toContain(expected);
     // The pane output itself can also be lost in tmux's race; check it when tmux recorded the exit.

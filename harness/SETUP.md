@@ -398,7 +398,7 @@ nothing; a session really flapping up/down costs about one row per change (bound
 | `POST /api/pair/start` | `5,10/h` per IP | `LIMIT_PAIR_START_IP` | `Throttle` Durable Object (4 shards, persisted) |
 | `POST /api/pair/start` per IPv6 /48 | `15,30/h` | `LIMIT_PAIR_START_IP48` | same call (one site rotating through its /64s) |
 | `POST /api/pair/start`, everyone together | `20,52/h` | `LIMIT_PAIR_START_GLOBAL` | split evenly over the 4 shards (5 burst, 13/h each) |
-| `/api/pair/wait` | `30,120/h` per IP | `LIMIT_PAIR_WAIT_IP` | isolate memory only (best effort, free) |
+| `/api/pair/wait` and `POST /api/pair/claim` (one shared bucket) | `30,120/h` per IP | `LIMIT_PAIR_WAIT_IP` | isolate memory only (best effort, free) |
 | `/auth/login`, `/auth/callback` | `30,120/h` per IP | `LIMIT_AUTH_IP` | isolate memory only (they never touch a Durable Object) |
 | Approve attempts on one pairing code | 5 | - | the code locks: "run `mcp-remote pair` on the computer again" |
 
@@ -490,6 +490,10 @@ named page and fix `worker/src/budget.ts` (and the defaults above) if it is wron
       delivered to `webSocketMessage`? Locally they are (a raw client kept sending ~17,000 frames in 2 s after
       a 4029); the Hub drops them before any work, but each would still be a billed DO request —
       <https://developers.cloudflare.com/durable-objects/best-practices/websockets/>
+- [ ] Duration billing for a Durable Object holding sockets that await a close handshake (the client ignores
+      our close): with hibernatable sockets (all of ours; `ws.accept()` is never used in a DO) the object
+      should hibernate and bill nothing while idle — confirm on the dashboard with such a socket open —
+      <https://developers.cloudflare.com/durable-objects/platform/pricing/>
 - [ ] A WebSocket accepted by the Worker itself (the pairing wait socket): does each client frame count
       against the invocation's CPU limit, so a flood ends the connection (wrangler dev doesn't enforce it),
       and are its frames free of request billing? Also: may a Worker hold such a socket (and its link to a

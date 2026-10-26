@@ -791,6 +791,35 @@ describe("per-tenant limits in the Hub (D10)", () => {
     expect(db.frames.filter((f) => f.t === "resync").length).toBe(2);
   });
 
+  it("a refused phone connect (4029) is a hibernatable, closed-marked socket whose frames run no SQL", async () => {
+    const u = "refused-hib";
+    await newMachine(u);
+    await setLimits(u, { connects: r("1,1/h") });
+    const ok = await phone(u);
+    // End to end: the refusal arrives as a 4029 close with the reason.
+    const refused = await phone(u);
+    await waitFor(() => refused.closed, "refused closed");
+    expect(refused.closed).toMatchObject({ code: 4029 });
+    // The refusal socket itself, before any client completes the close handshake (a client that
+    // ignores our close leaves it exactly like this): held by the hibernation API, marked closed.
+    const r2 = await withHub(u, async (hub, st) => {
+      const res: Response = hub.connectLimited("phone", Date.now());
+      const socks = st.getWebSockets("refused");
+      const stmts: string[] = [];
+      const real = hub.sql;
+      hub.sql = { exec: (q: string, ...a: unknown[]) => (stmts.push(q), real.exec(q, ...a)) };
+      for (const ws of socks) for (let i = 0; i < 20; i++) await hub.webSocketMessage(ws, JSON.stringify({ t: "refresh" }));
+      hub.sql = real;
+      return { status: res.status, n: socks.length, att: socks[0]?.deserializeAttachment(), stmts: stmts.length, phones: st.getWebSockets("phone").length };
+    });
+    expect(r2.status).toBe(101);
+    expect(r2.n).toBeGreaterThanOrEqual(1); // getWebSockets lists only hibernatable (acceptWebSocket) sockets
+    expect(r2.att).toMatchObject({ kind: "phone", closed: true });
+    expect(r2.stmts).toBe(0);
+    expect(r2.phones).toBe(1); // refusal sockets are not broadcast targets
+    void ok;
+  });
+
   it("frames on a socket the Hub already closed are dropped before any work (client ignoring 4029)", async () => {
     const u = "ignore-close";
     const { p } = await setup(u);

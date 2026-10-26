@@ -376,9 +376,13 @@ export class Hub extends DurableObject<Env> {
     const secs = Math.ceil(wait / 1000);
     if (kind === "phone") {
       // A browser can't read an HTTP status on a failed upgrade: accept, then close with a reason.
+      // NEVER ws.accept() a socket in a Durable Object: a non-hibernatable socket whose client ignores
+      // the close keeps the object in memory (billed duration). Accept it hibernatable, already marked
+      // closed, under its own tag (no broadcasts), so any later frame is dropped by webSocketMessage.
       const pair = new WebSocketPair();
-      pair[1].accept();
-      pair[1].close(CLOSE_RATE_LIMITED, over ? `daily budget used up; retry in ${secs}s` : `too many connections; retry in ${secs}s`);
+      this.ctx.acceptWebSocket(pair[1], ["refused"]);
+      pair[1].serializeAttachment({ kind: "phone", closed: true } satisfies Attachment);
+      this.shut(pair[1], CLOSE_RATE_LIMITED, over ? `daily budget used up; retry in ${secs}s` : `too many connections; retry in ${secs}s`);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     return new Response(over ? `${over.text}; retry in ${secs}s` : `too many connections for this account; retry in ${secs}s`, {
