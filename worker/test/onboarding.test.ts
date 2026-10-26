@@ -275,6 +275,29 @@ describe("Registry: sign-in, waitlist, invites", () => {
     expect(await reg.act("boss@dev.local", { t: "forget", tid: a.tid })).toMatchObject({ ok: false, status: 409 });
   });
 
+  it("deny then remove: the email is scrubbed from earlier audit entries too", async () => {
+    const reg = await freshRegistry({ mode: "waitlist" });
+    await reg.signIn({ tid: "g-denyme", email: "denyme@example.com", emailVerified: true });
+    expect(await reg.act("owner@example.com", { t: "deny", tid: "g-denyme" })).toEqual({ ok: true });
+    expect(JSON.stringify(await reg.auditLog())).toContain("denyme@example.com");
+    expect(await reg.act("owner@example.com", { t: "forget", tid: "g-denyme" })).toEqual({ ok: true });
+    const audit = JSON.stringify(await reg.auditLog());
+    expect(audit).not.toContain("denyme@example.com");
+    expect(audit).not.toContain("g-denyme");
+    expect((await reg.auditLog()).map((a) => a.action)).toEqual(["forget", "deny"]);
+  });
+
+  it("a pre-4b (legacy) account is migrated to Registry-governed when sign-up is not closed (report answer too)", async () => {
+    const reg = await freshRegistry({ mode: "waitlist" });
+    const ans = await reg.report(report("g-legacyrep", { do_requests: 1 }));
+    expect(ans).toMatchObject({ status: "active", adm: "reg" });
+    expect((await reg.listTenants("all"))[0]).toMatchObject({ via: "open" });
+    // In closed mode a legacy account keeps the env rule (as before Phase 4b).
+    const closed = await freshRegistry({ mode: "closed" });
+    expect(await closed.report(report("g-legacyclosed", { do_requests: 1 }))).toMatchObject({ adm: "env" });
+    expect(await closed.signIn({ tid: "g-legacyclosed", email: "g-legacyclosed@example.com", emailVerified: true })).toMatchObject({ status: "refused", reason: "closed" });
+  });
+
   it("an owner account can't be disabled; plans change only for admitted accounts", async () => {
     const reg = await freshRegistry({ mode: "open", userCap: 5 });
     await signIn(reg, "owner@example.com");
@@ -298,9 +321,9 @@ describe("Registry: sign-in, waitlist, invites", () => {
     expect(await verifyInviteToken(secret, await makeInviteToken(secret, "inv-eeeeeeeeeeeeeeee", Date.now() - 1))).toBeNull();
     // A blob signed for another purpose (e.g. a session cookie) is not an invite.
     expect(await verifyInviteToken(secret, await signBlob(secret, "session", { i: "inv-eeeeeeeeeeeeeeee", e: 9e9 }))).toBeNull();
-    const ok = await jsonOf(await SELF.fetch(`${ORIGIN}/api/invite?token=${encodeURIComponent(t)}`));
-    expect(ok).toMatchObject({ valid: true });
-    expect(await jsonOf(await SELF.fetch(`${ORIGIN}/api/invite?token=${encodeURIComponent(t)}x`))).toEqual({ valid: false });
+    // The sign-in page's check: a forged link is refused by the Worker; a genuine one is looked up.
+    expect(await jsonOf(await SELF.fetch(`${ORIGIN}/api/invite?token=${encodeURIComponent(t)}x`))).toEqual({ valid: false, reason: "invalid" });
+    expect(await jsonOf(await SELF.fetch(`${ORIGIN}/api/invite?token=${encodeURIComponent(t)}`))).toEqual({ valid: false, reason: "unknown" });
   });
 });
 
@@ -342,6 +365,71 @@ describe("Worker: waitlist cookie, approval, adm claim", () => {
     expect((await api("/api/me", `__Host-mr_session=${old}`)).status).toBe(401);
     expect((await api("/api/me", `__Host-mr_session=${allowed}`)).status).toBe(200);
     expect((await api("/api/me", `__Host-mr_session=${reg}`)).status).toBe(200);
+  });
+});
+
+describe("review round 1", () => {
+  it("legacy account + OPEN_SIGNUP=waitlist: sign-in admits it as 'reg', the per-request check passes, and its daemon connects", async () => {
+    const tid = "g-legacywl";
+    const email = "legacy.wl@example.com";
+    const hub = E.HUB.get(E.HUB.idFromName(tid));
+    const machineId = "mlegacywl0001";
+    const { mintMachineToken } = await import("../src/auth");
+    const { sha256Hex } = await import("../src/crypto");
+    const token = await mintMachineToken(E.SESSION_SECRET, tid, machineId);
+    await hub.addMachine(machineId, "old-box", await sha256Hex(token), email, "env");
+    // Before: the env rule (not allowlisted, OPEN_SIGNUP not "true") refuses its daemon (exit-3 path).
+    expect(await connect("/api/daemon/ws", { authorization: `Bearer ${token}` })).toBe(403);
+    await configureMain({ mode: "closed" });
+    try {
+      await mainReg().report({ tid, email, plan: "free", day: utcDay(Date.now()), counts: counts({ do_requests: 1 }) }); // registered as legacy
+      await configureMain({ mode: "waitlist" });
+      const r = await mainReg().signIn({ tid, email, emailVerified: true });
+      expect(r).toMatchObject({ status: "active", adm: "reg", via: "open" });
+      // What getSession() does with the cookie it gets:
+      const { accountAllowed } = await import("../src/oauth");
+      expect(accountAllowed(tid, email, { ...ENV, OPEN_SIGNUP: "waitlist" }, (r as { adm: "env" | "reg" }).adm)).toBe(true);
+      const cookie = `__Host-mr_session=${await makeSessionCookieValue(E.SESSION_SECRET, { tid, email, adm: "reg" })}`;
+      expect((await api("/api/me", cookie)).status).toBe(200);
+      // The sign-in synced the Hub (adm "reg"): the daemon connects now.
+      let d: Awaited<ReturnType<typeof connect>> = 0;
+      for (let i = 0; i < 50 && typeof d === "number"; i++) {
+        d = await connect("/api/daemon/ws", { authorization: `Bearer ${token}` });
+        if (typeof d === "number") await sleep(20);
+      }
+      if (typeof d === "number") throw new Error(`daemon refused: ${d}`);
+      await waitFor(() => last(d, "welcome"), "welcome");
+      d.ws.close();
+    } finally {
+      await configureMain(null);
+    }
+  });
+
+  it("a Hub left disabled (Enable could not reach it) is put right by the next sign-in", async () => {
+    const reg = await freshRegistry({ mode: "open", userCap: 5 });
+    const tid = "g-stuckdisabled";
+    await reg.signIn({ tid, email: "stuck@example.com", emailVerified: true });
+    const hub = E.HUB.get(E.HUB.idFromName(tid));
+    await hub.setAccount({ status: "disabled", adm: "reg", plan: "free" }); // the Registry says active
+    expect(await hub.isDisabled()).toBe(true);
+    expect(await reg.signIn({ tid, email: "stuck@example.com", emailVerified: true })).toMatchObject({ status: "active" });
+    for (let i = 0; i < 50 && (await hub.isDisabled()); i++) await sleep(20);
+    expect(await hub.isDisabled()).toBe(false);
+  });
+
+  it("malformed percent-encoding in an admin path is a 400, not a 500", async () => {
+    const res = await api("/api/admin/tenants/%E0%A4%A/approve", await ownerCookie(), { method: "POST", body: {} });
+    expect(res.status).toBe(400);
+  });
+
+  it("the invite check reports revoked links", async () => {
+    const boss = await ownerCookie();
+    const { invite } = await jsonOf(await api("/api/admin/invites", boss, { method: "POST", body: { days: 1, max_uses: 1 } }));
+    const token = new URL(invite.link).searchParams.get("invite")!;
+    const check = async () => jsonOf(await SELF.fetch(`${ORIGIN}/api/invite?token=${encodeURIComponent(token)}`));
+    expect(await check()).toMatchObject({ valid: true });
+    await api(`/api/admin/invites/${invite.id}`, boss, { method: "DELETE" });
+    expect(await check()).toEqual({ valid: false, reason: "revoked" });
   });
 });
 

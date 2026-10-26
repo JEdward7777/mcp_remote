@@ -1206,11 +1206,16 @@ function renderSignedOut(): void {
   const signIn = h("a", { class: "button", href: invite ? `/auth/login?invite=${encodeURIComponent(invite)}` : "/auth/login" }, "Sign in with Google");
   if (invite) {
     void fetch(`/api/invite?token=${encodeURIComponent(invite)}`)
-      .then((r) => r.json() as Promise<{ valid?: boolean; expires_at?: number }>)
+      .then((r) => r.json() as Promise<{ valid?: boolean; expires_at?: number; reason?: string }>)
       .then((j) => {
+        const why: Record<string, string> = {
+          revoked: "was withdrawn by the owner",
+          expired: "has expired",
+          used_up: "has been used as often as allowed",
+        };
         note.textContent = j.valid
           ? "You're invited: sign in with Google to join (no waitlist)."
-          : "This invite link is not valid any more (expired or changed). You can still sign in.";
+          : `This invite link ${why[j.reason ?? ""] ?? "is not valid"}. You can still sign in (the usual sign-up rules apply).`;
         if (!j.valid) signIn.setAttribute("href", "/auth/login");
       })
       .catch(() => {});
@@ -1304,9 +1309,32 @@ function renderWaitlist(email: string, since: number): void {
         "Only your email address is kept, so the owner can approve you; sign out and ask the owner if you want it removed.",
       ),
       again,
+      inviteForm(),
       signOutButton(),
     ),
   );
+}
+
+/** "Got an invite link?": paste it to sign in again with it (it skips the waitlist). */
+function inviteForm(): HTMLElement {
+  const input = h("input", { placeholder: "Paste an invite link", "aria-label": "invite link" }) as HTMLInputElement;
+  const go = h("button", { type: "submit", class: "small" }, "Use invite link");
+  const form = h("form", { class: "dev" }, h("p", { class: "muted small" }, "Got an invite link from the owner?"), input, go);
+  form.onsubmit = (ev) => {
+    ev.preventDefault();
+    let token = input.value.trim();
+    try {
+      token = new URL(token).searchParams.get("invite") ?? token;
+    } catch {
+      /* the bare token */
+    }
+    if (!/^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token)) {
+      toast("That doesn't look like an invite link");
+      return;
+    }
+    location.href = `/?invite=${encodeURIComponent(token)}`;
+  };
+  return form;
 }
 
 /** Disabled (or otherwise not allowed): say so, stop reconnecting, offer sign-out. */
@@ -1347,7 +1375,9 @@ async function boot(): Promise<void> {
     if (r && r.status === 401) renderSignedOut();
     else if (r && r.status === 403) {
       const j = (await r.json().catch(() => ({}))) as { waitlisted?: boolean; disabled?: boolean; email?: string; since?: number; error?: string };
-      if (j.waitlisted) renderWaitlist(j.email ?? "", j.since ?? Date.now());
+      // Waiting, but opened an invite link: offer to sign in with it (it skips the waitlist).
+      if (j.waitlisted && inviteToken()) renderSignedOut();
+      else if (j.waitlisted) renderWaitlist(j.email ?? "", j.since ?? Date.now());
       else renderBlocked(j.error ?? "This account can't use this server right now.", "Sign out and sign in again to see why.");
     } else {
       // The app shell itself comes from the service worker's cache, so this also shows offline.

@@ -493,7 +493,7 @@ export class Registry extends DurableObject<Env> {
     const counts = this.loadCounts();
     const day = utcDay(now);
     const { guard } = this.guardNow(now);
-    const d = decideSignup(
+    let d = decideSignup(
       {
         email: input.email,
         emailVerified: input.emailVerified,
@@ -511,6 +511,9 @@ export class Registry extends DurableObject<Env> {
     // Data minimization: the Registry keeps the email (the owner needs it to approve), not the name.
     const name: string | null = null;
     if (d.kind === "refused") return { status: "refused", reason: d.reason, text: refusalText(d.reason) };
+    // A pre-4b account admitted while sign-up is not closed becomes Registry-governed (review round 1):
+    // with adm "env" a later OPEN_SIGNUP=waitlist would make the per-request env check refuse it.
+    if (d.kind === "active" && d.via === "legacy" && cfg.mode !== "closed") d = { ...d, via: "open" };
     const status: AccountStatus = d.kind === "active" ? "active" : "waitlisted";
     if (!row) {
       const via: Via = d.kind === "active" ? d.via : "open";
@@ -556,7 +559,18 @@ export class Registry extends DurableObject<Env> {
     }
     if (d.kind === "waitlisted") return { status: "waitlisted", since: row?.created_at ?? now };
     const plan = row?.plan ?? DEFAULT_PLAN;
+    // An existing account's Hub may hold a stale state (e.g. it stayed "disabled" because telling it about
+    // Enable failed, or the account was disabled and is an owner now; a disabled Hub never reports): sync
+    // it on every sign-in. setAccount writes nothing when nothing changed.
+    if (row) this.syncHub(input.tid, { status: "active", adm: admFor(d.via), plan });
     return { status: "active", adm: admFor(d.via), via: d.via, plan };
+  }
+
+  private syncHub(tid: string, a: { status: AccountStatus; adm: Adm; plan: string }): void {
+    const p = this.env.HUB.get(this.env.HUB.idFromName(tid))
+      .setAccount(a)
+      .catch((e: unknown) => console.error("could not update the account's hub", e instanceof Error ? e.message : String(e)));
+    this.ctx.waitUntil(p);
   }
 
   /** Waitlist re-check (Worker, rate limited): the account's current status, without changing it. */
@@ -612,20 +626,27 @@ export class Registry extends DurableObject<Env> {
   private reportInner(r: UsageReport, now: number): ReportAnswer {
     const today = utcDay(now);
     let row = this.getTenant(r.tid);
+    if (row?.status === "active" && row.via === "legacy" && this.cfg().mode !== "closed") {
+      // Same migration as at sign-in: Registry-governed from now on (the answer hands the Hub adm "reg").
+      this.sql.exec("UPDATE tenants SET via = 'open', updated_at = ? WHERE tid = ?", now, r.tid);
+      row = { ...row, via: "open" };
+    }
     if (!row) {
       const plan = PLANS[r.plan] ? r.plan : DEFAULT_PLAN;
       const email = (r.email ?? "").slice(0, 254);
+      // Pre-4b account: "legacy" (env rule) only while sign-up is closed, else Registry-governed at once.
+      const via: Via = r.tid.startsWith("dev-") ? "dev" : this.cfg().mode === "closed" ? "legacy" : "open";
       this.sql.exec(
         "INSERT INTO tenants (tid, email, status, via, plan, created_at, updated_at) VALUES (?, ?, 'active', ?, ?, ?, ?)",
         r.tid,
         email,
-        r.tid.startsWith("dev-") ? "dev" : "legacy",
+        via,
         plan,
         now,
         now,
       );
       this.moveCount(null, "active");
-      row = { tid: r.tid, email, name: null, status: "active", via: r.tid.startsWith("dev-") ? "dev" : "legacy", plan, created_at: now, updated_at: now, last_active_day: null };
+      row = { tid: r.tid, email, name: null, status: "active", via, plan, created_at: now, updated_at: now, last_active_day: null };
     }
     let todayRow: DayRow | undefined;
     for (const part of [r.prev, { day: r.day, counts: r.counts }]) {
@@ -812,6 +833,10 @@ export class Registry extends DurableObject<Env> {
     if (a.t === "forget") {
       if (row.status !== "waitlisted" && row.status !== "denied") return { ok: false, status: 409, error: `this account is ${row.status}; only waitlisted or denied sign-ups can be removed` };
       this.sql.exec("DELETE FROM tenants WHERE tid = ?", row.tid);
+      // Earlier audit entries about this sign-up (approve / deny / invite use) named it: scrub them too.
+      if (row.email) this.sql.exec("UPDATE audit SET target = '(removed sign-up)' WHERE target = ?", row.email);
+      this.sql.exec("UPDATE audit SET target = '(removed sign-up)' WHERE target = ?", row.tid);
+      this.sql.exec("UPDATE audit SET actor = '(removed sign-up)', detail = '' WHERE detail = ?", row.tid);
       this.moveCount(row.status, null);
       this.audit(now, actor, "forget", "(removed sign-up)", row.status);
       return { ok: true };
@@ -894,6 +919,22 @@ export class Registry extends DurableObject<Env> {
     this.begin(now);
     try {
       return this.sql.exec<InviteRow>("SELECT * FROM invites ORDER BY created_at DESC LIMIT 200").toArray();
+    } finally {
+      this.end(now);
+    }
+  }
+
+  /** Is this invite still usable (not revoked, not expired, uses left)? For the sign-in page. */
+  async inviteOpen(id: string): Promise<{ valid: boolean; reason?: "revoked" | "expired" | "used_up" | "unknown" }> {
+    const now = Date.now();
+    this.begin(now);
+    try {
+      const i = this.sql.exec<InviteRow>("SELECT * FROM invites WHERE id = ?", id).toArray()[0];
+      if (!i) return { valid: false, reason: "unknown" };
+      if (i.revoked_at !== null) return { valid: false, reason: "revoked" };
+      if (i.expires_at <= now) return { valid: false, reason: "expired" };
+      if (i.max_uses !== null && i.uses >= i.max_uses) return { valid: false, reason: "used_up" };
+      return { valid: true };
     } finally {
       this.end(now);
     }

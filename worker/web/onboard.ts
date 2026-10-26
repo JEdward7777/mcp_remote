@@ -22,14 +22,15 @@ export interface InstallView {
   update(machines: MachineRecord[]): void;
 }
 
-let dlCache: DlInfo | null = null;
-
+/** Read fresh on every "Get an install command" (a deploy may have replaced the tarball), and checked to exist. */
 async function dlInfo(): Promise<DlInfo> {
-  if (dlCache) return dlCache;
+  const missing = "the CLI package is not available on this server (it is built by `wrangler deploy`; redeploy)";
   const r = await fetch("/dl/mcp-remote.json", { cache: "no-cache" });
-  if (!r.ok) throw new Error("the CLI package is not available on this server (build it with `npm run build -w worker`)");
-  dlCache = (await r.json()) as DlInfo;
-  return dlCache;
+  if (!r.ok) throw new Error(missing);
+  const info = (await r.json()) as DlInfo;
+  const head = await fetch(info.path, { method: "HEAD", cache: "no-cache" }).catch(() => null);
+  if (!head || !head.ok) throw new Error(missing);
+  return info;
 }
 
 /** Shell-safe enough for our own origin (https://host[:port]); anything else is quoted. */

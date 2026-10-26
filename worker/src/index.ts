@@ -572,12 +572,19 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   }
 
   if (path === "/api/invite" && request.method === "GET") {
-    // The sign-in page checks an invite link (signature + expiry only; no Durable Object).
+    // The sign-in page checks an invite link: signature + expiry in the Worker (a forged one never reaches
+    // a Durable Object), then whether it is revoked or used up (one Registry call, per-IP limited).
     const r = localHit(`auth:${clientKey(request)}`, publicLimits(env as unknown as Record<string, unknown>).auth_ip);
     if (!r.ok) return tooMany(r.retryAfterMs, "too many requests from your network");
     const t = url.searchParams.get("token") ?? "";
     const v = t ? await verifyInviteToken(env.SESSION_SECRET, t) : null;
-    return v ? json({ valid: true, expires_at: v.expiresAt }) : json({ valid: false });
+    if (!v) return json({ valid: false, reason: "invalid" });
+    try {
+      const o = await registry(env).inviteOpen(v.id);
+      return json(o.valid ? { valid: true, expires_at: v.expiresAt } : { valid: false, reason: o.reason });
+    } catch {
+      return json({ valid: true, expires_at: v.expiresAt, unchecked: true });
+    }
   }
 
   if (path === "/api/pair/claim" && request.method === "POST") {
@@ -857,7 +864,12 @@ async function handleAdmin(request: Request, env: Env, url: URL, session: Sessio
 
   const t = /^\/api\/admin\/tenants\/([^/]+)\/(approve|deny|disable|enable|plan|forget)$/.exec(path);
   if (t && request.method === "POST") {
-    const tid = decodeURIComponent(t[1]!);
+    let tid: string;
+    try {
+      tid = decodeURIComponent(t[1]!);
+    } catch {
+      return err(400, "bad account id");
+    }
     if (!TID_RE.test(tid)) return err(400, "bad account id");
     let action: AdminAction;
     if (t[2] === "plan") {

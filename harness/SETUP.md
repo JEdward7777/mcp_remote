@@ -373,8 +373,10 @@ The first rule that matches decides, at every sign-in (`worker/src/signup.ts`):
 3. Disabled by you in Admin: refused ("disabled by the operator").
 4. `ALLOWED_EMAILS`: in (skips cap and waitlist).
 5. Already in through the Registry (invite, cap, your approval): stays in, even if the cap is lower now.
-   (Accounts that got in through the lists keep their old rule: removing the email ends it; accounts from before
-   Phase 4b stay in unless `OPEN_SIGNUP` is `false` and they are not listed.)
+   (Accounts that got in through the lists keep their old rule: removing the email ends it. Accounts from before
+   Phase 4b: while `OPEN_SIGNUP` is `false` they keep the old rule (in only if listed); the first time one is
+   used or signs in while it is `waitlist` or `true`, it becomes a Registry account like any other and stays in
+   from then on, also if you later switch modes, until you disable it.)
 6. A valid invite link: in (skips the waitlist, the cap and a sign-up pause).
 7. On the waitlist: still waiting. Denied by you: refused.
 8. `OPEN_SIGNUP`: `false` -> refused ("not on the sign-up list; ask for an invite"); `waitlist` -> waitlist;
@@ -388,13 +390,15 @@ signed-in users never need the Registry (it is not on any request path).
 **Waitlist.** A waitlisted person gets a "You're on the waitlist" page (a waitlist cookie, not a session: no API
 access). When you approve them, they are in the next time they open the page (it re-checks with the Registry at
 most every 30 s; no polling, no email is sent: tell them). **Approve**, **Deny** (refused from then on; you can
-still approve later) or **Remove** (forgets the entry and its email; they can sign up again).
+still approve later) or **Remove** (forgets the entry and its email, also in earlier audit entries; they can sign
+up again). The waiting page also takes an invite link pasted by the person (it skips the waitlist).
 
 **Invite links.** Admin -> Invite links: valid for 1-30 days (default 7), up to N uses (default 5; empty =
 unlimited), with a note. The link is `https://<your app>/?invite=<token>`; the token is signed with
 `SESSION_SECRET` (forged or expired links are refused without touching any Durable Object), and the Registry
-checks at sign-in that it is not revoked or used up (a used-up link falls back to the normal rules). **Revoke**
-stops it at once. Rotating `SESSION_SECRET` invalidates every link.
+checks at sign-in that it is not revoked or used up (a used-up link falls back to the normal rules). The sign-in
+page tells a visitor whether the link is still good, expired, withdrawn or used up (one Registry lookup, per-IP
+limited). **Revoke** stops it at once. Rotating `SESSION_SECRET` invalidates every link.
 
 **Upgrading from Phase 4:** `OPEN_SIGNUP: "true"` now means "up to `USER_CAP` (default 10) accounts". Accounts
 that already exist are registered as active the first time they are used after the deploy (their Hub reports),
@@ -424,7 +428,9 @@ that browser out; the phone socket is closed with 4403 and the app says the acco
 disconnected (close 4001) and refused on reconnect (403), so they exit with code 3 and the service doesn't
 restart them (as for a revoked machine). It also can't sign in again. **Enable** lets it back in (a browser that
 was just refused may need up to a minute, or a new sign-in); its computers need `mcp-remote daemon` / the
-service started again. Changing the plan takes effect in that account's Hub at once.
+service started again. Changing the plan takes effect in that account's Hub at once. Every sign-in also re-sends
+the account's state to its Hub, so an account whose Hub missed an Enable (or that became an owner) is put right
+by signing in again.
 
 ### Global guard and owner alerts
 
