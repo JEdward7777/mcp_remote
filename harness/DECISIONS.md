@@ -84,3 +84,10 @@
   Throttle DO (4 shards) for unauthenticated pair-start, global cap derived from FREE_PLAN; pairing wait socket
   held by the Worker (DO never sees client frames), claim via authenticated POST; DOs never use ws.accept();
   closed sockets' frames dropped before any work; history GC batched, capped at 50% of rows_written.
+- D24 (accepted, made during Phase 4 build) Push/location: Web Push sent directly from the Hub (VAPID secrets,
+  WebCrypto, allowlisted push hosts, redirect manual), at most 5 devices per account, daily push caps; push only to
+  devices not currently showing the app (per-device suppression via subscription id); silent = no push, normal =
+  Urgency normal, urgent = Urgency high + requireInteraction; lock-screen preview setting. Location: every share
+  needs the user's tap for that session's request (random token per request in loc_req), only `ok` results carry a
+  position, a session may reuse only its own last share within max_age_s, last-known kept 6 h, off = deleted.
+  Only Google Maps (normalised paths) and geo: links are tappable.
