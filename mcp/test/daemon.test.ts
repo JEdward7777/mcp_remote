@@ -350,4 +350,28 @@ describe("daemon remote launch", () => {
     expect(hubFrames.filter((f) => f.t === "session_down" && f.session_id === id)).toEqual([]);
     expect(lastLaunches()[0].state).toBe("running");
   });
+
+  it("refuses a nested shim that registers before the real one (e.g. right after a daemon restart) (round-2 finding)", async () => {
+    const { tmux, alpha } = await setup();
+    hub({ t: "launch", req_id: "q1", project_id: alpha, continue: false });
+    await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "q1" && f.ok), "launch ok");
+    const id = tmux.spawns[0]!.name;
+    const token = tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN;
+    const pane = tmux.sessions.get(id)!.pid;
+    const connect = async (ancestors: number[]) => {
+      const sock = createConnection(join(dir, "d.sock"));
+      await new Promise<void>((r) => sock.once("connect", () => r()));
+      const c = { frames: [] as any[] };
+      const conn = new LineConn(sock, DaemonToShim, (f) => c.frames.push(f), () => {});
+      conn.send({ t: "register", v: 1, session: { session_id: id, project: "alpha" }, launch_token: token, ancestors });
+      await waitFor(() => c.frames.find((f) => f.t === "registered" || f.t === "register_refused"), "reply");
+      return c;
+    };
+    const nested = await connect([7001, 7000, 6000, pane]);
+    expect(nested.frames[0]).toMatchObject({ t: "register_refused", error: expect.stringMatching(/tmux pane/) });
+    expect(lastLaunches()[0].state).toBe("starting");
+    const real = await connect([6000, pane]);
+    expect(real.frames[0]).toMatchObject({ t: "registered" });
+    await waitFor(() => lastLaunches()[0]?.state === "running", "running");
+  });
 });

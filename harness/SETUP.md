@@ -161,6 +161,12 @@ Manual equivalent, or a per-project `.mcp.json`:
 ```
 
 Each shim registers a session named after the project folder (basename of `CLAUDE_PROJECT_DIR`, which Claude Code sets, else of the cwd) with a random session id.
+It only does so in a session that can receive phone messages: one launched from the phone, one with
+`MCP_REMOTE_SESSION_ID` set, or one whose `claude` process was started with `--dangerously-load-development-channels`
+(the shim checks its parent's command line). In `claude -p`, `claude mcp list` or a session without the flag it
+stays dormant (logged on stderr; `send_message` explains why), so those don't show up on the phone or push real
+threads out of the 50-session limit. `MCP_REMOTE_ACTIVATE=1` forces registration (e.g. on Windows, where the
+parent can't be inspected it registers anyway).
 Sessions started from the phone (step 14) get their id from the daemon automatically. For sessions you start
 yourself at the desk, to keep a stable id (and thread) across restarts, set `MCP_REMOTE_SESSION_ID` **per project
 and per computer**, never in a committed `.mcp.json` and never at user scope (user scope would give every project on

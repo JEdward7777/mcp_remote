@@ -49,12 +49,21 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function startShim(sessionId: string, extraEnv: Record<string, string> = {}): Promise<Client> {
+async function startShim(sessionId: string | null, extraEnv: Record<string, string> = {}, parentArgs?: string[]): Promise<Client> {
+  const env: Record<string, string> = { ...process.env } as Record<string, string>;
+  delete env.MCP_REMOTE_SESSION_ID;
+  delete env.MCP_REMOTE_LAUNCH_TOKEN;
+  delete env.MCP_REMOTE_ACTIVATE;
+  Object.assign(env, { MCP_REMOTE_SOCKET: join(dir, "d.sock"), ...extraEnv });
+  if (sessionId) env.MCP_REMOTE_SESSION_ID = sessionId;
+  // parentArgs: run the shim under an intermediate node process with that command line (stands in for
+  // `claude <args>`, which is the shim's direct parent under Claude Code).
+  const relay = "require('child_process').spawn(process.execPath, [process.argv[1], 'shim'], { stdio: 'inherit' }).on('exit', (c) => process.exit(c ?? 0))";
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [CLI, "shim"],
+    args: parentArgs ? ["-e", relay, CLI, ...parentArgs] : [CLI, "shim"],
     cwd: dir,
-    env: { ...process.env, MCP_REMOTE_SOCKET: join(dir, "d.sock"), MCP_REMOTE_SESSION_ID: sessionId, ...extraEnv } as Record<string, string>,
+    env,
     stderr: "pipe",
   });
   const c = new Client({ name: "test", version: "0" }, { capabilities: {} });
@@ -99,5 +108,23 @@ describe("shim", () => {
     proto.onShim = orig;
     expect(shimConnections).toBe(1);
     expect(hubFrames.filter((f) => f.t === "session_up" && f.session.session_id === "same-id").length).toBe(1);
+  }, 20_000);
+
+  it("stays dormant without channel evidence: no session on the phone, clear send_message error (round-2 finding)", async () => {
+    const c = await startShim(null, {}, ["mcp", "list"]);
+    await sleep(1500);
+    expect(hubFrames.filter((f) => f.t === "session_up")).toEqual([]);
+    const r = await c.callTool({ name: "send_message", arguments: { text: "hi" } });
+    expect(r.isError).toBe(true);
+    expect((r.content as { text: string }[])[0]!.text).toMatch(/inactive.*--dangerously-load-development-channels/);
+  }, 20_000);
+
+  it("registers when its parent was started with the channels flag, or with MCP_REMOTE_ACTIVATE=1", async () => {
+    await startShim(null, { CLAUDE_PROJECT_DIR: "/x/flagged" }, ["--dangerously-load-development-channels", "server:mcp-remote"]);
+    for (let i = 0; i < 50 && !hubFrames.find((f) => f.t === "session_up"); i++) await sleep(100);
+    expect(hubFrames.find((f) => f.t === "session_up")?.session.project).toBe("flagged");
+    await startShim(null, { CLAUDE_PROJECT_DIR: "/x/forced", MCP_REMOTE_ACTIVATE: "1" });
+    for (let i = 0; i < 50 && hubFrames.filter((f) => f.t === "session_up").length < 2; i++) await sleep(100);
+    expect(hubFrames.filter((f) => f.t === "session_up").map((f) => f.session.project)).toEqual(["flagged", "forced"]);
   }, 20_000);
 });

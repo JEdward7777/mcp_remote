@@ -773,3 +773,31 @@ describe("remote launch (phase 2)", () => {
     expect(r.again).toBe(0); // an unchanged snapshot (every reconnect) writes nothing and is not broadcast
   });
 });
+
+describe("phase 2 review round 2", () => {
+  it("evicts sessions that never had a message before ones with history", async () => {
+    const { token } = await newMachine("eve2");
+    const d = await daemon(token);
+    d.send({ t: "hello", v: 1, sessions: [] });
+    // Two old threads with history...
+    for (const id of ["keep1", "keep2"]) {
+      d.send({ t: "session_up", session: { session_id: id, project: "p" } });
+      d.send({ t: "send", req_id: `r-${id}`, session_id: id, text: "hello", urgency: "normal" });
+      d.send({ t: "session_down", session_id: id });
+    }
+    await waitFor(() => d.frames.filter((f) => f.t === "sent").length === 2, "2 sent");
+    // ...then many sessions that come and go without a message (e.g. `claude -p` runs).
+    for (let i = 0; i < 70; i++) {
+      d.send({ t: "session_up", session: { session_id: `e${i}`, project: "p" } });
+      d.send({ t: "session_down", session_id: `e${i}` });
+    }
+    const p = await phone("eve2");
+    await waitFor(() => last(p, "state")?.sessions.some((s: any) => s.session_id === "e69"), "all processed");
+    const ids = last(p, "state").sessions.map((s: any) => s.session_id);
+    expect(ids.length).toBe(50);
+    expect(ids).toContain("keep1");
+    expect(ids).toContain("keep2");
+    expect(ids).toContain("e69");
+    expect(ids).not.toContain("e0");
+  });
+});

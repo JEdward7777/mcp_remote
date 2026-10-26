@@ -42,10 +42,10 @@ describe("tmux argv", () => {
   });
 
   it("parses list-panes output and versions", () => {
-    expect(parseList("mr-aaaaaaaaaaaa|0|\nmr-bbbbbbbbbbbb|1|7\nod|d|1|\n")).toEqual([
-      { name: "mr-aaaaaaaaaaaa", dead: false, status: null },
-      { name: "mr-bbbbbbbbbbbb", dead: true, status: 7 },
-      { name: "od|d", dead: true, status: null },
+    expect(parseList("mr-aaaaaaaaaaaa|42|0|\nmr-bbbbbbbbbbbb|43|1|7\nod|d||1|\n")).toEqual([
+      { name: "mr-aaaaaaaaaaaa", pid: 42, dead: false, status: null },
+      { name: "mr-bbbbbbbbbbbb", pid: 43, dead: true, status: 7 },
+      { name: "od|d", pid: null, dead: true, status: null },
     ]);
     expect(tmuxVersionOk("tmux 3.4")).toBe(true);
     expect(tmuxVersionOk("tmux 3.2a")).toBe(true);
@@ -87,7 +87,8 @@ describe.skipIf(!tmuxBin)("real tmux", () => {
       if (p?.dead) break;
       await new Promise((r) => setTimeout(r, 50));
     }
-    expect(p).toEqual({ name, dead: true, status: 3 });
+    expect(p).toMatchObject({ name, dead: true, status: 3 });
+    expect(p!.pid).toBeGreaterThan(1);
     expect(await t.capture(name)).toMatch(/Pane is dead/); // the screen only shows the notice
     const screen = await t.capture(name, 60);
     expect(screen).toContain(`$(id);\`whoami\`|${name}|${work}`);

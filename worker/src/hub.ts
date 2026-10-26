@@ -651,12 +651,16 @@ export class Hub extends DurableObject<Env> {
     return null;
   }
 
-  /** Keep at most `keep` sessions for a machine by deleting the least recently active offline ones. */
+  /**
+   * Keep at most `keep` sessions for a machine by deleting offline ones: first those that never had a
+   * message (e.g. sessions that came and went without anyone writing), then the least recently active.
+   */
   private evictOldSessions(machineId: string, keep: number): void {
     const victims = this.sql
       .exec<{ session_id: string }>(
         `SELECT s.session_id FROM sessions s WHERE s.machine_id = ? AND s.online = 0
-         ORDER BY MAX(s.last_seen, COALESCE((SELECT created_at FROM messages m WHERE m.session_id = s.session_id ORDER BY id DESC LIMIT 1), 0)) ASC
+         ORDER BY s.msg_count > 0 ASC,
+           MAX(s.last_seen, COALESCE((SELECT created_at FROM messages m WHERE m.session_id = s.session_id ORDER BY id DESC LIMIT 1), 0)) ASC
          LIMIT MAX(0, (SELECT COUNT(*) FROM sessions WHERE machine_id = ?) - ?)`,
         machineId,
         machineId,

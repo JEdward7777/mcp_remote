@@ -1,5 +1,5 @@
 // Launcher lifecycle against a fake tmux driver (no real Claude Code, no real tmux).
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -59,6 +59,7 @@ function make(over: Partial<ConstructorParameters<typeof Launcher>[0]> = {}): La
     livenessMs: 20,
     restartBaseMs: 20,
     stopWaitMs: 200,
+    keyRetryMs: 50,
     extraEnv: { MCP_REMOTE_SOCKET: "/tmp/d.sock" },
     ...over,
   });
@@ -385,5 +386,83 @@ describe("launcher", () => {
     expect(deadStatus("x\nPane is dead (status 7, Sun Oct 25 21:57:43 2026)\n")).toBe(7);
     expect(deadStatus("Pane is dead (signal 9, Sun Oct 25 21:57:43 2026)")).toBeNull();
     expect(deadStatus("")).toBeNull();
+  });
+
+  it("tells the session's own shim from a nested one by the pane pid (round-2 finding)", async () => {
+    const l = make();
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    const pane = tmux.sessions.get(a.launch_id)!.pid;
+    expect(l.isOwnShim(a.launch_id, [5000, pane, 1])).toBe(true); // shim -> claude -> wrapper(pane)
+    expect(l.isOwnShim(a.launch_id, [pane])).toBe(true); // no wrapper: shim -> claude(pane)
+    expect(l.isOwnShim(a.launch_id, [6000, 6001, 5000, pane])).toBe(false); // nested claude via a shell
+    expect(l.isOwnShim(a.launch_id, [6000, 5000, pane])).toBe(false); // nested claude exec'd directly
+    expect(l.isOwnShim(a.launch_id, undefined)).toBeNull();
+    expect(l.isOwnShim("mr-ffffffffffff", [1])).toBeNull();
+  });
+
+  it("presses the key again only after the screen changed or the retry delay passed (round-2 finding)", async () => {
+    const dialog = readFileSync(join(__dirname, "fixtures", "dev-channels-raw.txt"), "utf8");
+    const l = make({ keyRetryMs: 400 });
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    tmux.sessions.get(a.launch_id)!.screen = dialog;
+    await waitFor(() => tmux.keys.length === 1, "first key");
+    await sleep(250); // many ticks (10ms) on the same screen: no second key yet
+    expect(tmux.keys).toHaveLength(1);
+    await waitFor(() => tmux.keys.length === 2, "retry after the delay", 2000);
+  });
+
+  it("a stop arriving while the launch is still spawning stops what it started (round-2 finding)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const origSpawn = tmux.spawn.bind(tmux);
+    tmux.spawn = async (spec) => {
+      await gate;
+      return origSpawn(spec);
+    };
+    const l = make();
+    await l.init();
+    const launching = l.launch(alphaId(), { continue: false });
+    await sleep(20);
+    const id = l.records()[0]!.launch_id;
+    expect(l.records()[0]!.state).toBe("starting");
+    const stopping = l.stop(id);
+    const restarting = l.restart(id, false);
+    await sleep(50);
+    release();
+    expect((await launching).ok).toBe(true);
+    expect((await stopping).ok).toBe(true);
+    expect((await restarting).ok).toBe(true);
+    // Stopped first, then restarted: one tmux session, a new spawn, nothing marked failed.
+    expect(tmux.spawns).toHaveLength(2);
+    expect(rec(l, id).state).toBe("starting");
+  });
+
+  it("removes the run-claude status file of stopped and dismissed launches", async () => {
+    const runDir = join(dir, "run");
+    const l = make({ wrapper: ["/n", "/cli.js"], runDir });
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    expect(tmux.spawns[0]!.argv.slice(0, 6)).toEqual(["/n", "/cli.js", "run-claude", "--status-file", join(runDir, `${a.launch_id}.exit`), "--"]);
+    const f = join(runDir, `${a.launch_id}.exit`);
+    writeFileSync(f, JSON.stringify({ token: "old", code: 1, signal: null }));
+    await l.stop(a.launch_id);
+    expect(existsSync(f)).toBe(false);
+    writeFileSync(f, "{}");
+    await l.dismiss(a.launch_id);
+    expect(existsSync(f)).toBe(false);
+  });
+
+  it("prefers the run-claude status file (token-checked) over tmux's status", async () => {
+    const runDir = join(dir, "run");
+    const l = make({ wrapper: ["/n", "/cli.js"], runDir });
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    const token = tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN;
+    writeFileSync(join(runDir, `${a.launch_id}.exit`), JSON.stringify({ token, code: null, signal: "SIGKILL" }));
+    tmux.die(a.launch_id, null, "Killed");
+    await waitFor(() => rec(l, a.launch_id).state === "exited", "exited", 6000);
+    expect(rec(l, a.launch_id).exit_code).toBe(137);
   });
 });

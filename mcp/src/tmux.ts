@@ -29,6 +29,8 @@ export interface SpawnSpec {
 
 export interface PaneInfo {
   name: string;
+  /** pid of the pane's process (the run-claude wrapper, or claude itself); null if unknown. */
+  pid: number | null;
   dead: boolean;
   /** Exit status of a dead pane (null if unknown or killed by a signal). */
   status: number | null;
@@ -120,21 +122,23 @@ export function spawnArgs(o: TmuxOptions, spec: SpawnSpec): string[] {
   ];
 }
 
-/** tmux prints control characters such as tab as "_", so fields are separated by "|" (the last two fields are numeric). */
-export const LIST_FORMAT = "#{session_name}|#{pane_dead}|#{pane_dead_status}";
+/** tmux prints control characters such as tab as "_", so fields are separated by "|" (the last three are numeric). */
+export const LIST_FORMAT = "#{session_name}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}";
 
 export function parseList(out: string): PaneInfo[] {
   const res: PaneInfo[] = [];
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
     const parts = line.split("|");
-    if (parts.length < 3) continue;
+    if (parts.length < 4) continue;
     const status = parts.pop();
     const dead = parts.pop();
+    const pid = parts.pop();
     const name = parts.join("|");
     if (!name) continue;
     const n = status && /^-?\d+$/.test(status) ? Number(status) : null;
-    res.push({ name, dead: dead === "1", status: n });
+    const pn = pid && /^\d+$/.test(pid) ? Number(pid) : null;
+    res.push({ name, pid: pn, dead: dead === "1", status: n });
   }
   return res;
 }

@@ -23,6 +23,7 @@ import {
 import { socketPath } from "./config";
 import { LineConn } from "./ipc";
 import { log, setLogPrefix } from "./log";
+import { activation, ancestors, cmdlineOf } from "./proc";
 
 export const SERVER_NAME = "mcp-remote";
 
@@ -64,6 +65,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   const sessionId = parsedSid.data;
   // Set by the daemon for phone-launched sessions (it links this shim to the launch).
   const launchToken = process.env.MCP_REMOTE_LAUNCH_TOKEN?.slice(0, 64) || undefined;
+  const act = activation(process.env, cmdlineOf(process.ppid));
   setLogPrefix(`mcp-remote shim ${project}/${sessionId.slice(0, 8)}`);
   const sockPath = opts.socket ?? socketPath();
 
@@ -193,7 +195,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
         t: "register",
         v: PROTOCOL_VERSION,
         session: { session_id: sessionId, project: project.slice(0, 128), cwd: cwd.slice(0, 1024) },
-        ...(launchToken ? { launch_token: launchToken } : {}),
+        ...(launchToken ? { launch_token: launchToken, ancestors: ancestors(8) } : {}),
       } satisfies ShimToDaemon);
     });
     sock.on("error", () => {
@@ -223,6 +225,15 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   }
 
   function sendToPhone(text: string, urgency: Urgency): Promise<{ ok: true; id: number } | { ok: false; error: string }> {
+    if (!act.active) {
+      return Promise.resolve({
+        ok: false,
+        error:
+          "mcp-remote is inactive in this Claude Code process: it was not started with " +
+          "`--dangerously-load-development-channels server:mcp-remote` (or MCP_REMOTE_SESSION_ID / MCP_REMOTE_ACTIVATE=1), " +
+          "so it is not connected to the phone",
+      });
+    }
     if (!registered && registerRefused) {
       return Promise.resolve({ ok: false, error: `the mcp-remote daemon refused this session: ${registerRefused}` });
     }
@@ -290,7 +301,11 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
 
   // Register with the daemon only after Claude Code has initialized us, so no channel
   // notification is emitted before the client is ready to receive it.
-  server.oninitialized = () => connectDaemon();
+  // Only in a session that can actually receive channel events (see proc.ts); otherwise every `claude -p`,
+  // `claude mcp list` or flagless session would show up on the phone as a new session.
+  server.oninitialized = () => {
+    if (act.active) connectDaemon();
+  };
 
   const transport = new StdioServerTransport();
   const shutdown = () => {
@@ -306,10 +321,14 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
   await server.connect(transport);
-  log(`ready (session ${sessionId}, project ${project})`);
+  log(
+    act.active
+      ? `ready (session ${sessionId}, project ${project}; ${act.reason})`
+      : `dormant, not announcing a session: ${act.reason}. Set MCP_REMOTE_ACTIVATE=1 to override.`,
+  );
   // There is no reliable way for the server to tell whether Claude Code registered it as a
   // channel; without the flag, phone messages are dropped silently by Claude Code. Say so loudly.
-  log(
+  if (act.active) log(
     `NOTE: phone messages only reach Claude if this session was started with ` +
       `\`claude --dangerously-load-development-channels server:<name of this server in .mcp.json>\` ` +
       `(e.g. server:${SERVER_NAME}). Without it, messages are handed to Claude Code and silently dropped.`,

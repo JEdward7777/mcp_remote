@@ -58,6 +58,11 @@ type Entry = z.infer<typeof Entry> & {
   noConversation?: boolean;
   /** First time the pane was seen dead without an exit status. */
   deadSince?: number;
+  /** pid of the tmux pane's process for the current spawn (run-claude wrapper, or claude itself). */
+  panePid?: number | null;
+  /** Screen on which the dev-channels keys were last sent, and when. */
+  keysScreen?: string;
+  keysAt?: number;
 };
 const StateFile = z.object({ v: z.literal(1), launches: z.array(Entry).max(MAX_LAUNCHES_PER_MACHINE) });
 
@@ -83,6 +88,8 @@ export interface LauncherOptions {
    */
   wrapper?: string[];
   runDir?: string;
+  /** Wait before pressing the dev-channels key again on an unchanged screen (default 3s). */
+  keyRetryMs?: number;
 }
 
 function newId(): string {
@@ -242,7 +249,12 @@ export class Launcher {
       restart_at: null,
     };
     this.entries.push(e);
-    await this.spawn(e);
+    e.busy = true;
+    try {
+      await this.spawn(e);
+    } finally {
+      e.busy = false;
+    }
     return e.state === "failed" ? { ok: false, error: e.detail ?? "failed to start" } : { ok: true, launch_id: id };
   }
 
@@ -254,13 +266,16 @@ export class Launcher {
       if (e.state === "exited" && e.detail?.includes("restarting in")) this.set(e, { detail: "auto-restart cancelled" });
       return { ok: true };
     }
-    if (e.busy) return { ok: false, error: "this session is being restarted; try again in a moment" };
+    // A launch / restart / auto-restart still spawning: let it finish, then stop what it started.
+    if (!(await this.idle(e))) return { ok: false, error: "this session is busy starting; try again in a moment" };
+    if (!ACTIVE.includes(e.state)) return { ok: true };
     e.busy = true;
     try {
       await this.killAndWait(e);
     } finally {
       e.busy = false;
     }
+    this.removeExitFile(e);
     this.set(e, { state: "exited", exit_code: null, detail: "stopped from the phone" });
     return { ok: true };
   }
@@ -268,12 +283,17 @@ export class Launcher {
   async restart(id: string, cont: boolean): Promise<OpResult> {
     const e = this.get(id);
     if (!e) return { ok: false, error: "unknown launch" };
-    if (e.busy) return { ok: false, error: "this session is already being restarted" };
+    if (!(await this.idle(e))) return { ok: false, error: "this session is busy starting; try again in a moment" };
     if (!this.available || !this.tmux) return { ok: false, error: this.launchError ?? "remote launch is not available" };
     await this.reload();
     if (!this.available) return { ok: false, error: this.launchError ?? "remote launch is not available" };
     const project = findProject(this.cfg, e.project_id);
     if (!project) return { ok: false, error: "this project is no longer in the computer's allowlist" };
+    if (!ACTIVE.includes(e.state) && this.activeCount() >= this.cfg.max_sessions) {
+      return { ok: false, error: `this computer already runs ${this.activeCount()} launched sessions (max ${this.cfg.max_sessions})` };
+    }
+    // A stop may have claimed it while we reloaded: wait for it, then claim it ourselves (no await between).
+    if (!(await this.idle(e))) return { ok: false, error: "this session is busy starting; try again in a moment" };
     if (!ACTIVE.includes(e.state) && this.activeCount() >= this.cfg.max_sessions) {
       return { ok: false, error: `this computer already runs ${this.activeCount()} launched sessions (max ${this.cfg.max_sessions})` };
     }
@@ -295,8 +315,9 @@ export class Launcher {
   async dismiss(id: string): Promise<OpResult> {
     const e = this.get(id);
     if (!e) return { ok: true };
-    if (ACTIVE.includes(e.state)) return { ok: false, error: "stop the session before removing it" };
+    if (ACTIVE.includes(e.state) || e.busy) return { ok: false, error: "stop the session before removing it" };
     this.cancelRestart(e);
+    this.removeExitFile(e);
     this.entries = this.entries.filter((x) => x !== e);
     this.changed();
     return { ok: true };
@@ -327,6 +348,35 @@ export class Launcher {
 
   // -------------------------------------------------------------------------
   // Internals
+
+  /** Wait (bounded) until no spawn/stop is in progress for this launch. */
+  private async idle(e: Entry, timeoutMs = 20_000): Promise<boolean> {
+    const end = Date.now() + timeoutMs;
+    while (e.busy && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    return !e.busy;
+  }
+
+  private removeExitFile(e: Entry): void {
+    if (!this.o.wrapper) return;
+    try {
+      rmSync(this.statusFile(e), { force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
+   * Is a shim with these ancestor pids the one started by the Claude Code running in this launch's tmux
+   * pane? That shim's parent is that Claude Code, whose parent is the pane process (the run-claude wrapper),
+   * or the pane process itself without the wrapper. A `claude` started inside the session (Bash tool, hook)
+   * sits deeper. null: can't tell (no pid info), callers fall back to the token rules.
+   */
+  isOwnShim(sessionId: string, ancestors: number[] | undefined): boolean | null {
+    const e = this.get(sessionId);
+    if (!e || !e.panePid || !ancestors?.length) return null;
+    const i = ancestors.indexOf(e.panePid);
+    return i === 0 || i === 1;
+  }
 
   private get(id: string): Entry | undefined {
     return this.entries.find((e) => e.launch_id === id);
@@ -407,6 +457,8 @@ export class Launcher {
     e.stopping = false;
     e.dialogTries = 0;
     e.lastDialog = null;
+    e.keysScreen = undefined;
+    e.keysAt = undefined;
     e.noConversation = false;
     e.spawned_at = Date.now();
     if (typeof argv === "string") {
@@ -429,6 +481,7 @@ export class Launcher {
       this.set(e, { state: "failed", detail: `tmux could not start the session: ${msg}`, exit_code: null });
       return;
     }
+    e.panePid = (await tmux.list().catch(() => [])).find((x) => x.name === e.launch_id)?.pid ?? null;
     log(`launched ${e.project} as ${e.launch_id}${e.continued ? " (--continue)" : ""}`);
     this.set(e, { state: "starting", detail: null, exit_code: null });
     this.startStartup(e);
@@ -490,8 +543,13 @@ export class Launcher {
     }
     const key = JSON.stringify(d);
     if (autoAcceptable(d, this.cfg.server_name) && (e.dialogTries ?? 0) < 3) {
+      // Claude Code may not have reacted to the last key yet (slow machine): only press again once the
+      // screen changed from the one we pressed on, or after 3s, so no stray "1" lands in the REPL.
+      if (e.keysScreen === screen && Date.now() - (e.keysAt ?? 0) < (this.o.keyRetryMs ?? 3000)) return;
       e.dialogTries = (e.dialogTries ?? 0) + 1;
       e.lastDialog = key;
+      e.keysScreen = screen;
+      e.keysAt = Date.now();
       log(`${e.launch_id}: accepting the development-channels warning for server:${this.cfg.server_name}`);
       await tmux.sendKeys(e.launch_id, DEV_CHANNELS_KEYS).catch((err) => log("send-keys failed:", err));
       return;
@@ -648,9 +706,15 @@ export class Launcher {
       this.set(e, { state: "failed", detail: "auto-restart skipped: this project is no longer in the computer's allowlist" });
       return;
     }
+    if (e.busy) return; // a phone restart/stop took over
     e.path = project.path;
     e.project = project.name;
-    await this.spawn(e);
+    e.busy = true;
+    try {
+      await this.spawn(e);
+    } finally {
+      e.busy = false;
+    }
   }
 
   private async readopt(): Promise<void> {
@@ -678,6 +742,7 @@ export class Launcher {
       log(`re-adopting ${e.launch_id} (${e.project})`);
       e.spawned_at = Date.now();
       e.fresh = false;
+      e.panePid = p.pid;
       this.set(e, { state: "starting", detail: "re-adopted after a daemon restart; waiting for its shim to reconnect" });
       this.startStartup(e);
     }
@@ -713,6 +778,7 @@ export class Launcher {
         ever_running: true,
         restart_at: null,
         fresh: false,
+        panePid: p.pid,
       };
       this.entries.push(e);
       this.startStartup(e);

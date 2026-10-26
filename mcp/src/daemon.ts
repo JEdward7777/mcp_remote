@@ -175,6 +175,19 @@ export class Daemon {
             conn.close();
             return;
           }
+          if (f.launch_token && this.launcher?.isOwnShim(f.session.session_id, f.ancestors) === false) {
+            // Right token, wrong process: not the shim of the Claude Code in the session's tmux pane but one
+            // further down (a claude started inside the session). Refused even when the real shim isn't
+            // connected yet (e.g. right after a daemon restart), so it can't win that race.
+            conn.send({
+              t: "register_refused",
+              error:
+                `session "${f.session.session_id}" belongs to the Claude Code in its tmux pane; this process inherited its ` +
+                "MCP_REMOTE_SESSION_ID and MCP_REMOTE_LAUNCH_TOKEN (a claude started inside a phone-launched session?)",
+            } satisfies DaemonToShim);
+            conn.close();
+            return;
+          }
           const link = this.launcher?.shimRegister(f.session.session_id, f.launch_token) ?? "none";
           if (link === "reject") {
             conn.send({

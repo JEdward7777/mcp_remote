@@ -2,7 +2,8 @@
 import type { PaneInfo, SpawnSpec, TmuxDriver } from "../src/tmux";
 
 export class FakeTmux implements TmuxDriver {
-  sessions = new Map<string, { spec: SpawnSpec; dead: boolean; status: number | null; screen: string; history: string }>();
+  sessions = new Map<string, { spec: SpawnSpec; pid: number; dead: boolean; status: number | null; screen: string; history: string }>();
+  nextPid = 1000;
   spawns: SpawnSpec[] = [];
   keys: { name: string; keys: string[] }[] = [];
   /** Called after send-keys, to emulate the dialog going away. */
@@ -11,10 +12,10 @@ export class FakeTmux implements TmuxDriver {
   async spawn(spec: SpawnSpec) {
     if (this.sessions.has(spec.name)) throw Object.assign(new Error("duplicate session"), { stderr: `duplicate session: ${spec.name}` });
     this.spawns.push(spec);
-    this.sessions.set(spec.name, { spec, dead: false, status: null, screen: "", history: "" });
+    this.sessions.set(spec.name, { spec, pid: this.nextPid++, dead: false, status: null, screen: "", history: "" });
   }
   async list(): Promise<PaneInfo[]> {
-    return [...this.sessions.entries()].map(([name, s]) => ({ name, dead: s.dead, status: s.status }));
+    return [...this.sessions.entries()].map(([name, s]) => ({ name, pid: s.pid, dead: s.dead, status: s.status }));
   }
   async capture(name: string, history?: number) {
     const s = this.sessions.get(name);
