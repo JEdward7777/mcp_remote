@@ -245,14 +245,18 @@ Needs **tmux 3.2+** on the computer (`tmux -V`; `apt install tmux` / `brew insta
    - **Development channels warning**: shown on every start; the daemon answers it (it sends `1`) only when it is
      the expected warning listing exactly `server:mcp-remote`. Nothing else is ever answered automatically.
 
-On the phone, each computer has a **Start session** picker (with "resume last conversation" = `--continue`, the
-folder's most recent conversation, and
+On the phone, each computer has a **Start session** picker (with "resume last conversation": the folder's most
+recent conversation, continued as a fork under a new id the daemon picks, `--continue --fork-session --session-id <uuid>`,
+so later resumes reopen exactly that fork; and
 "auto-restart on crash"). A launched session shows its state: *starting*, *running*, **needs you at the desk**
 (with what to do, e.g. a trust prompt), *exited* (with the exit code and Claude Code's last line) or *failed*.
 Buttons: **Stop**, **Restart** (new conversation), **Restart + resume** (this launch's own conversation:
 each fresh start passes `--session-id <uuid>` and resuming passes `--resume <uuid>`, so another session's
-conversation in the same folder is never picked; launches started with `--continue`, or recorded by an older
-version, resume with `--continue`), and **Remove** for ended ones. Launched sessions
+conversation in the same folder is never picked; launches recorded by an older version resume like "resume last
+conversation" once and are exact from then on), and **Remove** for ended ones. Limit: if you run `/clear` in a
+launched session at the desk, Claude Code continues under a new conversation id the daemon doesn't know, so a
+later **Restart + resume** reopens the conversation from before `/clear` (use **Restart** for a fresh one).
+`--continue`, `-c`, `--resume`, `-r`, `--session-id` and `--fork-session` are refused in `extra-args` for that reason. Launched sessions
 appear in the session list like any other (badge "launched") and keep their thread across restarts.
 
 At the desk, `mcp-remote attach mr-<id>` opens a launched session's terminal (detach with `Ctrl-b d`); they run on
@@ -280,6 +284,8 @@ exit) with growing delays, resuming the conversation, and gives up after 5 crash
   conversation yet (Claude Code only saves it after the first message); use **Restart** instead of **Restart + resume**.
 - A launched session that never comes up although Claude Code runs: the detail line shows if the daemon refused
   its shim (daemon log: `refused shim for mr-...`). `claude` behind wrappers (Volta, npm's wrapper, scripts) is fine.
+  Register the shim with `mcp-remote setup-claude` (absolute node + CLI paths); an `npx`-style registration or a
+  hook that runs `claude` itself at session start can make the daemon take the wrong process for the session's shim.
 - "remote launch is not available": the phone shows why (no tmux, tmux older than 3.2, invalid launch.json, Windows).
 - Worker logs: `cd worker && npx wrangler tail`.
 

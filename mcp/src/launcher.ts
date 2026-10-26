@@ -73,6 +73,8 @@ type Entry = z.infer<typeof Entry> & {
   keysAt?: number;
   /** Why the daemon last refused a shim presenting this launch's token. */
   lastRefusal?: string;
+  /** Current spawn resumes the folder's last conversation forked under a new id (--continue --fork-session). */
+  forking?: boolean;
 };
 const StateFile = z.object({ v: z.literal(1), launches: z.array(Entry).max(MAX_LAUNCHES_PER_MACHINE) });
 
@@ -452,8 +454,10 @@ export class Launcher {
     if (!bin) return "the claude command was not found on the daemon's PATH (set it: mcp-remote config set claude-path /path/to/claude)";
     const argv = [bin, "--dangerously-load-development-channels", `server:${this.cfg.server_name}`];
     if (this.cfg.permission_mode) argv.push("--permission-mode", this.cfg.permission_mode);
-    if (e.continued) argv.push(...(e.claude_session ? ["--resume", e.claude_session] : ["--continue"]));
-    else if (e.claude_session) argv.push("--session-id", e.claude_session);
+    // (claude_session is set by spawn() before this is called; see there.)
+    if (e.continued && !e.forking) argv.push("--resume", e.claude_session!);
+    else if (e.continued) argv.push("--continue", "--fork-session", "--session-id", e.claude_session!);
+    else argv.push("--session-id", e.claude_session!);
     argv.push(...this.cfg.extra_args);
     return argv;
   }
@@ -480,7 +484,14 @@ export class Launcher {
     // Count as active right away, so concurrent launch/restart requests see it against max_sessions.
     e.state = "starting";
     // A fresh start gets its own conversation id; resuming keeps the one it has.
-    if (!e.continued) e.claude_session = randomUUID();
+    // Every spawn knows its conversation id, so a later resume reopens exactly this one:
+    //  - fresh: a new id (--session-id);
+    //  - resume with a known id: --resume <id>;
+    //  - resume without one ("resume last conversation", or state from an older version): the folder's
+    //    last conversation, forked under a new id we choose (2.1.310 requires --fork-session whenever
+    //    --session-id is combined with --continue/--resume).
+    e.forking = e.continued && !e.claude_session;
+    if (!e.continued || e.forking) e.claude_session = randomUUID();
     e.shim_parent = null;
     e.lastRefusal = undefined;
     let argv = this.claudeArgv(e);
@@ -526,7 +537,7 @@ export class Launcher {
       return;
     }
     e.panePid = (await tmux.list().catch(() => [])).find((x) => x.name === e.launch_id)?.pid ?? null;
-    log(`launched ${e.project} as ${e.launch_id}${e.continued ? (e.claude_session ? ` (--resume ${e.claude_session})` : " (--continue)") : ""}`);
+    log(`launched ${e.project} as ${e.launch_id}${e.continued ? (e.forking ? ` (--continue, forked as ${e.claude_session})` : ` (--resume ${e.claude_session})`) : ""}`);
     this.set(e, { state: "starting", detail: null, exit_code: null });
     this.startStartup(e);
   }
@@ -689,7 +700,7 @@ export class Launcher {
     let detail: string | null;
     if (NO_CONVERSATION.test(screen)) {
       e.noConversation = true;
-      detail = e.claude_session
+      detail = !e.forking
         ? "No conversation to resume for this session yet (nothing was said in it); restart without resume"
         : "No earlier conversation in this folder to continue; restart without resume";
     } else if (/cannot be used with root\/sudo/.test(screen)) {

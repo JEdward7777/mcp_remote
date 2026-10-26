@@ -76,6 +76,8 @@ export class Daemon {
   private openedAt = 0;
   private server: Server | null = null;
   private stopped = false;
+  /** Resolves once launches are loaded; shim frames are handled only after it. */
+  private ready: Promise<void> = Promise.resolve();
   readonly socket: string;
   readonly launcher: Launcher | null;
 
@@ -94,10 +96,17 @@ export class Daemon {
   }
 
   async start(): Promise<void> {
-    // Load and re-adopt launches before shims can connect, so a launched shim reconnecting right after a
-    // daemon restart is linked to its launch instead of being taken for an ordinary session.
-    if (this.launcher) await this.launcher.init();
+    // Bind first: listen() refuses to start if another daemon is live, before anything touches tmux or
+    // launches.json. Shim frames that arrive while launches are still being loaded and re-adopted wait
+    // (see onShim), so a launched shim reconnecting right after a restart is still linked to its launch.
+    let ready!: () => void;
+    this.ready = new Promise<void>((r) => (ready = r));
     await this.listen();
+    try {
+      if (this.launcher) await this.launcher.init();
+    } finally {
+      ready();
+    }
     this.connectHub();
   }
 
@@ -160,94 +169,96 @@ export class Daemon {
     const conn: LineConn<ShimToDaemon> = new LineConn(
       sock,
       ShimToDaemon,
-      (f) => {
-        if (f.t === "register") {
-          if (sessionId) return conn.send({ t: "error", error: "already registered" } satisfies DaemonToShim);
-          const sid = f.session.session_id;
-          const refuse = (error: string) => {
-            log(`refused shim for ${sid}: ${error}`);
-            if (f.launch_token) this.launcher?.noteRefusal(sid, error);
-            conn.send({ t: "register_refused", error } satisfies DaemonToShim);
-            conn.close();
-          };
-          const prior = this.shims.get(sid);
-          if (prior && f.launch_token && prior.token === f.launch_token) {
-            // Same spawn's token while its shim is connected: a second process inherited the session's
-            // environment (e.g. `claude` run from a Bash tool or hook inside the launched session). The
-            // connected shim stays; only a newer spawn (different, current token) may replace it.
-            return refuse(
-              `session "${sid}" is already connected; this process inherited its MCP_REMOTE_SESSION_ID ` +
-                "and MCP_REMOTE_LAUNCH_TOKEN (a claude started inside a phone-launched session?)",
-            );
-          }
-          if (f.launch_token && this.launcher?.isOwnShim(sid, f.ancestors) === false) {
-            // Right token, wrong process (see Launcher.isOwnShim): not from this session's tmux pane, or a
-            // claude started inside the session while its own shim is away (e.g. right after a daemon restart).
-            return refuse(
-              `session "${sid}" belongs to the Claude Code in its tmux pane; this process is not that Claude Code's ` +
-                "shim (a claude started inside a phone-launched session?)",
-            );
-          }
-          const link = this.launcher?.shimRegister(sid, f.launch_token, f.ancestors) ?? "none";
-          if (link === "reject") {
-            return refuse(`session id "${sid}" belongs to a phone-launched session; only the shim that session starts can use it`);
-          }
-          const existing = this.shims.get(sid);
-          if (existing && link === "linked") {
-            // A previous spawn's shim that hasn't gone away yet: the current spawn wins.
-            existing.conn.send({ t: "register_refused", error: "superseded by a restarted session" } satisfies DaemonToShim);
-            this.shims.delete(sid);
-            existing.conn.close();
-          } else if (existing) {
-            return refuse(
-              `another live session on this computer already uses session id "${sid}" ` +
-                "(MCP_REMOTE_SESSION_ID?). Only one session can use an id at a time; give each project its own id or unset it",
-            );
-          }
-          if (this.shims.size >= MAX_SESSIONS_PER_MACHINE) {
-            if (link === "linked") this.launcher?.shimDown(sid);
-            return refuse(`too many live sessions on this computer (max ${MAX_SESSIONS_PER_MACHINE})`);
-          }
-          sessionId = f.session.session_id;
-          this.shims.set(sessionId, { conn, session: f.session, refused: null, launched: link === "linked", token: f.launch_token });
-          log(`shim up: ${f.session.project} (${sessionId})`);
-          conn.send({ t: "registered", hub_connected: this.hubReady } satisfies DaemonToShim);
-          this.toHub({ t: "session_up", session: f.session });
-          return;
-        }
-        if (f.t === "reload") {
-          void this.reloadLaunchConfig().then((err) =>
-            conn.send({ t: "reloaded", ok: !err, ...(err ? { error: err } : {}) } satisfies DaemonToShim),
-          );
-          return;
-        }
-        if (!sessionId) return conn.send({ t: "error", error: "register first" } satisfies DaemonToShim);
-        if (f.t === "send") {
-          if (!this.hubReady) {
-            conn.send({ t: "send_error", req_id: f.req_id, error: "daemon is not connected to the server right now" } satisfies DaemonToShim);
-            return;
-          }
-          const refused = this.shims.get(sessionId)?.refused;
-          if (refused) {
-            conn.send({ t: "send_error", req_id: f.req_id, error: `the server refused this session: ${refused}` } satisfies DaemonToShim);
-            return;
-          }
-          const hubReq = `r${++this.reqSeq}`;
-          const timer = setTimeout(() => {
-            if (this.pending.delete(hubReq)) {
-              conn.send({ t: "send_error", req_id: f.req_id, error: "timed out waiting for the server" } satisfies DaemonToShim);
-            }
-          }, SEND_TIMEOUT_MS);
-          this.pending.set(hubReq, { shim: conn, shimReqId: f.req_id, timer });
-          this.toHub({ t: "send", req_id: hubReq, session_id: sessionId, text: f.text, urgency: f.urgency });
-          return;
-        }
-        if (f.t === "ack") {
-          this.toHub({ t: "ack", session_id: sessionId, ids: f.ids });
-        }
-      },
+      // Frames queue (in order) behind the launcher's init; one from a shim that has gone meanwhile is dropped.
+      (f) => void this.ready.then(() => !sock.destroyed && handle(f)),
       (error) => conn.send({ t: "error", error } satisfies DaemonToShim),
     );
+    const handle = (f: ShimToDaemon): unknown => {
+      if (f.t === "register") {
+        if (sessionId) return conn.send({ t: "error", error: "already registered" } satisfies DaemonToShim);
+        const sid = f.session.session_id;
+        const refuse = (error: string) => {
+          log(`refused shim for ${sid}: ${error}`);
+          if (f.launch_token) this.launcher?.noteRefusal(sid, error);
+          conn.send({ t: "register_refused", error } satisfies DaemonToShim);
+          conn.close();
+        };
+        const prior = this.shims.get(sid);
+        if (prior && f.launch_token && prior.token === f.launch_token) {
+          // Same spawn's token while its shim is connected: a second process inherited the session's
+          // environment (e.g. `claude` run from a Bash tool or hook inside the launched session). The
+          // connected shim stays; only a newer spawn (different, current token) may replace it.
+          return refuse(
+            `session "${sid}" is already connected; this process inherited its MCP_REMOTE_SESSION_ID ` +
+              "and MCP_REMOTE_LAUNCH_TOKEN (a claude started inside a phone-launched session?)",
+          );
+        }
+        if (f.launch_token && this.launcher?.isOwnShim(sid, f.ancestors) === false) {
+          // Right token, wrong process (see Launcher.isOwnShim): not from this session's tmux pane, or a
+          // claude started inside the session while its own shim is away (e.g. right after a daemon restart).
+          return refuse(
+            `session "${sid}" belongs to the Claude Code in its tmux pane; this process is not that Claude Code's ` +
+              "shim (a claude started inside a phone-launched session?)",
+          );
+        }
+        const link = this.launcher?.shimRegister(sid, f.launch_token, f.ancestors) ?? "none";
+        if (link === "reject") {
+          return refuse(`session id "${sid}" belongs to a phone-launched session; only the shim that session starts can use it`);
+        }
+        const existing = this.shims.get(sid);
+        if (existing && link === "linked") {
+          // A previous spawn's shim that hasn't gone away yet: the current spawn wins.
+          existing.conn.send({ t: "register_refused", error: "superseded by a restarted session" } satisfies DaemonToShim);
+          this.shims.delete(sid);
+          existing.conn.close();
+        } else if (existing) {
+          return refuse(
+            `another live session on this computer already uses session id "${sid}" ` +
+              "(MCP_REMOTE_SESSION_ID?). Only one session can use an id at a time; give each project its own id or unset it",
+          );
+        }
+        if (this.shims.size >= MAX_SESSIONS_PER_MACHINE) {
+          if (link === "linked") this.launcher?.shimDown(sid);
+          return refuse(`too many live sessions on this computer (max ${MAX_SESSIONS_PER_MACHINE})`);
+        }
+        sessionId = f.session.session_id;
+        this.shims.set(sessionId, { conn, session: f.session, refused: null, launched: link === "linked", token: f.launch_token });
+        log(`shim up: ${f.session.project} (${sessionId})`);
+        conn.send({ t: "registered", hub_connected: this.hubReady } satisfies DaemonToShim);
+        this.toHub({ t: "session_up", session: f.session });
+        return;
+      }
+      if (f.t === "reload") {
+        void this.reloadLaunchConfig().then((err) =>
+          conn.send({ t: "reloaded", ok: !err, ...(err ? { error: err } : {}) } satisfies DaemonToShim),
+        );
+        return;
+      }
+      if (!sessionId) return conn.send({ t: "error", error: "register first" } satisfies DaemonToShim);
+      if (f.t === "send") {
+        if (!this.hubReady) {
+          conn.send({ t: "send_error", req_id: f.req_id, error: "daemon is not connected to the server right now" } satisfies DaemonToShim);
+          return;
+        }
+        const refused = this.shims.get(sessionId)?.refused;
+        if (refused) {
+          conn.send({ t: "send_error", req_id: f.req_id, error: `the server refused this session: ${refused}` } satisfies DaemonToShim);
+          return;
+        }
+        const hubReq = `r${++this.reqSeq}`;
+        const timer = setTimeout(() => {
+          if (this.pending.delete(hubReq)) {
+            conn.send({ t: "send_error", req_id: f.req_id, error: "timed out waiting for the server" } satisfies DaemonToShim);
+          }
+        }, SEND_TIMEOUT_MS);
+        this.pending.set(hubReq, { shim: conn, shimReqId: f.req_id, timer });
+        this.toHub({ t: "send", req_id: hubReq, session_id: sessionId, text: f.text, urgency: f.urgency });
+        return;
+      }
+      if (f.t === "ack") {
+        this.toHub({ t: "ack", session_id: sessionId, ids: f.ids });
+      }
+    };
     sock.on("error", () => {});
     sock.on("close", () => {
       for (const [k, p] of this.pending) {

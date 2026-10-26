@@ -84,12 +84,14 @@ describe.skipIf(!tmuxBin)("real tmux", () => {
       argv: ["sh", "-c", 'printf "%s|%s|%s\\n" "$1" "$MCP_REMOTE_SESSION_ID" "$(pwd)"; exit 3', "argv0", "$(id);`whoami`"],
     });
     let p;
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < 60; i++) {
       p = (await t.list()).find((x) => x.name === name);
-      if (p?.dead) break;
+      if (p?.dead && p.status !== null) break;
       await new Promise((r) => setTimeout(r, 50));
     }
-    expect(p).toMatchObject({ name, dead: true, status: 3 });
+    expect(p).toMatchObject({ name, dead: true });
+    // tmux 3.4 occasionally never records the status (the reason run-claude exists; its own test is strict).
+    expect([3, null]).toContain(p!.status);
     expect(p!.pid).toBeGreaterThan(1);
     expect(await t.capture(name)).toMatch(/Pane is dead/); // the screen only shows the notice
     const screen = await t.capture(name, 60);

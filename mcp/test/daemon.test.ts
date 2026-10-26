@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket as WsSocket } from "ws";
 import { DaemonToShim } from "@mcp-remote/shared";
-import { mkdirSync, realpathSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { Daemon } from "../src/daemon";
 import { LineConn } from "../src/ipc";
 import { LaunchConfig, projectIdFor } from "../src/launch-config";
@@ -419,5 +419,28 @@ describe("daemon remote launch", () => {
     await waitFor(() => frames.find((f) => f.t === "registered"), "registered", 5000);
     await starting;
     expect(daemon.launcher!.records().find((x) => x.launch_id === id)?.state).toBe("running");
+  });
+
+  it("a second daemon refuses to start before touching tmux or launches.json (round-4 finding)", async () => {
+    const { tmux, alpha } = await setup();
+    hub({ t: "launch", req_id: "z1", project_id: alpha, continue: false });
+    await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "z1" && f.ok), "launch ok");
+    const id = tmux.spawns[0]!.name;
+    const statePath = daemon!.launcher!.statePath;
+    const before = readFileSync(statePath, "utf8");
+    const calls: string[] = [];
+    const spy = new FakeTmux();
+    spy.version = async () => (calls.push("version"), "tmux 3.4");
+    spy.list = async () => (calls.push("list"), tmux.list());
+    spy.kill = async (n: string) => (calls.push(`kill ${n}`), tmux.kill(n));
+    const second = new Daemon({
+      config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
+      socket: join(dir, "d.sock"),
+      launcher: { loadConfig: () => LaunchConfig.parse({}), tmux: spy, statePath },
+    });
+    await expect(second.start()).rejects.toThrow(/already listening/);
+    expect(calls).toEqual([]);
+    expect(readFileSync(statePath, "utf8")).toBe(before);
+    expect(tmux.sessions.has(id)).toBe(true);
   });
 });

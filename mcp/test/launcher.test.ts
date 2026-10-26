@@ -185,8 +185,12 @@ describe("launcher", () => {
     const l = make();
     await l.init();
     const a = (await l.launch(alphaId(), { continue: true })) as { launch_id: string };
-    // "Resume last conversation" on a brand-new launch: the folder's last one (id unknown yet).
-    expect(tmux.spawns[0]!.argv).toContain("--continue");
+    // "Resume last conversation" on a brand-new launch: the folder's last one, forked under an id we pick
+    // (2.1.310 requires --fork-session with --session-id + --continue), so later resumes are exact.
+    const a0 = tmux.spawns[0]!.argv;
+    const i0 = a0.indexOf("--continue");
+    expect(a0.slice(i0, i0 + 3)).toEqual(["--continue", "--fork-session", "--session-id"]);
+    expect(a0[i0 + 3]).toMatch(/^[0-9a-f-]{36}$/);
     tmux.die(a.launch_id, 1, "No conversation found to continue");
     await waitFor(() => rec(l, a.launch_id).state === "exited", "exited");
     expect(rec(l, a.launch_id)).toMatchObject({ exit_code: 1, detail: expect.stringMatching(/restart without resume/) });
@@ -430,7 +434,7 @@ describe("launcher", () => {
     expect(rec(l, a.launch_id).detail).toMatch(/daemon refused it: not that Claude Code's shim/);
   });
 
-  it("falls back to --continue for launches recorded before conversation ids existed", async () => {
+  it("forks the folder's last conversation under a new id for launches recorded before conversation ids existed", async () => {
     const l1 = make();
     await l1.init();
     const a = (await l1.launch(alphaId(), { continue: false })) as { launch_id: string };
@@ -443,8 +447,16 @@ describe("launcher", () => {
     const l2 = make();
     await l2.init();
     await l2.restart(a.launch_id, true);
-    expect(tmux.spawns.at(-1)!.argv).toContain("--continue");
-    expect(tmux.spawns.at(-1)!.argv).not.toContain("--resume");
+    const last = tmux.spawns.at(-1)!.argv;
+    expect(last).toContain("--continue");
+    expect(last).toContain("--fork-session");
+    expect(last).not.toContain("--resume");
+    const forked = last[last.indexOf("--session-id") + 1];
+    // ...and from then on it resumes exactly that id.
+    await l2.restart(a.launch_id, true);
+    const again = tmux.spawns.at(-1)!.argv;
+    expect(again[again.indexOf("--resume") + 1]).toBe(forked);
+    expect(again).not.toContain("--continue");
   });
 
   it("presses the key again only after the screen changed or the retry delay passed (round-2 finding)", async () => {

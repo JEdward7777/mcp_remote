@@ -26,13 +26,27 @@ export const PERMISSION_MODE_HELP: Record<PermissionMode, string> = {
   bypassPermissions: "no permission checks at all; isolated machines only. Refused when running as root",
 };
 
+/** Conversation-selection flags the launcher sets itself; extra args may not override them. */
+export const RESERVED_ARGS = ["--continue", "-c", "--resume", "-r", "--session-id", "--fork-session"];
+
 /** One extra CLI argument. Validated so it can never be read as a tmux command separator. */
 const ExtraArg = z
   .string()
   .min(1)
   .max(512)
   .refine((a) => !a.endsWith(";"), "an argument may not end with ';' (tmux would read it as a command separator)")
-  .refine((a) => !/[\0\n\r]/.test(a), "no control characters");
+  .refine((a) => !/[\0\n\r]/.test(a), "no control characters")
+  .superRefine((a, ctx) => {
+    const hit = RESERVED_ARGS.find((r) => a === r || a.startsWith(`${r}=`));
+    if (hit) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          `${hit} is managed by mcp-remote (it picks --session-id / --resume / --continue per launch from the ` +
+          "phone's resume option); remove it from extra-args",
+      });
+    }
+  });
 
 export const ProjectEntry = z.object({ path: z.string().min(1).max(1024), name: z.string().min(1).max(128).optional() });
 
@@ -88,7 +102,12 @@ export function loadLaunchConfig(): LaunchConfig {
 export function saveLaunchConfig(cfg: LaunchConfig): string {
   ensureConfigDir();
   const path = launchConfigPath();
-  const valid = LaunchConfig.parse(cfg);
+  const r = LaunchConfig.safeParse(cfg);
+  if (!r.success) {
+    const i = r.error.issues[0];
+    throw new Error(`${i?.path.join(".") || "launch settings"}: ${i?.message ?? "invalid"}`);
+  }
+  const valid = r.data;
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(valid, null, 2) + "\n", { mode: 0o600 });
   if (process.platform !== "win32") chmodSync(tmp, 0o600);

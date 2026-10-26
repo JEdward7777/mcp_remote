@@ -38,8 +38,11 @@ export function runClaude(args: string[]): void {
   // to our process group (we are its leader: tmux starts the pane with setsid), so claude gets it even when
   // it sits behind a non-exec wrapper (Volta, npm's cli-wrapper, a shell script). We receive our own copy
   // too and ignore it; stay alive until claude has exited so its status is recorded.
+  // Keyboard SIGINT/SIGQUIT (Ctrl-C, Ctrl-\ when not in raw mode) already reach the whole foreground group
+  // from the terminal: just survive them, don't forward (that would deliver them twice).
+  for (const sig of ["SIGINT", "SIGQUIT"] as const) process.on(sig, () => {});
   const echoes: Record<string, number> = {};
-  for (const sig of ["SIGHUP", "SIGINT", "SIGTERM", "SIGQUIT"] as const) {
+  for (const sig of ["SIGHUP", "SIGTERM"] as const) {
     process.on(sig, () => {
       if (echoes[sig]) {
         echoes[sig]--;
