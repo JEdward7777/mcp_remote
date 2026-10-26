@@ -1,11 +1,14 @@
 # Phases
 
 ## To do
-- [ ] Phase 0: Settle open design questions (in progress, see sessions/ and DECISIONS.md)
-- [ ] Phase 4b (in progress): Onboarding (sign-up cap/waitlist, invite links, one-line daemon install) + /admin usage alerts (D12, D13)
-- [ ] Phase 5: Codex backend (nice-to-have)
+- [ ] Phase 5: Codex backend (nice-to-have; awaiting go-ahead)
+- [ ] Desk session: deploy + work through harness/SETUP.md "verify at the desk" checklist (needs the user)
 
 ## Completed
+- [x] Phase 4b: Sign-up gating (cap/waitlist/invites), Registry DO (metadata + counters only), global guard,
+      owner /admin with audit log, owner alerts, signed-in one-line install (D12, D13). Ratchet: 1 review round
+      (2 minor), fixes verified by orchestrator. Final: 333/333 tests, e2e 139/139.
+- [x] Phase 0: Design interview (D1-D20), extended by build decisions D21-D25.
 - [x] Phase 4: PWA icons/manifest/service worker, Web Push from the Worker (RFC 8291/8292) with urgency mapping
       and per-device suppression, consented on-demand location, map links (D11, D14, D17, D19). Ratchet: 2 review
       rounds (major fixed: location leaked to any session on deny); round-2 fixes verified by orchestrator.

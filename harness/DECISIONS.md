@@ -91,3 +91,9 @@
   needs the user's tap for that session's request (random token per request in loc_req), only `ok` results carry a
   position, a session may reuse only its own last share within max_age_s, last-known kept 6 h, off = deleted.
   Only Google Maps (normalised paths) and geo: links are tappable.
+- D25 (accepted, made during Phase 4b build) Onboarding/monitoring: single Registry SQLite DO (not D1) holding only
+  account metadata, per-day counters, invites and an audit log; sign-up precedence owner > disabled > allowlist >
+  registered > invite > waitlist/deny > OPEN_SIGNUP (false | waitlist | true capped by USER_CAP); cookie carries
+  adm (env | reg); Hubs report every 15 min (charged to tenant); guard pauses auto-approval at 80% and lowers free
+  share to 5% at 90% for the UTC day; owner alerts at 50%/80%; signed-in pairing with 16-char codes bypasses the
+  anonymous global cap; mcp-remote tarball served from /dl with sha256, no pipe-to-shell.
