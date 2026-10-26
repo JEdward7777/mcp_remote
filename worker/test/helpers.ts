@@ -90,5 +90,6 @@ export async function setLimits(user: string, patch: Record<string, unknown>): P
 /** Volume tests below predate Phase 3's per-tenant limits: lift them for that tenant's Hub only. */
 export async function relaxLimits(user: string): Promise<void> {
   const big = { burst: 1e6, per: 1e6, perMs: 1000 };
-  await setLimits(user, { phone_send: big, agent_send: big, history: big, phone_frames: big, daemon_frames: big, daily_messages: 1e9 });
+  const daily = { do_requests: 1e9, rows_read: 1e9, rows_written: 1e9 };
+  await setLimits(user, { phone_send: big, agent_send: big, history: big, phone_frames: big, daemon_frames: big, daily_messages: 1e9, daily });
 }

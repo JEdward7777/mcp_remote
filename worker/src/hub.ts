@@ -90,6 +90,9 @@ type MessageRow = {
   delivered: number;
 };
 
+/** History rows deleted per event for removed sessions (bounds what one frame can write). */
+export const GC_BATCH = 200;
+
 /** With no socket open, refused calls write their counts at most this often. */
 const NO_SOCKET_REFUSAL_FLUSH_MS = 10_000;
 
@@ -134,6 +137,10 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(session_id, direction, delivered);
 CREATE INDEX IF NOT EXISTS messages_dir ON messages(session_id, direction, id);
+-- Sessions removed (forget / eviction) whose history is still being deleted in bounded batches.
+-- While an id is listed here it can't be used again, so leftover rows never show up in a new session.
+-- except_machine: the daemon not to resync when done (the one whose eviction removed it; '' = resync all).
+CREATE TABLE IF NOT EXISTS gc (session_id TEXT PRIMARY KEY, except_machine TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
 ${USAGE_SCHEMA}`;
 
 /** Max messages per deliver frame (keeps the daemon's ack under DO SQLite's bound-parameter cap too). */
@@ -219,6 +226,12 @@ export class Hub extends DurableObject<Env> {
   private woke = false;
   /** Set by upgrade() when it accepted a socket (that socket then carries the snapshot). */
   private accepted = false;
+  /** The drained blocked-connect bucket was written this wake (see onSocketClosedState). */
+  private blockedSnapSaved = false;
+  /** Some removed session still has history rows to delete (checked once per wake). */
+  private gcPending = false;
+  /** Set by upgrade() when it refused a daemon's credentials (401/403). */
+  private credentialRefused = false;
   /** Last usage flush done for a refused call while no socket was open. */
   private lastLooseFlush = 0;
 
@@ -238,7 +251,8 @@ export class Hub extends DurableObject<Env> {
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.limits = limitsFor(DEFAULT_PLAN, this.envVars());
     this.limiter = new Limiter<MemLimit>(this.limits);
-    this.meter = new UsageMeter(this.sql);
+    // The meter writes through the raw handle and charges its own upsert itself (see UsageMeter.upsert).
+    this.meter = new UsageMeter(raw);
   }
 
   private envVars(): Record<string, unknown> {
@@ -279,6 +293,7 @@ export class Hub extends DurableObject<Env> {
     // A socket whose close woke us is no longer listed by getWebSockets(), but may carry the newest state.
     if (closing) consider((closing.deserializeAttachment() as Attachment | null)?.s);
     const b = best as HubSnap | null;
+    this.gcPending = this.sql.exec("SELECT 1 FROM gc LIMIT 1").toArray().length > 0;
     this.limiter.restore(b?.b);
     this.meter.load(now, b);
   }
@@ -439,7 +454,20 @@ export class Hub extends DurableObject<Env> {
       return;
     }
     this.settleRows(now);
-    if (!this.mayWriteUsage(now)) return; // blocked, and the stored counts already say so: write nothing
+    if (!this.mayWriteUsage(now)) {
+      // Blocked, and the stored counts already say so: write nothing, except once per wake the drained
+      // blocked-connect bucket (one row), so an eviction can't hand a blocked tenant a fresh burst.
+      const snap = this.nextSnap(now);
+      const bc = snap.b?.blocked_connects;
+      if (bc && bc[0] < 1 && !this.blockedSnapSaved) {
+        this.blockedSnapSaved = true;
+        this.sql.exec(
+          "INSERT INTO meta (k, v) VALUES ('rl_snap', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+          JSON.stringify({ g: snap.g, b: snap.b }),
+        );
+      }
+      return;
+    }
     const snap = this.nextSnap(now);
     if (snap.b && Object.keys(snap.b).length) {
       this.sql.exec(
@@ -531,25 +559,29 @@ export class Hub extends DurableObject<Env> {
     this.sql.exec(
       "DELETE FROM machines WHERE revoked_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.machine_id = machines.machine_id)",
     );
-    const machines = this.sql
+    const machines = this.countMachines();
+    if (machines >= this.limits.max_machines) {
+      this.saveSnap(undefined, now, true);
+      return { ok: false, status: 409, retryAfterMs: 0, says_when: true, error: this.machineCapText(machines) };
+    }
+    this.saveSnap(undefined, now);
+    return { ok: true, retryAfterMs: 0 };
+  }
+
+  /** Computers that count against max_machines: active ones, and revoked ones that still have sessions. */
+  private countMachines(): number {
+    return this.sql
       .exec<{ n: number }>(
         "SELECT COUNT(*) AS n FROM machines m WHERE m.revoked_at IS NULL OR EXISTS (SELECT 1 FROM sessions s WHERE s.machine_id = m.machine_id)",
       )
       .one().n;
-    if (machines >= this.limits.max_machines) {
-      this.saveSnap(undefined, now, true);
-      return {
-        ok: false,
-        status: 409,
-        retryAfterMs: 0,
-        says_when: true,
-        error:
-          `this account already has ${machines} computers (the "${this.plan}" plan allows ${this.limits.max_machines}); ` +
-          "revoke one under Machines first (a revoked computer still counts while it has sessions: Forget them)",
-      };
-    }
-    this.saveSnap(undefined, now);
-    return { ok: true, retryAfterMs: 0 };
+  }
+
+  private machineCapText(n: number): string {
+    return (
+      `this account already has ${n} computers (the "${this.plan}" plan allows ${this.limits.max_machines}); ` +
+      "revoke one under Machines first (a revoked computer still counts while it has sessions: Forget them)"
+    );
   }
 
   /** Idempotent schema upgrades for Hubs created by earlier versions. */
@@ -585,7 +617,7 @@ export class Hub extends DurableObject<Env> {
   // -------------------------------------------------------------------------
   // RPC used by the Worker (never reachable from outside it)
 
-  async addMachine(machineId: string, name: string, tokenHash: string, email?: string): Promise<MachineRecord> {
+  async addMachine(machineId: string, name: string, tokenHash: string, email?: string): Promise<MachineRecord | { error: string }> {
     const now = Date.now();
     this.begin("requests", now);
     try {
@@ -595,8 +627,11 @@ export class Hub extends DurableObject<Env> {
     }
   }
 
-  private addMachineInner(machineId: string, name: string, tokenHash: string, now: number, email?: string): MachineRecord {
+  private addMachineInner(machineId: string, name: string, tokenHash: string, now: number, email?: string): MachineRecord | { error: string } {
     if (email) this.rememberEmail(email);
+    // Checked again here (allowPairApprove checked first): concurrent approvals must not exceed the cap.
+    const machines = this.countMachines();
+    if (machines >= this.limits.max_machines) return { error: this.machineCapText(machines) };
     this.sql.exec(
       "INSERT INTO machines (machine_id, name, token_hash, created_at) VALUES (?, ?, ?, ?)",
       machineId,
@@ -680,13 +715,22 @@ export class Hub extends DurableObject<Env> {
 
   override async fetch(request: Request): Promise<Response> {
     const now = Date.now();
-    this.begin("requests", now);
+    this.wake(now);
+    this.settleRows(now);
     this.accepted = false;
+    this.credentialRefused = false;
     try {
       return this.upgrade(request, now);
     } finally {
-      // Refusals (401/403/429/...) are counted too; an accepted socket already got the snapshot.
-      if (!this.accepted) this.saveSnap(undefined, now, true);
+      if (this.credentialRefused) {
+        // A revoked/unknown token or a no-longer-allowed account: not the tenant's own traffic (it may be
+        // someone holding a stolen token), so it must not be able to lock the account out. Its reads are
+        // not charged and it goes to a separate, non-blocking counter that never triggers a write itself.
+        this.cursors.length = 0;
+        this.meter.add("refused", now);
+      } else if (!this.accepted) {
+        this.saveSnap(undefined, now, true); // other refusals (429, 426, ...) are counted
+      }
     }
   }
 
@@ -696,6 +740,7 @@ export class Hub extends DurableObject<Env> {
     }
     const kind = request.headers.get(H_KIND);
     const tenant = request.headers.get(H_TENANT);
+    if (kind !== "daemon") this.meter.add("requests", now); // daemons: counted once the token checked out
     if (tenant) this.rememberTenant(tenant);
 
     if (kind === "phone") {
@@ -722,14 +767,17 @@ export class Hub extends DurableObject<Env> {
         .exec<MachineRow>("SELECT * FROM machines WHERE machine_id = ?", machineId)
         .toArray()[0];
       if (!row || row.revoked_at !== null || !row.token_hash || !timingSafeEqual(row.token_hash, tokenHash)) {
+        this.credentialRefused = true;
         return new Response("machine token revoked or unknown", { status: 401 });
       }
       // Sign-up gating is re-checked on every daemon connect, so removing an account from
       // ALLOWED_EMAILS also locks out its machines (D7/D9).
       const tid = tenant ?? this.getMeta("tenant") ?? "";
       if (!accountAllowed(tid, this.email, this.env)) {
+        this.credentialRefused = true;
         return new Response("account is no longer allowed to sign in", { status: 403 });
       }
+      this.meter.add("requests", now);
       // Charged only after the token checked out, so a revoked/stolen token can't use up the budget.
       const limited = this.connectLimited(kind, now);
       if (limited) return limited;
@@ -770,6 +818,7 @@ export class Hub extends DurableObject<Env> {
     this.begin("frames", now);
     try {
       this.onFrame(ws, att, message, now);
+      this.gcStep(now);
     } finally {
       this.saveSnap(ws, now);
     }
@@ -852,6 +901,11 @@ export class Hub extends DurableObject<Env> {
         this.sendPhone(ws, this.stateFrame());
         return;
       case "history": {
+        // Only existing sessions have a history (a removed one may still have rows waiting for gcStep).
+        if (!this.getSession(f.session_id)) {
+          this.sendPhone(ws, { t: "history", session_id: f.session_id, messages: [], has_more: false });
+          return;
+        }
         const wait = this.limited("history", now);
         if (wait !== null) {
           this.sendPhone(ws, {
@@ -962,11 +1016,8 @@ export class Hub extends DurableObject<Env> {
           this.sendPhone(ws, { t: "error", error: "cannot forget an online session" });
           return;
         }
-        // One forget may write up to MAX_HISTORY_PER_SESSION (+ slack) rows at once, i.e. overshoot the daily
-        // budget by that much once; accepted: bounded per session, and sessions are bounded by max_machines.
-        this.sql.exec("DELETE FROM messages WHERE session_id = ?", f.session_id);
-        this.sql.exec("DELETE FROM sessions WHERE session_id = ?", f.session_id);
-        this.resyncDaemons(); // the id is free now; a computer refused it may claim it
+        // The history goes in bounded batches (gcStep); the id is free again once that is done (resync then).
+        this.dropSession(f.session_id);
         this.broadcastState();
         return;
       }
@@ -988,7 +1039,10 @@ export class Hub extends DurableObject<Env> {
           JSON.stringify(f.sessions.map((s) => s.session_id)),
         );
         for (const s of f.sessions) {
-          const { error: err } = this.upsertSession(machineId, s, now);
+          // Re-check the daily budget between sessions: one hello may announce many new ones.
+          this.settleRows(now);
+          const over = this.overBudget(now);
+          const err = over ? `refused for now: ${over.text}` : this.upsertSession(machineId, s, now).error;
           if (err) this.sendDaemon(ws, { t: "error", error: err, session_id: s.session_id });
         }
         for (const s of f.sessions) this.flushPending(ws, machineId, s.session_id);
@@ -1163,6 +1217,14 @@ export class Hub extends DurableObject<Env> {
         "under Machines; otherwise give each computer its own MCP_REMOTE_SESSION_ID (or unset it)"
       );
     }
+    if (
+      !existing &&
+      this.gcPending &&
+      // Someone wants this id back: make sure every daemon is told when it is free (clears except_machine).
+      this.sql.exec("UPDATE gc SET except_machine = '' WHERE session_id = ? RETURNING session_id", s.session_id).toArray().length
+    ) {
+      return `session id "${s.session_id}" was just removed and its history is still being deleted; it is retried automatically`;
+    }
     if (!existing || existing.machine_id !== machineId) {
       // New to this machine (brand new, or taken over from a revoked one): apply the same limits.
       const count = this.sql
@@ -1198,6 +1260,44 @@ export class Hub extends DurableObject<Env> {
    * Keep at most `keep` sessions for a machine by deleting offline ones: first those that never had a
    * message (e.g. sessions that came and went without anyone writing), then the least recently active.
    */
+  /**
+   * Remove a session now; its messages are deleted by gcStep in bounded batches. When that is done the
+   * id is free again and the other daemons are asked to re-announce (`exceptMachine` already knows).
+   */
+  private dropSession(sessionId: string, exceptMachine = ""): void {
+    this.sql.exec("DELETE FROM sessions WHERE session_id = ?", sessionId);
+    this.sql.exec(
+      "INSERT INTO gc (session_id, except_machine) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET except_machine = ''",
+      sessionId,
+      exceptMachine,
+    );
+    this.gcPending = true;
+  }
+
+  /**
+   * Delete up to GC_BATCH history rows of removed sessions (run at the end of each event, not while the
+   * daily budget is used up). When a session's history is gone its id is usable again: daemons re-announce.
+   */
+  private gcStep(now: number): void {
+    if (!this.gcPending) return;
+    this.settleRows(now);
+    if (this.overBudget(now)) return;
+    const next = this.sql.exec<{ session_id: string; except_machine: string }>("SELECT session_id, except_machine FROM gc LIMIT 1").toArray()[0];
+    if (!next) {
+      this.gcPending = false;
+      return;
+    }
+    const del = this.sql.exec(
+      "DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE session_id = ? ORDER BY id LIMIT ?)",
+      next.session_id,
+      GC_BATCH,
+    );
+    if (del.rowsWritten < GC_BATCH) {
+      this.sql.exec("DELETE FROM gc WHERE session_id = ?", next.session_id);
+      this.resyncDaemons(next.except_machine || undefined); // the id is free now; a computer refused it may claim it
+    }
+  }
+
   private evictOldSessions(machineId: string, keep: number): void {
     const victims = this.sql
       .exec<{ session_id: string }>(
@@ -1210,13 +1310,9 @@ export class Hub extends DurableObject<Env> {
         keep,
       )
       .toArray();
-    // Like forget_session: a single eviction can overshoot the daily budget by one session's history (bounded).
-    for (const v of victims) {
-      this.sql.exec("DELETE FROM messages WHERE session_id = ?", v.session_id);
-      this.sql.exec("DELETE FROM sessions WHERE session_id = ?", v.session_id);
-    }
+    // Histories are deleted later in bounded batches (gcStep), so one frame can't write thousands of rows.
+    for (const v of victims) this.dropSession(v.session_id, machineId);
     // Freed ids may be what another computer was refused; the evicting machine already knows.
-    if (victims.length) this.resyncDaemons(machineId);
   }
 
   /**

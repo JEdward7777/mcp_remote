@@ -18,6 +18,8 @@ const COUNTERS = {
   frames: "f",
   rows_read: "rr",
   rows_written: "rw",
+  /** Daemon connects refused for bad credentials (401/403): recorded, never part of the daily budget. */
+  refused: "x",
 } as const;
 
 export type UsageKind = keyof typeof COUNTERS;
@@ -36,12 +38,13 @@ CREATE TABLE IF NOT EXISTS usage (
   frames INTEGER NOT NULL DEFAULT 0,
   rows_read INTEGER NOT NULL DEFAULT 0,
   rows_written INTEGER NOT NULL DEFAULT 0,
+  refused INTEGER NOT NULL DEFAULT 0,
   gen INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 `;
 
 /** Columns added after the table first shipped (idempotent migration, see Hub.migrate). */
-export const USAGE_ADDED_COLUMNS = ["frames", "rows_read", "rows_written"] as const;
+export const USAGE_ADDED_COLUMNS = ["frames", "rows_read", "rows_written", "refused"] as const;
 
 export interface UsageDay extends UsageCounts {
   day: string;
@@ -50,7 +53,7 @@ export interface UsageDay extends UsageCounts {
 /** Pending (unflushed) counts for one day, as stored in a snapshot: { d: day, m: n, l: n, ... }. */
 export type PendingSnap = { d: string } & Partial<Record<(typeof COUNTERS)[UsageKind], number>>;
 
-const zero = (): UsageCounts => ({ messages: 0, launches: 0, requests: 0, frames: 0, rows_read: 0, rows_written: 0 });
+const zero = (): UsageCounts => ({ messages: 0, launches: 0, requests: 0, frames: 0, rows_read: 0, rows_written: 0, refused: 0 });
 
 export function utcDay(now: number): string {
   return new Date(now).toISOString().slice(0, 10);
@@ -64,6 +67,10 @@ export function msUntilUtcMidnight(now: number): number {
 
 type Row = UsageCounts & { day: string; gen: number };
 const COLS = KINDS.join(", ");
+
+/** What one usage upsert costs (measured: one row read, one row written; see the usage meter test). */
+const UPSERT_ROWS_READ = 1;
+const UPSERT_ROWS_WRITTEN = 1;
 
 export class UsageMeter {
   private loaded = false;
@@ -199,7 +206,13 @@ export class UsageMeter {
     this.sql.exec("DELETE FROM usage WHERE day < ?", cutoff);
   }
 
-  private upsert(day: string, c: UsageCounts): void {
+  /**
+   * The upsert charges itself: its own row read + row written (WITHOUT ROWID, no secondary index) are
+   * included in the values it writes, so the charge can't be lost to an eviction right after it. Any
+   * difference from that estimate is added to pending (charged by the next write).
+   */
+  private upsert(day: string, counts: UsageCounts): void {
+    const c = { ...counts, rows_read: counts.rows_read + UPSERT_ROWS_READ, rows_written: counts.rows_written + UPSERT_ROWS_WRITTEN };
     const cur = this.sql.exec(
       `INSERT INTO usage (day, ${COLS}, gen) VALUES (?, ${KINDS.map(() => "?").join(", ")}, ?)
        ON CONFLICT(day) DO UPDATE SET ${KINDS.map((k) => `${k} = ${k} + excluded.${k}`).join(", ")}, gen = excluded.gen`,
@@ -210,6 +223,17 @@ export class UsageMeter {
     this.flushedGen = this.gen;
     this.lastRowsRead = cur.rowsRead;
     this.lastRowsWritten = cur.rowsWritten;
+    if (day === this.day) {
+      this.stored.rows_read += UPSERT_ROWS_READ;
+      this.stored.rows_written += UPSERT_ROWS_WRITTEN;
+    }
+    const extraR = cur.rowsRead - UPSERT_ROWS_READ;
+    const extraW = cur.rowsWritten - UPSERT_ROWS_WRITTEN;
+    if (extraR > 0 || extraW > 0) {
+      this.pending.rows_read += Math.max(0, extraR);
+      this.pending.rows_written += Math.max(0, extraW);
+      this.dirty = true;
+    }
   }
 }
 

@@ -375,7 +375,26 @@ export class Daemon {
         hints.text = "too many connections for this account, HTTP 429";
         hints.retryAfterMs = parseRetryAfter(res.headers["retry-after"] as string | undefined);
         hints.rateLimited = true;
-        log(`server is rate limiting this account's connections (HTTP 429${hints.retryAfterMs ? `, retry after ${humanWait(hints.retryAfterMs)}` : ""})`);
+        // The body says why (e.g. the account's daily budget is used up): read it (small, bounded) first.
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (c: string) => {
+          if (body.length < 2000) body += c;
+        });
+        let finished = false;
+        const done = () => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(fallback);
+          const why = body.trim().replace(/;?\s*retry in \d+s$/, "").slice(0, 300);
+          if (why) hints.text = why;
+          log(`server refused the connection (HTTP 429${hints.retryAfterMs ? `, retry after ${humanWait(hints.retryAfterMs)}` : ""}): ${hints.text}`);
+          ws.terminate();
+        };
+        const fallback = setTimeout(done, 3000); // a body that never ends must not stall reconnecting
+        res.once("end", done);
+        res.once("error", done);
+        return;
       } else if (res.statusCode !== undefined && res.statusCode >= 500) {
         hints.serverError = true;
         hints.retryAfterMs = parseRetryAfter(res.headers["retry-after"] as string | undefined);

@@ -1,6 +1,6 @@
 // Phase 3: free-tier budget, per-tenant limits (D10), usage accounting and unauthenticated abuse
 // protection. Pure parts use explicit timestamps (no real clock); the rest runs inside workerd.
-import { SELF, evictDurableObject } from "cloudflare:test";
+import { SELF, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { tenantIdForDev } from "../src/auth";
 import {
@@ -18,6 +18,7 @@ import {
 import type { Env } from "../src/env";
 import { Limiter, fullAt, take } from "../src/ratelimit";
 import { checkPairStart, clientKey, perShard, resetIsolateThrottles, shardOf } from "../src/throttle";
+import { GC_BATCH } from "../src/hub";
 import { UsageMeter, msUntilUtcMidnight, utcDay } from "../src/usage";
 import { E, ORIGIN, connect, cookieFor, daemon, last, newMachine, phone, relaxLimits, setLimits, sleep, waitFor, withHub } from "./helpers";
 
@@ -487,13 +488,30 @@ describe("per-tenant limits in the Hub (D10)", () => {
     expect((await waitFor(() => last(q, "state"), "state")).usage.plan).toBe("free");
   });
 
-  it("counts refused daemon connects (401) as requests", async () => {
-    const { token } = await newMachine("count401");
-    const before = await withHub("count401", (hub) => { hub.wake(Date.now()); return hub.meter.today(Date.now()).requests as number; });
-    await withHub("count401", (_h, st) => st.storage.sql.exec("UPDATE machines SET token_hash = 'x'"));
-    for (let i = 0; i < 3; i++) expect(await connect("/api/daemon/ws", { authorization: `Bearer ${token}` })).toBe(401);
-    const after = await withHub("count401", (hub) => hub.meter.today(Date.now()).requests as number);
-    expect(after - before).toBe(3);
+  it("refused daemon credentials (401) never count toward the blocking budget (stolen-token lockout)", async () => {
+    const u = "victim401";
+    const { machineId, token } = await newMachine(u);
+    const cookie = await cookieFor(u);
+    expect((await SELF.fetch(`${ORIGIN}/api/machines/${machineId}`, { method: "DELETE", headers: { cookie, origin: ORIGIN } })).status).toBe(200);
+    const before = await withHub(u, (hub) => {
+      hub.wake(Date.now());
+      hub.settleRows(Date.now());
+      const t = hub.meter.today(Date.now());
+      // A tiny request budget: 40 refused connects would blow it if they counted.
+      hub.limits = { ...hub.limits, daily: { ...hub.limits.daily, do_requests: t.requests + Math.ceil(t.frames / 20) + 10 } };
+      return t;
+    });
+    for (let i = 0; i < 40; i++) expect(await connect("/api/daemon/ws", { authorization: `Bearer ${token}` })).toBe(401);
+    const after = await withHub(u, (hub) => {
+      hub.settleRows(Date.now());
+      return hub.meter.today(Date.now());
+    });
+    expect(after.requests - before.requests).toBe(0);
+    expect(after.rows_read - before.rows_read).toBe(0);
+    // Separate counter; after the first refusal the Worker's isolate memory turns the token away without the Hub.
+    expect(after.refused - before.refused).toBeGreaterThanOrEqual(1);
+    expect(after.refused - before.refused).toBeLessThanOrEqual(40);
+    expect((await SELF.fetch(`${ORIGIN}/api/state`, { headers: { cookie } })).status).toBe(200);
   });
 
   // --- review round 2 ---------------------------------------------------------------------------
@@ -560,7 +578,8 @@ describe("per-tenant limits in the Hub (D10)", () => {
     const after = await today(u);
     expect(stateful).toBe(PLANS.free!.blocked_connects.burst);
     expect(refused).toBe(15 - stateful);
-    expect(after.rows_written - before.rows_written).toBe(0);
+    // At most the one write of the drained blocked-connect bucket (round 3), nothing per connect.
+    expect(after.rows_written - before.rows_written).toBeLessThanOrEqual(2);
     expect(after.rows_read - before.rows_read).toBeLessThan(15 * 10); // no 50-session reads
   });
 
@@ -615,6 +634,123 @@ describe("per-tenant limits in the Hub (D10)", () => {
     expect(perMessage).toBeLessThan(10);
     // The free plan's 500 messages/day stay well inside its rows-written budget.
     expect(perMessage * PLANS.free!.daily_messages).toBeLessThan(limitsFor("free", {}).daily.rows_written / 2);
+  });
+
+  // --- review round 3 ---------------------------------------------------------------------------
+  it("charges the usage row's own write even when the Hub is evicted right after every call", async () => {
+    const u = "flush-charge";
+    await newMachine(u);
+    const cookie = await cookieFor(u);
+    await SELF.fetch(`${ORIGIN}/api/usage`, { headers: { cookie } });
+    await evictDurableObject(hubStub(u));
+    const before = await today(u);
+    await evictDurableObject(hubStub(u));
+    for (let i = 0; i < 20; i++) {
+      expect((await SELF.fetch(`${ORIGIN}/api/usage`, { headers: { cookie } })).status).toBe(200);
+      // Nothing written by this call is left uncharged in memory.
+      expect(await withHub(u, (hub) => hub.cursors.reduce((n: number, c: { rowsWritten: number }) => n + c.rowsWritten, 0))).toBe(0);
+      await evictDurableObject(hubStub(u));
+    }
+    const after = await today(u);
+    expect(after.rows_written - before.rows_written).toBeGreaterThanOrEqual(20); // one usage row per call
+  });
+
+  it("deletes removed sessions' history in bounded batches, never resurrecting it", async () => {
+    const u = "gc-hist";
+    const { machineId, token } = await newMachine(u);
+    await withHub(u, (_hub, st) => {
+      const sql = st.storage.sql;
+      for (let s = 0; s < 50; s++) {
+        sql.exec(
+          "INSERT INTO sessions (session_id, machine_id, project, online, last_seen, created_at, msg_count) VALUES (?, ?, 'p', 0, ?, ?, 200)",
+          `old${s}`,
+          machineId,
+          s,
+          s,
+        );
+        for (let i = 0; i < 200; i++) sql.exec("INSERT INTO messages (session_id, direction, text, created_at, delivered) VALUES (?, 'out', 'x', ?, 1)", `old${s}`, i);
+      }
+    });
+    await relaxLimits(u);
+    const before = (await today(u)).rows_written;
+    const d = await daemon(token);
+    await waitFor(() => last(d, "welcome"), "welcome");
+    // One hello announcing 50 new sessions evicts 50 old ones; their 10,000 messages must not go in one frame.
+    d.send({ t: "hello", v: 1, sessions: Array.from({ length: 50 }, (_, i) => ({ session_id: `new${i}`, project: "p" })) });
+    await sleep(300);
+    const afterHello = (await today(u)).rows_written - before;
+    expect(afterHello).toBeLessThan(1000);
+    const left = () => withHub(u, (_h, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages").one().n);
+    expect(await left()).toBeGreaterThan(9000);
+    // A removed id can't come back while its rows are still there; its history stays empty meanwhile.
+    d.send({ t: "session_up", session: { session_id: "old0", project: "p" } });
+    const refused = await waitFor(() => d.frames.find((f) => f.t === "error" && f.session_id === "old0"), "refused while cleaning");
+    expect(refused.error).toMatch(/was just removed and its history is still being deleted/);
+    const p = await phone(u);
+    p.send({ t: "history", session_id: "old0" });
+    const h = await waitFor(() => p.frames.find((f) => f.t === "history" && f.session_id === "old0"), "history");
+    expect(h.messages).toEqual([]);
+    // Each further frame deletes at most GC_BATCH rows; eventually all are gone and daemons are told to resync.
+    for (let i = 0; i < 150 && (await left()) > 0; i++) {
+      const w0 = (await today(u)).rows_written;
+      d.send({ t: "launches", launches: [] });
+      await sleep(20);
+      expect((await today(u)).rows_written - w0).toBeLessThanOrEqual(GC_BATCH + 20);
+    }
+    expect(await left()).toBe(0);
+    await waitFor(() => d.frames.some((f) => f.t === "resync"), "resync after cleanup");
+  }, 30_000);
+
+  it("re-checks the daily budget between sessions of one hello", async () => {
+    const { d } = await setup("hello-budget");
+    await withHub("hello-budget", (hub) => {
+      hub.settleRows(Date.now());
+      const w = hub.meter.today(Date.now()).rows_written;
+      hub.limits = { ...hub.limits, daily: { ...hub.limits.daily, rows_written: w + 5 } };
+    });
+    d.send({ t: "hello", v: 1, sessions: Array.from({ length: 20 }, (_, i) => ({ session_id: `h${i}`, project: "p" })) });
+    await waitFor(() => d.frames.some((f) => f.t === "error" && /refused for now: this account's daily budget is used up/.test(f.error)) || d.closed, "budget refusal");
+    const added = await withHub("hello-budget", (_h, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM sessions WHERE session_id LIKE 'h%'").one().n);
+    expect(added).toBeLessThan(20);
+  });
+
+  it("keeps a blocked tenant's connect allowance across evictions (one write when drained)", async () => {
+    const u = "blk-evict";
+    await newMachine(u);
+    const p0 = await phone(u);
+    await waitFor(() => last(p0, "state"), "state");
+    p0.ws.close(1000);
+    await sleep(100);
+    await withHub(u, (hub, st) => {
+      hub.meter.flush();
+      st.storage.sql.exec("INSERT INTO usage (day, requests) VALUES (?, 1000000) ON CONFLICT(day) DO UPDATE SET requests = 1000000", utcDay(Date.now()));
+    });
+    await evictDurableObject(hubStub(u));
+    const rounds: number[] = [];
+    for (let round = 0; round < 3; round++) {
+      let ok = 0;
+      for (let i = 0; i < 8; i++) {
+        const q = await phone(u);
+        await waitFor(() => last(q, "state") || q.closed, "state or close");
+        if (last(q, "state")) ok++;
+        q.ws.close(1000);
+        await sleep(20);
+      }
+      rounds.push(ok);
+      await sleep(100);
+      await evictDurableObject(hubStub(u));
+    }
+    expect(rounds).toEqual([PLANS.free!.blocked_connects.burst, 0, 0]);
+  });
+
+  it("re-checks the computer cap in addMachine (concurrent approvals can't exceed it)", async () => {
+    const u = "cap-race";
+    const stub = hubStub(u);
+    const results = await Promise.all(
+      Array.from({ length: 14 }, (_, i) => stub.addMachine(`race${i}`, `box${i}`, `hash${i}`, "x@dev.local")),
+    );
+    expect(results.filter((r) => !("error" in r)).length).toBe(PLANS.free!.max_machines);
+    expect(results.find((r) => "error" in r)).toMatchObject({ error: expect.stringMatching(/allows 10/) });
   });
 
   it("rate limits the HTTP API per tenant with 429 + Retry-After", async () => {
@@ -704,9 +840,13 @@ describe("pairing abuse protection", () => {
       .filter((ip) => shardOf(`ip:${ip}`) === target)
       .slice(0, 7);
     const results = [];
+    // Its own Throttle objects, so the shared shards of the other tests aren't drained.
+    const isolated = {
+      THROTTLE: { idFromName: (n: string) => E.THROTTLE.idFromName(`derived-cap-test:${n}`), get: (id: DurableObjectId) => E.THROTTLE.get(id) },
+    } as unknown as Env;
     for (const ip of ips) {
       const req = new Request("https://x/", { headers: { "cf-connecting-ip": ip } });
-      results.push((await checkPairStart(E, req, defaults, Date.UTC(2030, 0, 1))).ok);
+      results.push((await checkPairStart(isolated, req, defaults)).ok);
     }
     expect(results.filter(Boolean).length).toBe(5);
   });
@@ -717,6 +857,41 @@ describe("pairing abuse protection", () => {
     const x = await stub.hit([{ key: "ip:1", rate }, { key: "*", rate }, { key: "ip6:2001:db8:1::/48", rate }], 1000);
     expect(x.ok).toBe(true);
     expect(x.rowsWritten).toBeLessThanOrEqual(3);
+  });
+
+  it("a 'claimed' flood on a pairing wait socket reads storage once and closes the socket (1008)", async () => {
+    const r0 = await SELF.fetch(`${ORIGIN}/api/pair/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.77" },
+      body: "{}",
+    });
+    const s0 = (await r0.json()) as { code: string; pairing_id: string; poll_secret: string };
+    const w = await connect(`/api/pair/wait?code=${s0.code}&pairing_id=${s0.pairing_id}`, { authorization: `Bearer ${s0.poll_secret}` });
+    if (typeof w === "number") throw new Error(`wait refused: ${w} ${JSON.stringify(s0)}`);
+    await waitFor(() => w.frames.find((f) => f.t === "pending"), "pending");
+    for (let i = 0; i < 300; i++) {
+      try {
+        w.ws.send("claimed");
+      } catch {
+        break;
+      }
+    }
+    await waitFor(() => w.closed, "closed");
+    expect(w.closed!.code).toBe(1008);
+    await sleep(500);
+    const stub = E.PAIRING.get(E.PAIRING.idFromName(`pair:${s0.code.replace("-", "")}`));
+    const handled = await runInDurableObject(stub, (p: { framesHandled: number }) => p.framesHandled);
+    // The first frame closes the socket. Frames the client had already sent are still delivered by local
+    // workerd (each only reads the socket attachment: no storage read, no write); see SETUP "Verify at the desk".
+    expect(handled).toBeLessThanOrEqual(301);
+    expect(await runInDurableObject(stub, (p: { storageReads: number }) => p.storageReads)).toBeLessThanOrEqual(1);
+    // Any other frame closes too.
+    const w2 = await connect(`/api/pair/wait?code=${s0.code}&pairing_id=${s0.pairing_id}`, { authorization: `Bearer ${s0.poll_secret}` });
+    if (typeof w2 === "number") throw new Error(String(w2));
+    await waitFor(() => w2.frames.find((f) => f.t === "pending"), "pending 2");
+    w2.ws.send("hello?");
+    await waitFor(() => w2.closed, "closed 2", 10_000);
+    expect(w2.closed!.code).toBe(1008);
   });
 
   it("uses the optional Rate Limiting binding first when configured", async () => {

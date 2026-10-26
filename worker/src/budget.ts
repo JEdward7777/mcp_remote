@@ -122,7 +122,9 @@ export function dailyBudget(sharePercent: number): DailyBudget {
  *    and HTTP), which is why the daily budget exists.
  * Exhausting the shared free quota takes accounts whose shares add up to 100%: e.g. ten free accounts at
  * 10% each, or the owner (50%) plus five free accounts. Normal use (hundreds of messages a day) stays far
- * below a share.
+ * below a share. The shares bound database rows, and requests from well-behaved clients (which stop and
+ * wait when refused); a raw flood of requests is bounded only by the platform, since even an instantly
+ * refused request costs a DO request.
  */
 export interface TenantLimits {
   /** Phone -> session messages. */

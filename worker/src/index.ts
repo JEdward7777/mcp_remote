@@ -40,6 +40,10 @@ export { Hub } from "./hub";
 export { Pairing } from "./pairing";
 export { Throttle } from "./throttle";
 
+/** Isolate memory of machine tokens the Hub refused with 401 (revocation is permanent). Best effort, free. */
+const refusedTokens = new Map<string, number>();
+const REFUSED_TOKEN_TTL_MS = 10 * 60_000;
+
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const MAX_JSON_BODY = 4096;
 
@@ -301,16 +305,25 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const parts = token ? await verifyMachineToken(env.SESSION_SECRET, token) : null;
     if (!parts) return err(401, "invalid machine token");
+    const tokenHash = await sha256Hex(token);
+    // A token the Hub already refused (revoked: permanent) is turned away here, without waking the Hub.
+    const refusedUntil = refusedTokens.get(tokenHash);
+    if (refusedUntil !== undefined && refusedUntil > Date.now()) return err(401, "invalid machine token");
     const fwd = new Request("https://hub/daemon", {
       headers: {
         upgrade: "websocket",
         [H_KIND]: "daemon",
         [H_TENANT]: parts.tid,
         [H_MACHINE]: parts.machineId,
-        [H_TOKEN_HASH]: await sha256Hex(token),
+        [H_TOKEN_HASH]: tokenHash,
       },
     });
-    return hubFor(env, parts.tid).fetch(fwd);
+    const res = await hubFor(env, parts.tid).fetch(fwd);
+    if (res.status === 401) {
+      if (refusedTokens.size >= 4096) refusedTokens.clear();
+      refusedTokens.set(tokenHash, Date.now() + REFUSED_TOKEN_TTL_MS);
+    }
+    return res;
   }
 
   // --- phone-facing, cookie -------------------------------------------------------------
@@ -378,6 +391,10 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       const name = body.machine_name || claim.hostname;
       const token = await mintMachineToken(env.SESSION_SECRET, session.tid, machineId);
       const machine = await hubFor(env, session.tid).addMachine(machineId, name, await sha256Hex(token), session.email);
+      if ("error" in machine) {
+        await pairing.abortApprove();
+        return err(409, machine.error);
+      }
       added = true;
       await pairing.complete(
         { t: "approved", token, machine_id: machineId, machine_name: name, account: session.email },

@@ -328,19 +328,28 @@ sessions show offline, and Claude's `send_message` says "... the server refused 
 budget used up); the daemon reconnects in 5 h"), API calls and daemon connects get HTTP 429 with
 `Retry-After`. A phone can still connect, at most 5 times in a burst and 6 per hour (`LIMIT_BLOCKED_CONNECTS`),
 and gets only the reason (no machine or session list, so no database reads); further connects are closed with
-4029. While blocked, nothing more is written for the account. Tune with `TENANT_DAILY_SHARE_PERCENT` (1-100,
+4029. That allowance survives the Hub being evicted (once it is used up it is written down, one row). While
+blocked, nothing else is written for the account. Tune with `TENANT_DAILY_SHARE_PERCENT` (1-100,
 free plan) and `OWNER_DAILY_SHARE_PERCENT` (owner plan).
 
 Exhausting the shared free quota takes accounts whose shares add up to 100%: ten free accounts at 10% each, or
-the owner (50%) plus five free accounts. Ordinary use needs a fraction of a share: a message round trip writes
+the owner (50%) plus five free accounts. What the shares bound: database rows, and requests from clients that
+behave (our daemon and PWA stop at a refusal and wait). They do not bound a raw request flood: every request
+that reaches a Durable Object costs one DO request, even when it is refused at once (and a WebSocket's frames
+that were already sent still arrive after the socket is closed); that is limited only by Cloudflare itself.
+Daemon connects refused for bad credentials (a revoked or stolen token) are counted separately
+(`refused`) and never block the account; the Worker also remembers refused tokens for 10 minutes. Ordinary use needs a fraction of a share: a message round trip writes
 about 6-8 rows, so the free plan's 500 messages a day use about 3,500 of its 10,000 rows written.
 
 Computers per account are capped too (free: 10, owner: 30; `MAX_MACHINES` for the free plan): this also bounds
 what any single request can cost (a session list reads at most 10 computers x 50 sessions). Pairing an 11th
 computer is refused with "this account already has 10 computers (the "free" plan allows 10); revoke one under
-Machines first (a revoked computer still counts while it has sessions: Forget them)". Forgetting a session (or
-the automatic eviction of old ones) deletes up to ~1,050 history rows in one go and may overshoot the daily
-budget by that much once; that is accepted, since it is bounded per session and sessions per account are capped.
+Machines first (a revoked computer still counts while it has sessions: Forget them)" (checked again when the
+computer is added, so simultaneous approvals can't exceed it). Forgetting a session, or the automatic eviction
+of old ones, removes the session at once and deletes its history afterwards, at most 200 rows per event (no
+deletes while the account is over its budget); until that is done the session id can't be used again (a daemon
+announcing it is told so and re-announces automatically when it is free) and its history is empty, so old rows
+never show up anywhere. A single `hello` that announces many new sessions re-checks the budget between them.
 
 ### Plans: `free` and `owner`
 
@@ -477,11 +486,23 @@ named page and fix `worker/src/budget.ts` (and the defaults above) if it is wron
       <https://developers.cloudflare.com/durable-objects/reference/in-memory-state/>
 - [ ] Workers Rate Limiting binding: available and free on the free plan? `namespace_id` rules —
       <https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/>
+- [ ] After a Durable Object closes a WebSocket, are frames the client already sent still delivered to
+      `webSocketMessage` (local workerd delivers them; each costs a DO request)? —
+      <https://developers.cloudflare.com/durable-objects/best-practices/websockets/>
 - [ ] Close code / behavior clients see when a deploy restarts Durable Objects (we treat any close the same) —
       <https://developers.cloudflare.com/durable-objects/reference/durable-object-lifecycle/>
 
 Also on the first `npx wrangler deploy` after Phase 3: it applies migration `v2` (new `Throttle` class);
 wrangler should say so.
+
+### Known gaps (for Phase 4b)
+
+- The global pairing-start cap (about 52 per hour for everyone) protects the quota, but someone hammering
+  `/api/pair/start` from many networks can use it up and block new pairings for everyone until it refills.
+  The planned one-line install for signed-in users (D12) should start pairing from the signed-in session
+  (pre-approved, tied to the account) and so bypass this unauthenticated cap.
+- A pairing wait socket accepts exactly one `claimed` frame after approval and closes on anything else; frames
+  a client pipelined before that close still each cost a DO request (no storage), see the checklist above.
 
 ## Troubleshooting
 

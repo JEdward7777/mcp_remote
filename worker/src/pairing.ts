@@ -46,6 +46,10 @@ interface PairingState {
 }
 
 export class Pairing extends DurableObject<Env> {
+  /** Frames that reached this instance, and how many of them read storage (tests: a flood stops at one). */
+  framesHandled = 0;
+  storageReads = 0;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -171,24 +175,38 @@ export class Pairing extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
+  /**
+   * The only frame a waiting daemon may send is one "claimed", after it got the approved token ("ping"
+   * is answered by the auto-response and never gets here). Anything else, a second "claimed", or a
+   * "claimed" before approval closes the socket (1008): an unauthenticated client must not be able to
+   * wake this object (a DO request + a storage read) in a loop.
+   */
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    // The daemon says "claimed" once it has saved the token; then nothing is kept.
-    if (message === "claimed") {
-      const s = await this.load();
-      if (s?.status === "approved") {
-        await this.ctx.storage.deleteAlarm();
-        await this.ctx.storage.deleteAll();
-        for (const w of this.ctx.getWebSockets()) {
-          try {
-            w.close(1000, "done");
-          } catch {
-            /* ignore */
-          }
-        }
-      }
+    this.framesHandled++;
+    const att = ws.deserializeAttachment() as { claimed?: boolean } | null;
+    if (message !== "claimed" || att?.claimed) {
+      this.closeSocket(ws, 1008, "unexpected frame");
       return;
     }
-    if (message !== "ping") ws.close(1008, "unexpected frame");
+    ws.serializeAttachment({ claimed: true });
+    this.storageReads++;
+    const s = await this.load();
+    if (s?.status !== "approved") {
+      this.closeSocket(ws, 1008, "not approved");
+      return;
+    }
+    // The daemon has saved the token: nothing is kept.
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    for (const w of this.ctx.getWebSockets()) this.closeSocket(w, 1000, "done");
+  }
+
+  private closeSocket(ws: WebSocket, code: number, reason: string): void {
+    try {
+      ws.close(code, reason);
+    } catch {
+      /* already closing */
+    }
   }
 
   override async webSocketClose(ws: WebSocket, code: number): Promise<void> {

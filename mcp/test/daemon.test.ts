@@ -490,12 +490,12 @@ describe("daemon reconnect hardening (phase 3)", () => {
     expect(delays).toEqual([]);
   });
 
-  async function rejectingServer(status: number, headers: Record<string, string>): Promise<number> {
+  async function rejectingServer(status: number, headers: Record<string, string>, message = "refused"): Promise<number> {
     wss.close();
     wss = new WebSocketServer({
       port: 0,
       host: "127.0.0.1",
-      verifyClient: (_info, cb) => cb(false, status, "refused", headers),
+      verifyClient: (_info, cb) => cb(false, status, message, headers),
     });
     await new Promise<void>((r) => wss.once("listening", () => r()));
     return (wss.address() as { port: number }).port;
@@ -516,6 +516,15 @@ describe("daemon reconnect hardening (phase 3)", () => {
     await waitFor(() => seen.length >= 1, "scheduled");
     expect(seen[0]!.h).toMatchObject({ rateLimited: true, retryAfterMs: 7000 });
     expect(seen[0]!.d).toBeGreaterThanOrEqual(7000);
+  });
+
+  it("reads the reason from a 429 body (daily budget) and tells the shims", async () => {
+    port = await rejectingServer(429, { "Retry-After": "7" }, "this account's daily budget is used up (requests: 9 of 8 per UTC day); retry in 7s");
+    daemon = new Daemon({ config: cfg(), socket: join(dir, "d.sock"), launcher: false, reconnect: FAST_RECONNECT, random: () => 0 });
+    await daemon.start();
+    const s = await shim("s429");
+    const st = await waitFor(() => s.frames.find((f) => f.t === "hub_status" && f.reason) ?? (s.frames[0]?.reason ? s.frames[0] : null), "reason");
+    expect(st.reason).toMatch(/^the server refused this account for now \(this account's daily budget is used up \(requests: 9 of 8 per UTC day\)\); the daemon reconnects in /);
   });
 
   it("backs off at least 5 s after an HTTP 5xx and 60 s after 429 without Retry-After", async () => {
