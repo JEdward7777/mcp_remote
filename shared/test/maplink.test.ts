@@ -77,6 +77,10 @@ describe("linkify (which message parts the phone makes tappable)", () => {
       "https://google.com/maps/..\\x",
       "https://www.google.com/maps/./../x",
       "https://www.google.com/maps%2f..%2fx",
+      // Review round 2: open redirects on maps.google.com.
+      "https://maps.google.com/url?q=https://evil.example",
+      "https://maps.google.com/amp/s/evil.example",
+      "https://maps.google.com/mapsx",
     ]) {
       expect(linkify(`see ${t} now`).every((s) => s.href === undefined), t).toBe(true);
       expect(allowedMapHref(t), t).toBeNull();
@@ -89,6 +93,8 @@ describe("linkify (which message parts the phone makes tappable)", () => {
     expect(allowedMapHref("https://WWW.Google.com/maps/search/?api=1&query=a b")).toBeNull(); // space ends a link anyway
     expect(allowedMapHref("https://WWW.Google.com/maps/place/X")).toEqual({ href: "https://www.google.com/maps/place/X", kind: "map" });
     expect(allowedMapHref("https://maps.app.goo.gl/AbC")).toEqual({ href: "https://maps.app.goo.gl/AbC", kind: "map" });
+    expect(allowedMapHref("https://maps.google.com/?q=52.37,4.89")).toEqual({ href: "https://maps.google.com/?q=52.37,4.89", kind: "map" });
+    expect(allowedMapHref("https://maps.google.com/maps?q=x")?.kind).toBe("map");
   });
 
   it("keeps a closing parenthesis that belongs to the URL", () => {

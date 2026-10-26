@@ -73,8 +73,8 @@ export function pushSupported(): string | null {
 export async function pushState(): Promise<PushState> {
   const why = pushSupported();
   if (why) return { kind: "unsupported", why };
-  const reg = await navigator.serviceWorker.ready;
-  const sub = await reg.pushManager.getSubscription();
+  const reg = await navigator.serviceWorker.getRegistration();
+  const sub = await reg?.pushManager.getSubscription();
   if (sub && Notification.permission === "granted") return { kind: "on", sub };
   return { kind: "off", permission: Notification.permission };
 }
@@ -110,7 +110,12 @@ async function api(method: "POST" | "DELETE", body: unknown): Promise<{ ok: bool
 }
 
 /** Turn notifications on for this phone (asks for permission). Returns an error sentence or null. */
-export async function enablePush(key: string): Promise<string | null> {
+/**
+ * `fresh`: this browser's current subscription is not on the account's device list (removed, or
+ * registered by another account that signed in here before): drop it and make a new endpoint, so one
+ * endpoint is never shared between accounts.
+ */
+export async function enablePush(key: string, fresh = false): Promise<string | null> {
   const why = pushSupported();
   if (why) return `Notifications are not available: ${why}.`;
   const perm = await Notification.requestPermission();
@@ -119,9 +124,10 @@ export async function enablePush(key: string): Promise<string | null> {
       ? "Notifications are blocked for this site. Allow them in Chrome: site settings (lock icon) > Notifications, then try again."
       : "Notifications were not allowed.";
   }
-  const reg = await navigator.serviceWorker.ready;
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg) return "Notifications need the app's service worker, which is not running (reload the app).";
   let sub = await reg.pushManager.getSubscription();
-  if (sub && !sameKey(sub, key)) {
+  if (sub && (fresh || !sameKey(sub, key))) {
     await sub.unsubscribe().catch(() => false);
     sub = null;
   }
@@ -132,8 +138,9 @@ export async function enablePush(key: string): Promise<string | null> {
 
 export async function disablePush(): Promise<string | null> {
   if (pushSupported()) return null;
-  const reg = await navigator.serviceWorker.ready;
-  const sub = await reg.pushManager.getSubscription();
+  // getRegistration(), not .ready: .ready never resolves when registration failed (sign-out must not hang).
+  const reg = await navigator.serviceWorker.getRegistration();
+  const sub = await reg?.pushManager.getSubscription();
   if (!sub) return null;
   const r = await api("DELETE", { endpoint: sub.endpoint });
   await sub.unsubscribe().catch(() => false);
@@ -148,8 +155,8 @@ export async function disablePush(): Promise<string | null> {
 let healed = false;
 export async function healPush(key: string | null): Promise<void> {
   if (healed || !key || pushSupported() || Notification.permission !== "granted") return;
-  const reg = await navigator.serviceWorker.ready;
-  const sub = await reg.pushManager.getSubscription();
+  const reg = await navigator.serviceWorker.getRegistration();
+  const sub = await reg?.pushManager.getSubscription();
   if (!sub || sameKey(sub, key)) return;
   healed = true;
   await enablePush(key);
@@ -168,7 +175,7 @@ export async function removeDevices(id: string | "all"): Promise<string | null> 
   const r = await api("DELETE", id === "all" ? { all: true } : { id });
   if (!r.ok) return `Could not remove: ${r.error}`;
   if (id === "all" && !pushSupported()) {
-    const sub = await (await navigator.serviceWorker.ready).pushManager.getSubscription();
+    const sub = await (await navigator.serviceWorker.getRegistration())?.pushManager.getSubscription();
     await sub?.unsubscribe().catch(() => false);
   }
   return null;

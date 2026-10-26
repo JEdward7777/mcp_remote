@@ -977,7 +977,7 @@ function buildSettings(): SettingsView {
     if (pushBusy || !key) return;
     pushBusy = true;
     render();
-    const error = pushLocal === "on" && thisDeviceListed() ? await disablePush() : await enablePush(key);
+    const error = pushLocal === "on" && thisDeviceListed() ? await disablePush() : await enablePush(key, !thisDeviceListed());
     pushBusy = false;
     if (error) toast(error);
     await afterPushChange();

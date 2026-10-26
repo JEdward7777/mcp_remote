@@ -26,7 +26,8 @@ export type Segment = { text: string; href?: undefined } | { text: string; href:
 const MAP_HOSTS: Record<string, readonly string[] | null> = {
   "www.google.com": ["/maps"],
   "google.com": ["/maps"],
-  "maps.google.com": null,
+  // Not any path: maps.google.com/url?q= and /amp/s/ are open redirects.
+  "maps.google.com": ["/maps", "/"],
   "maps.app.goo.gl": null,
   "goo.gl": ["/maps"],
 };
@@ -74,7 +75,7 @@ export function allowedMapHref(url: string): { href: string; kind: "map" | "geo"
   const paths = MAP_HOSTS[host];
   // The prefix is checked on the parsed (normalized) path, and the parsed URL is what the link opens.
   const path = u.pathname.toLowerCase();
-  if (paths && !paths.some((p) => path === p || path.startsWith(`${p}/`))) return null;
+  if (paths && !paths.some((p) => path === p || (p !== "/" && path.startsWith(`${p}/`)))) return null;
   return { href: u.href, kind: "map" };
 }
 

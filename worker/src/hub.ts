@@ -1693,28 +1693,27 @@ export class Hub extends DurableObject<Env> {
       const a = p.deserializeAttachment() as Attachment | null;
       return p.readyState === WebSocket.OPEN && !!a && !a.closed;
     });
+    // Per device, like messages: every open app shows the prompt, and every registered device that is
+    // not showing the app gets the push (a desktop tab left open must not keep the phone silent).
+    const open = this.appOpen(now);
+    const payload: PushPayload = { k: "l", r: request.rid, t: request.tok, s: s.session_id };
+    if (this.pushPreview) {
+      payload.p = Array.from(s.project).slice(0, 64).join("");
+      if (request.reason) payload.b = previewText(request.reason);
+    }
+    // High priority, and pointless after the longest a get_location call waits.
+    const pushed = this.queuePush(payload, { ttl: 120, urgency: "high" }, now, undefined, open.devs);
     let via: LocationVia;
-    if (this.appOpen(now).any) {
-      via = "app";
-    } else {
-      const payload: PushPayload = { k: "l", r: request.rid, t: request.tok, s: s.session_id };
-      if (this.pushPreview) {
-        payload.p = Array.from(s.project).slice(0, 64).join("");
-        if (request.reason) payload.b = previewText(request.reason);
-      }
-      // High priority, and pointless after the longest a get_location call waits.
-      const pushed = this.queuePush(payload, { ttl: 120, urgency: "high" }, now);
-      if (pushed.sent > 0) via = "push";
-      else if (phones.length) via = "app"; // only hidden apps: they show the prompt when brought back
-      else {
-        reply({
-          status: "no_device",
-          position: null,
-          fresh: false,
-          message: `the phone app is not open and the phone can't be notified (${pushed.text})`,
-        });
-        return;
-      }
+    if (pushed.sent > 0) via = "push";
+    else if (open.any || phones.length) via = "app"; // hidden apps show the prompt when brought back
+    else {
+      reply({
+        status: "no_device",
+        position: null,
+        fresh: false,
+        message: `the phone app is not open and the phone can't be notified (${pushed.text})`,
+      });
+      return;
     }
     this.sql.exec(
       "INSERT OR REPLACE INTO loc_req (rid, machine_id, session_id, project, reason, tok, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",

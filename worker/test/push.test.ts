@@ -391,6 +391,26 @@ describe("on-demand location (D14): consent per request and per session", () => 
     expect(last(p, "location_pending").requests).toEqual([]);
   });
 
+  it("per device (review round 2): a visible tab without push still lets the phone get the location push", async () => {
+    const { d, sid } = await setup("loc-dev");
+    const [sub] = await subscribed("loc-dev");
+    const calls = await fakePushService("loc-dev");
+    const desk = await phone("loc-dev"); // visible, but no push device of its own (e.g. a desktop tab)
+    await waitFor(() => last(desk, "state"), "state");
+    ask(d, "l1", sid, 0, "near me");
+    expect(await waitFor(() => last(d, "location_wait"), "wait")).toEqual({ t: "location_wait", req_id: "l1", via: "push" });
+    await waitFor(() => calls.length === 1, "push to the phone");
+    expect(calls[0]!.url).toBe(sub!.endpoint);
+    expect(await prompt(desk, "l1")).toMatchObject({ session_id: sid }); // the open tab shows the prompt too
+    // The device whose own app is visible gets no push; the prompt is in its app.
+    const own = await phone("loc-dev", `?vis=1&dev=${await subscriptionId(sub!.endpoint)}`);
+    await waitFor(() => last(own, "state"), "state");
+    ask(d, "l2", sid, 0);
+    expect(await waitFor(() => d.frames.find((f) => f.t === "location_wait" && f.req_id === "l2"), "wait 2")).toMatchObject({ via: "app" });
+    await sleep(100);
+    expect(calls.length).toBe(1);
+  });
+
   it("disabled in Settings: refused, last-known and pending requests forgotten", async () => {
     const { d, p } = await two("loc-off");
     ask(d, "a1", "sA");
