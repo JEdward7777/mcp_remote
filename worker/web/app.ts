@@ -1294,10 +1294,15 @@ function renderWaitlist(email: string, since: number): void {
       h(
         "p",
         {},
-        "Thanks for signing up! This server is full right now, so new accounts wait for its owner's approval. " +
-          "You'll get in as soon as a spot is free: just open this page again.",
+        "Thanks for signing up! New accounts on this server wait for its owner's approval (it runs on a free plan " +
+          "with room for a limited number of people). Open this page again later: once you are approved, you are in.",
       ),
       h("p", { class: "muted small" }, `Signed in as ${email}, waiting since ${new Date(since).toLocaleDateString()}.`),
+      h(
+        "p",
+        { class: "muted small" },
+        "Only your email address is kept, so the owner can approve you; sign out and ask the owner if you want it removed.",
+      ),
       again,
       signOutButton(),
     ),

@@ -2,7 +2,7 @@
 // Durable Object, addressed by env.REGISTRY.idFromName("registry").
 //
 // It holds ONLY tenant metadata and counters:
-//   tenants  id, email, name, created, status, how they got in, plan, last active day
+//   tenants  id, email, created, status, how they got in, plan, last active day (no names)
 //   daily    per tenant per UTC day: aggregate counters (requests, rows, messages, pushes, launches,
 //            machines, sessions) as reported by that tenant's Hub
 //   days     per UTC day: deployment totals (sum of `daily` + the Registry's own cost), sign-ups, DAU
@@ -166,6 +166,8 @@ export type AdminAction =
   | { t: "disable"; tid: string }
   | { t: "enable"; tid: string }
   | { t: "plan"; tid: string; plan: string }
+  /** Remove a waitlisted or denied sign-up entirely (its email is not kept, not even in the audit log). */
+  | { t: "forget"; tid: string }
   | { t: "pause"; paused: boolean };
 
 export type AdminResult = { ok: true; warning?: string } | { ok: false; status: number; error: string };
@@ -378,8 +380,9 @@ export class Registry extends DurableObject<Env> {
     for (const r of this.sql.exec<{ status: AccountStatus; n: number }>("SELECT status, COUNT(*) AS n FROM tenants GROUP BY status").toArray()) {
       if (r.status in c) c[r.status] = r.n;
     }
+    const json = JSON.stringify(c);
+    if (json !== JSON.stringify(this.counts)) this.setMeta("counts", json);
     this.counts = c;
-    this.setMeta("counts", JSON.stringify(c));
     return c;
   }
 
@@ -505,7 +508,8 @@ export class Registry extends DurableObject<Env> {
       env,
     );
     const email = input.email.slice(0, 254);
-    const name = input.name ? input.name.slice(0, 100) : null;
+    // Data minimization: the Registry keeps the email (the owner needs it to approve), not the name.
+    const name: string | null = null;
     if (d.kind === "refused") return { status: "refused", reason: d.reason, text: refusalText(d.reason) };
     const status: AccountStatus = d.kind === "active" ? "active" : "waitlisted";
     if (!row) {
@@ -805,6 +809,13 @@ export class Registry extends DurableObject<Env> {
     const row = this.getTenant(a.tid);
     if (!row) return { ok: false, status: 404, error: "no such account" };
     const env = this.envVars();
+    if (a.t === "forget") {
+      if (row.status !== "waitlisted" && row.status !== "denied") return { ok: false, status: 409, error: `this account is ${row.status}; only waitlisted or denied sign-ups can be removed` };
+      this.sql.exec("DELETE FROM tenants WHERE tid = ?", row.tid);
+      this.moveCount(row.status, null);
+      this.audit(now, actor, "forget", "(removed sign-up)", row.status);
+      return { ok: true };
+    }
     let next: AccountStatus = row.status;
     let plan = row.plan;
     switch (a.t) {

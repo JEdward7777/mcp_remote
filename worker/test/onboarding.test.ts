@@ -261,6 +261,20 @@ describe("Registry: sign-in, waitlist, invites", () => {
     expect(audit).toContain("disable");
   });
 
+  it("waitlisted or denied sign-ups can be removed entirely (email not kept, not even in the audit log)", async () => {
+    const reg = await freshRegistry({ mode: "waitlist" });
+    await signIn(reg, "gone@example.com");
+    const t = (await reg.listTenants("waitlisted"))[0]!;
+    expect(await reg.act("boss@dev.local", { t: "forget", tid: t.tid })).toEqual({ ok: true });
+    expect(await reg.listTenants("all")).toEqual([]);
+    expect((await reg.overview()).counts.waitlisted).toBe(0);
+    expect(JSON.stringify(await reg.auditLog())).not.toContain("gone@example.com");
+    // Active accounts can't be "forgotten" this way (disable them instead).
+    await signIn(reg, "allowed@example.com");
+    const a = (await reg.listTenants("active"))[0]!;
+    expect(await reg.act("boss@dev.local", { t: "forget", tid: a.tid })).toMatchObject({ ok: false, status: 409 });
+  });
+
   it("an owner account can't be disabled; plans change only for admitted accounts", async () => {
     const reg = await freshRegistry({ mode: "open", userCap: 5 });
     await signIn(reg, "owner@example.com");
@@ -645,6 +659,42 @@ describe("signed-in pairing start (one-line install)", () => {
     p.ws.close();
   });
 
+  it("works while the GLOBAL anonymous pair-start cap is used up (it never consults the Throttle DO)", async () => {
+    const shards = [0, 1, 2, 3].map((i) => E.THROTTLE.get(E.THROTTLE.idFromName(`shard:${i}`)) as unknown as DurableObjectStub);
+    const drain = (empty: boolean) =>
+      Promise.all(
+        shards.map((st) =>
+          runInDurableObject(st, (inst: any, state) => {
+            const now = Date.now();
+            if (empty) {
+              state.storage.sql.exec(
+                "INSERT INTO buckets (k, t, at, full_at) VALUES ('ps:*', 0, ?, ?) ON CONFLICT(k) DO UPDATE SET t = 0, at = excluded.at, full_at = excluded.full_at",
+                now,
+                now + 3600_000,
+              );
+              inst.cache.set("ps:*", { t: 0, at: now });
+            } else {
+              state.storage.sql.exec("DELETE FROM buckets WHERE k = 'ps:*'");
+              inst.cache.delete("ps:*");
+            }
+          }),
+        ),
+      );
+    await drain(true);
+    try {
+      const anon = await SELF.fetch(`${ORIGIN}/api/pair/start`, { method: "POST", headers: { "content-type": "application/json", "cf-connecting-ip": "192.0.2.201" }, body: "{}" });
+      expect(anon.status).toBe(429); // a fresh network, refused by the global cap
+      const r = await SELF.fetch(`${ORIGIN}/api/pair/start-signed`, {
+        method: "POST",
+        headers: { cookie: await cookieFor("inst-global"), origin: ORIGIN, "content-type": "application/json", "cf-connecting-ip": "192.0.2.201" },
+        body: "{}",
+      });
+      expect(r.status, await r.clone().text()).toBe(200);
+    } finally {
+      await drain(false);
+    }
+  });
+
   it("unknown, malformed or anonymous-flow codes are refused; the account's own bucket limits starts", async () => {
     expect((await redeem("ABCD-EFGH-JKMN-PQRS")).status).toBe(404);
     expect((await redeem("ABCD-EFGH")).status).toBe(400);
@@ -664,6 +714,20 @@ describe("signed-in pairing start (one-line install)", () => {
     }
     expect(last429).not.toBeNull();
     expect((await jsonOf(last429!)).error).toMatch(/^too many install commands for this account; try again in/);
+  });
+
+  it("an invited (Registry-admitted) account's computer is accepted even before any phone of it connected", async () => {
+    const tid = "g-invitedfirstpair";
+    const cookie = `__Host-mr_session=${await makeSessionCookieValue(E.SESSION_SECRET, { tid, email: "invited.first@example.com", adm: "reg" })}`;
+    const { code } = await jsonOf(await startSigned(cookie));
+    const pr = await jsonOf(await redeem(code));
+    // Not on ALLOWED_EMAILS and OPEN_SIGNUP is false: only the adm claim handed over with the pairing lets it in.
+    const d = await connect("/api/daemon/ws", { authorization: `Bearer ${pr.token}` });
+    expect(typeof d).not.toBe("number");
+    if (typeof d !== "number") {
+      await waitFor(() => last(d, "welcome"), "welcome");
+      d.ws.close();
+    }
   });
 
   it("the machine cap applies when the code is redeemed", async () => {

@@ -3,6 +3,8 @@
 `mcp-remote` CLI (Node 22+):
 
 - `mcp-remote pair <worker-url> [--name <n>]` - device pairing; saves `~/.config/mcp-remote/config.json` (0600).
+- `mcp-remote pair --code XXXX-XXXX-XXXX-XXXX <worker-url>` - one-line install: redeems a pre-approved code the
+  signed-in user got in the app (Machines -> Add a computer); no approval step.
 - `mcp-remote daemon` - one per computer; single outbound WebSocket to the Hub, plus a Unix socket
   (`~/.config/mcp-remote/daemon.sock`, 0600; a per-user named pipe on Windows) for shims.
 - `mcp-remote shim` - stdio MCP server Claude Code spawns per session. Declares `claude/channel`; phone messages

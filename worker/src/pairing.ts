@@ -51,6 +51,8 @@ interface PairingState {
   /** Started by a signed-in user: `tid`/`email` are set from the start. */
   signed?: boolean;
   email?: string;
+  /** How the starting account was admitted (session cookie claim), handed to the Hub with the machine. */
+  adm?: "env" | "reg";
   /** Approve attempts on this code (Phase 3: locks after approve_attempts_per_code). */
   attempts?: number;
   result?: Extract<PairResult, { t: "approved" }>;
@@ -120,10 +122,10 @@ export class Pairing extends DurableObject<Env> {
    * A signed-in user started this pairing from the app (pre-approved for `tid`). The Worker charged it
    * to that account's Hub first; the global unauthenticated pair-start cap doesn't apply.
    */
-  async initSigned(tid: string, email: string): Promise<{ ok: boolean; expires_at: number }> {
+  async initSigned(tid: string, email: string, adm: "env" | "reg" = "env"): Promise<{ ok: boolean; expires_at: number }> {
     if (await this.load()) return { ok: false, expires_at: 0 };
     const expires_at = Date.now() + PAIRING_TTL_MS;
-    const state: PairingState = { pairing_id: "", poll_hash: "", hostname: "", expires_at, status: "presigned", signed: true, tid, email };
+    const state: PairingState = { pairing_id: "", poll_hash: "", hostname: "", expires_at, status: "presigned", signed: true, tid, email, adm };
     await this.ctx.storage.put("state", state);
     await this.ctx.storage.setAlarm(expires_at);
     return { ok: true, expires_at };
@@ -138,7 +140,7 @@ export class Pairing extends DurableObject<Env> {
     pollSecret: string,
     hostname: string,
     maxAttempts = Number.POSITIVE_INFINITY,
-  ): Promise<{ ok: true; tid: string; email: string } | { ok: false; status: number; error: string }> {
+  ): Promise<{ ok: true; tid: string; email: string; adm: "env" | "reg" } | { ok: false; status: number; error: string }> {
     const s = await this.load();
     if (!s || !s.signed || !s.tid) return { ok: false, status: 404, error: "unknown or expired code; get a new install command from the app (Machines)" };
     const attempts = (s.attempts ?? 0) + 1;
@@ -153,7 +155,7 @@ export class Pairing extends DurableObject<Env> {
     s.poll_hash = await sha256Hex(pollSecret);
     s.hostname = hostname;
     await this.ctx.storage.put("state", s);
-    return { ok: true, tid: s.tid, email: s.email ?? "" };
+    return { ok: true, tid: s.tid, email: s.email ?? "", adm: s.adm ?? "env" };
   }
 
   /**

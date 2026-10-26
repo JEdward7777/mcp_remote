@@ -16,16 +16,21 @@ HTTP surface:
 
 | Route | Auth | Purpose |
 | --- | --- | --- |
-| `GET /auth/login`, `/auth/callback` | - | Google authorization code + PKCE; sets `__Host-mr_session` |
+| `GET /auth/login[?invite=]`, `/auth/callback` | - | Google authorization code + PKCE; the Registry decides (signup.ts): `__Host-mr_session` (active) or `__Host-mr_wait` (waitlisted) |
 | `POST /auth/logout` | cookie + Origin | clear session |
-| `GET /auth/dev?user=` | `DEV_AUTH=1` only | local fake sign-in (404 otherwise, and never on *.workers.dev) |
-| `GET /api/me`, `/api/state`, `/api/machines` | cookie | who am I / snapshot (incl. today's usage) / machine list |
+| `GET /auth/dev?user=[&gate=1][&invite=]` | `DEV_AUTH=1` only | local fake sign-in (404 otherwise, and never on *.workers.dev); `gate=1` applies sign-up gating |
+| `GET /admin` | - | redirect to the app's Admin view (`/#/admin`) |
+| `GET /api/invite?token=` | - (per-IP, no DO) | is an invite link genuine and unexpired (signature only) |
+| `GET /api/me`, `/api/state`, `/api/machines` | cookie | who am I (incl. `owner`) / snapshot (incl. today's usage) / machine list; `/api/me` with only a waitlist cookie: `403 {waitlisted}` or, once approved, the session cookie |
 | `GET /api/usage` | cookie | this account's usage per UTC day (last 35 days) |
 | `DELETE /api/machines/:id` | cookie + Origin | revoke a machine (closes its socket) |
 | `POST /api/pair/start` | - (throttled per IP) | daemon starts pairing: `{code, pairing_id, poll_secret, expires_at}` |
 | `GET /api/pair/wait` (WebSocket) | poll secret | daemon waits for approval (socket held by the Worker; any frame but `ping` closes it) |
 | `POST /api/pair/claim` | poll secret | daemon saved its token: the pairing is forgotten |
 | `POST /api/pair/approve` | cookie + Origin | phone approves `{code, machine_name?}` |
+| `POST /api/pair/start-signed` | cookie + Origin | one-line install: a pre-approved 16-char code, charged to the account (not the anonymous cap) |
+| `POST /api/pair/redeem` | - (per-IP) | `mcp-remote pair --code`: `{code, hostname?}` -> machine token + pairing id/secret for the claim |
+| `GET/POST/DELETE /api/admin/*` | cookie + `OWNER_EMAILS` (+ Origin for writes) | overview, tenants (approve/deny/forget/disable/enable/plan), sign-up pause, invites, audit |
 | `POST /api/push/subscribe` | cookie + Origin | register this phone's Web Push subscription (`PushSubscription.toJSON()`; known push services only; max 5 per account) |
 | `DELETE /api/push/subscribe` | cookie + Origin | `{endpoint}`, `{id}` (any device of the account, e.g. a lost phone) or `{all: true}`: unregister |
 | `GET /api/ws` (WebSocket) | cookie + Origin | phone socket |
@@ -36,3 +41,8 @@ per-tenant and per-IP limit; `src/ratelimit.ts` is the token-bucket math, `src/u
 counters, `src/throttle.ts` the `Throttle` Durable Object for unauthenticated endpoints. Over a limit, HTTP
 answers `429` with `Retry-After` and `{error, retry_after_s}`; WebSockets get an `error` frame (or close
 `4029` for floods). See `../harness/SETUP.md` ("Limits and the free plan").
+
+Sign-up, Registry, admin (Phase 4b): `src/signup.ts` (gating precedence, guard, config), `src/registry.ts` (the
+`Registry` Durable Object: the one cross-tenant store, tenant metadata + counters only), `web/admin.ts` (owner
+page), `web/onboard.ts` (one-line install), `scripts/dl.mjs` (packs the CLI into `public/dl/` at build time).
+See `../harness/SETUP.md` ("Sign-up, admin and alerts").

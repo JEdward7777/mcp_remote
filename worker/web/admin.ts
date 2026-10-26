@@ -170,14 +170,21 @@ export function buildAdmin(): AdminView {
         "Counted: what each account's Hub and the Registry metered (Durable Object requests incl. WebSocket frames / 20, " +
           "SQLite rows), reported at most every " +
           (o.config.report_minutes === null ? "(reports off)" : `${o.config.report_minutes} min`) +
-          " per account. Worker-only requests (static files, /api/me, sign-in, pairing) are not included. The limits are " +
+          " per account. Not included: Worker-only requests (static files, /api/me, sign-in) and anonymous pairing starts. The limits are " +
           "assumed free-plan numbers (see SETUP, verify at the desk).",
       ),
     );
     const pause = h("input", { type: "checkbox" }) as HTMLInputElement;
     pause.checked = o.owner_paused;
     pause.onchange = () => void act("/api/admin/signups", { paused: pause.checked }, pause.checked ? "Sign-ups paused" : "Sign-ups resumed");
-    rows.push(h("label", { class: "toggle" }, pause, h("span", {}, "Pause new sign-ups (strangers go to the waitlist; invites still work)")));
+    rows.push(
+      h(
+        "label",
+        { class: "toggle" },
+        pause,
+        h("span", {}, "Pause new sign-ups: accounts that would be auto-approved go to the waitlist (invite links, ALLOWED_EMAILS and owners still get in)"),
+      ),
+    );
     today.replaceChildren(...rows);
   }
 
@@ -220,7 +227,7 @@ export function buildAdmin(): AdminView {
       no.onclick = () => {
         if (confirm(`Deny ${t.email}? They can't sign up again unless you approve them later.`)) void act(`/api/admin/tenants/${encodeURIComponent(t.tid)}/deny`, {}, `Denied ${t.email}`);
       };
-      return h("div", { class: "machine-row", "data-tid": t.tid }, h("span", { class: "proj" }, t.email), h("span", { class: "time" }, `since ${fmtDate(t.created_at)}`), ok, no);
+      return h("div", { class: "machine-row", "data-tid": t.tid }, h("span", { class: "proj" }, t.email), h("span", { class: "time" }, `since ${fmtDate(t.created_at)}`), ok, no, forgetButton(t));
     });
     waitlist.replaceChildren(h("h2", {}, `Waitlist (${list.length})`), ...(rows.length ? rows : [h("p", { class: "muted small" }, "Nobody is waiting.")]));
   }
@@ -231,6 +238,15 @@ export function buildAdmin(): AdminView {
     sel.value = t.plan;
     sel.onchange = () => void act(`/api/admin/tenants/${encodeURIComponent(t.tid)}/plan`, { plan: sel.value }, `${t.email}: plan ${sel.value}`);
     return sel;
+  }
+
+  /** Waitlisted / denied sign-ups can be removed entirely (their email is not kept). */
+  function forgetButton(t: { tid: string; email: string }): HTMLElement {
+    const b = h("button", { type: "button", class: "small ghost" }, "Remove");
+    b.onclick = () => {
+      if (confirm(`Remove ${t.email} from the list? Their email is deleted; they can sign up again.`)) void act(`/api/admin/tenants/${encodeURIComponent(t.tid)}/forget`, {}, "Removed");
+    };
+    return b;
   }
 
   function statusButton(t: { tid: string; status: Status; email: string }): HTMLElement | null {
@@ -294,6 +310,7 @@ export function buildAdmin(): AdminView {
           h("span", { class: "time" }, t.last_active_day ? `active ${t.last_active_day}` : `joined ${fmtDate(t.created_at)}`),
           t.status === "active" || t.status === "disabled" ? planSelect(t) : null,
           statusButton(t),
+          t.status === "denied" ? forgetButton(t) : null,
         ),
       );
     all.replaceChildren(h("h2", {}, "All accounts"), ...(rows.length ? rows : [h("p", { class: "muted small" }, "None yet.")]));

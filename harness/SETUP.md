@@ -47,9 +47,15 @@ In <https://console.cloud.google.com/>:
 
 ## 4. Decide who may sign up
 
-Phase 1 gating is minimal (waitlist/caps come in Phase 4b):
-- default: only the emails in `ALLOWED_EMAILS` (comma-separated, verified Google emails);
-- or set `"OPEN_SIGNUP": "true"` in `worker/wrangler.jsonc` to let any verified Google account in.
+`OPEN_SIGNUP` in `worker/wrangler.jsonc` (`vars`) picks the mode (details: "Sign-up, admin and alerts" below):
+
+- `"false"` (default, closed): only `ALLOWED_EMAILS`, `OWNER_EMAILS` and people with an invite link you created
+  in Admin;
+- `"waitlist"`: everyone else can sign up but waits until you approve them in Admin (one tap);
+- `"true"` (open): anyone with a verified Google account is let in automatically until `USER_CAP` active
+  accounts (default **10**), then new sign-ups go to the waitlist.
+
+Set `OWNER_EMAILS` (step 5 / "Plans") to your own email: that is what shows you the **Admin** page.
 
 ## 5. Set secrets
 
@@ -76,9 +82,11 @@ Without these keys everything else works; the phone's Settings say "Notification
 server". Replacing the keys later invalidates every phone's subscription: each phone re-registers by itself the
 next time the app is opened (until then it gets no notifications).
 
-Gating is re-checked on every request: removing an email from `ALLOWED_EMAILS` (or setting `OPEN_SIGNUP` back to
-`false`) signs that person out immediately and refuses their daemons the next time they connect (an already open
-daemon socket stays up until it reconnects; revoke the machine to cut it at once).
+Gating is re-checked on every request for accounts that got in through `ALLOWED_EMAILS` / `OWNER_EMAILS` (or
+before Phase 4b): removing the email (or, for pre-4b accounts, setting `OPEN_SIGNUP` back to `false`) signs that
+person out immediately and refuses their daemons the next time they connect (an already open daemon socket stays
+up until it reconnects; revoke the machine to cut it at once). Accounts let in by the Registry (invite link, user
+cap, your approval) stay until you **Disable** them in Admin, which cuts everything at once.
 
 Optional: `GOOGLE_REDIRECT_URI` (only if you serve from a different URL than the request origin).
 **Never** set `DEV_AUTH` on the deployed Worker (it only belongs in `worker/.dev.vars`; the code also refuses it on
@@ -121,7 +129,23 @@ Open `$URL` in Chrome on Android and sign in. Then:
 
 ## 9. Install the CLI on each computer
 
-From the repo:
+**Easiest (Phase 4b):** on the phone or any browser where you are signed in: **Machines -> Add a computer**. It
+shows one command for the computer's terminal, with a pairing code already filled in:
+
+```sh
+npm i -g https://mcp-remote.<you>.workers.dev/dl/mcp-remote-0.1.0-<sha8>.tgz && mcp-remote pair --code XXXX-XXXX-XXXX-XXXX https://mcp-remote.<you>.workers.dev
+```
+
+It installs the CLI from your own Worker (the file is built from this repo by `wrangler deploy`; the name pins
+version and content, and the app shows its full sha256 plus a "verify first" variant:
+`curl -fsSLO <url> && echo "<sha256>  <file>" | sha256sum -c - && npm i -g ./<file> && mcp-remote pair --code ...`;
+nothing is piped into a shell) and pairs the computer to the signed-in account without an approval step (the code
+works once, for 10 minutes; whoever has it can pair a computer to your account until then, so don't share it).
+Then continue with steps 11 and 12 (`mcp-remote install-service`, `mcp-remote setup-claude`), which the app lists
+too. If `npm i -g` needs root, set a user prefix first (`npm config set prefix ~/.local`, with `~/.local/bin` on
+your `PATH`).
+
+Or from the repo:
 
 ```sh
 cd mcp
@@ -132,11 +156,13 @@ mcp-remote --help
 
 ## 10. Pair the computer
 
+(Skip this if you used the one-line install in step 9.)
+
 ```sh
 mcp-remote pair $URL             # optional: --name "work laptop"
 ```
 
-It prints a code like `K7QX-M2RP`. On the phone: **Machines -> Pair a computer**, enter the code, **Approve**.
+It prints a code like `K7QX-M2RP`. On the phone: **Machines -> Or: approve a code**, enter the code, **Approve**.
 The CLI prints `Paired "<name>" to <your email>` and saves `~/.config/mcp-remote/config.json` (mode 0600, dir 0700).
 Check that the email it prints is yours. Codes expire after 10 minutes.
 If you pair a computer again (new token), revoke its previous entry under Machines; the phone flags an older
@@ -335,6 +361,124 @@ development-channels warning) right after it started it, before its shim connect
 restart are never typed into. Auto-restart (off by default) restarts a crashed session (non-zero
 exit) with growing delays, resuming the conversation, and gives up after 5 crashes in a row (a run longer than
 10 minutes resets the count); a clean exit or **Stop** is never restarted.
+
+## Sign-up, admin and alerts (Phase 4b)
+
+### Who gets in (precedence)
+
+The first rule that matches decides, at every sign-in (`worker/src/signup.ts`):
+
+1. No verified email: refused.
+2. `OWNER_EMAILS`: in (can't be waitlisted or disabled).
+3. Disabled by you in Admin: refused ("disabled by the operator").
+4. `ALLOWED_EMAILS`: in (skips cap and waitlist).
+5. Already in through the Registry (invite, cap, your approval): stays in, even if the cap is lower now.
+   (Accounts that got in through the lists keep their old rule: removing the email ends it; accounts from before
+   Phase 4b stay in unless `OPEN_SIGNUP` is `false` and they are not listed.)
+6. A valid invite link: in (skips the waitlist, the cap and a sign-up pause).
+7. On the waitlist: still waiting. Denied by you: refused.
+8. `OPEN_SIGNUP`: `false` -> refused ("not on the sign-up list; ask for an invite"); `waitlist` -> waitlist;
+   `true` -> in while active accounts < `USER_CAP` and sign-ups are not paused, else waitlist. A full waitlist
+   (`WAITLIST_MAX`, default 500) refuses.
+
+If the Registry can't be reached at sign-in, owners and `ALLOWED_EMAILS` still get in (fail open: they need no
+Registry decision); everyone else is asked to try again (fail closed: the cap can't be checked). Already
+signed-in users never need the Registry (it is not on any request path).
+
+**Waitlist.** A waitlisted person gets a "You're on the waitlist" page (a waitlist cookie, not a session: no API
+access). When you approve them, they are in the next time they open the page (it re-checks with the Registry at
+most every 30 s; no polling, no email is sent: tell them). **Approve**, **Deny** (refused from then on; you can
+still approve later) or **Remove** (forgets the entry and its email; they can sign up again).
+
+**Invite links.** Admin -> Invite links: valid for 1-30 days (default 7), up to N uses (default 5; empty =
+unlimited), with a note. The link is `https://<your app>/?invite=<token>`; the token is signed with
+`SESSION_SECRET` (forged or expired links are refused without touching any Durable Object), and the Registry
+checks at sign-in that it is not revoked or used up (a used-up link falls back to the normal rules). **Revoke**
+stops it at once. Rotating `SESSION_SECRET` invalidates every link.
+
+**Upgrading from Phase 4:** `OPEN_SIGNUP: "true"` now means "up to `USER_CAP` (default 10) accounts". Accounts
+that already exist are registered as active the first time they are used after the deploy (their Hub reports),
+so they don't count as new; an account not used at all since the deploy would be treated as a new sign-up when
+its 30-day cookie runs out. To be safe, raise `USER_CAP` or list existing users in `ALLOWED_EMAILS` before deploying.
+The deploy applies migration `v3` (new `Registry` class); wrangler should say so.
+
+### Admin page (owner only)
+
+Open **Admin** in the app (or `https://<your app>/admin`). It appears only for `OWNER_EMAILS` accounts, and every
+`/api/admin/*` call checks the cookie and `OWNER_EMAILS` on the server (non-owners get 403; writes also need
+our Origin). It shows, loaded on open / **Refresh** (no polling):
+
+- **Today vs the free plan**: Durable Object requests (connects, API calls, WebSocket frames / 20), database rows
+  read and written, summed over all accounts plus the Registry itself, against the assumed free daily limits
+  (`budget.ts`, unverified), and what the guard is doing. Not counted: Worker-only requests (static files,
+  `/api/me`, sign-in) and anonymous pairing starts; numbers lag by at most `USAGE_REPORT_MINUTES` per account.
+- **Accounts**: active / cap, waiting, disabled, denied; per UTC day (last 14): sign-ups, active accounts (DAU),
+  requests, rows written, messages.
+- **Waitlist** with Approve / Deny / Remove. **Top accounts today** by share of a free limit (emails are shown
+  to the owner only). **All accounts**: change the plan (`free` / `owner`), **Disable** / **Enable**.
+- **Invite links** (create / copy / revoke) and the **Audit log** (every owner action: approve, deny, remove,
+  disable, enable, plan, pause, invite create / revoke, and invite uses; last 1,000 kept).
+
+**Disable** cuts the account off at once: its Hub refuses everything (API calls 403 "disabled", which also signs
+that browser out; the phone socket is closed with 4403 and the app says the account is disabled), its daemons are
+disconnected (close 4001) and refused on reconnect (403), so they exit with code 3 and the service doesn't
+restart them (as for a revoked machine). It also can't sign in again. **Enable** lets it back in (a browser that
+was just refused may need up to a minute, or a new sign-in); its computers need `mcp-remote daemon` / the
+service started again. Changing the plan takes effect in that account's Hub at once.
+
+### Global guard and owner alerts
+
+The `Registry` keeps today's deployment-wide totals. When the highest share of any free daily limit reaches:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `ALERT_USAGE_PERCENTS` | `50,80` | Web Push to the owner's phones ("Usage passed 50% of the free plan"), once per threshold per UTC day |
+| `GUARD_PAUSE_SIGNUPS_PERCENT` | `80` | new sign-ups that would be auto-approved go to the waitlist for the rest of the UTC day |
+| `GUARD_TIGHTEN_PERCENT` / `GUARD_FREE_SHARE_PERCENT` | `90` / `5` | free accounts' daily share drops from 10% to 5% for the rest of the UTC day (owner plan unchanged) |
+| `ALERT_SIGNUPS_PER_DAY` | `20` | alert when that many accounts signed up today (once a day) |
+| `ALERT_WAITLIST` | on | alert when someone joins the waitlist (at most once a day; `off` to stop) |
+
+Any of them can be `off`. Alerts go to every phone with notifications on of every active account whose email is in
+`OWNER_EMAILS` (their own Hub sends them; they count against that account's push cap). Tapping one opens Admin.
+The manual **Pause new sign-ups** switch in Admin does the same as the guard's pause until you switch it off.
+
+Why these are safe defaults: the guard only ever makes things stricter, and only for the current UTC day (it
+lifts itself at midnight). If the Registry can't be reached, Hubs keep the last guard state they got for today
+(fail open to the per-account daily budgets, which still bound every account); sign-ups for strangers fail closed.
+
+### The Registry (what is stored, what it costs)
+
+One `Registry` Durable Object (SQLite) is the only store that spans accounts (D13). It holds: per account its id,
+email (no name), when it signed up, status (active / waitlisted / denied / disabled), how it got in, plan, and the
+last active day; per account per UTC day the counters its Hub reported (requests, rows read / written, messages,
+launches, pushes, computers, sessions; kept 35 days); per day the totals, sign-ups and active accounts; invite
+links; the audit log. Never message content, project or machine names, or locations.
+
+Each account's Hub reports its own counters at most every `USAGE_REPORT_MINUTES` (default 15) while something is
+counted, once at the start of a new UTC day (with the final numbers of the previous one) and once when its daily
+budget runs out; never per message. A report costs one Registry request and about 3 rows read / 2 written there
+(measured; 4 / 3 on an account's first report of the day), charged to that account's own daily budget, plus one
+row in its Hub. Sign-ins cost one Registry request each; the Admin page a few. Chosen over D1: no new product or
+setup step, one object serializes the cap and invite counts without races, and its load is small (see the
+checklist for the single-object throughput assumption).
+
+### Settings (all optional, `vars` in `worker/wrangler.jsonc`)
+
+`OPEN_SIGNUP` (`false` / `waitlist` / `true`), `USER_CAP` (default 10), `WAITLIST_MAX` (500),
+`USAGE_REPORT_MINUTES` (15; `off` disables reports, and with them the Admin numbers and the guard),
+`ALERT_USAGE_PERCENTS`, `ALERT_SIGNUPS_PER_DAY`, `ALERT_WAITLIST`, `GUARD_PAUSE_SIGNUPS_PERCENT`,
+`GUARD_TIGHTEN_PERCENT`, `GUARD_FREE_SHARE_PERCENT`, `LIMIT_PAIR_START_SIGNED` (one-line install codes per
+account, free plan default `5,10/h`). Invalid values fall back to the default.
+
+### One-line install: what it costs and why it bypasses the anonymous pairing cap
+
+**Add a computer** starts the pairing from the signed-in session (`POST /api/pair/start-signed`): it is charged to
+that account (its own persisted bucket `LIMIT_PAIR_START_SIGNED`, its daily budget, its machine cap; the Pairing
+DO's ~8 rows written are added to its usage) and never touches the global cap on anonymous `POST /api/pair/start`
+(about 52 per hour for everyone), so a flood of anonymous starts can't block signed-in users from adding
+computers. The code is 16 characters (~79 bits), single use, 10 minutes; redeeming it (`POST /api/pair/redeem`,
+per-IP limited like the pairing wait) returns the machine token directly, and the CLI then confirms with the
+existing claim call. The 8-character flow (`mcp-remote pair <url>` + approve on the phone) still works.
 
 ## Notifications, location and map links (Phase 4)
 
@@ -622,15 +766,47 @@ Phase 4 (Web Push, PWA, location) adds these; `developers.cloudflare.com` was st
       still on `fcm.googleapis.com` (the subscribe allowlist, `src/webpush.ts`). If Chrome hands out another
       host, registration fails with "endpoint host ... is not a known Web Push service": add the host there.
 
-Also on the first `npx wrangler deploy` after Phase 3: it applies migration `v2` (new `Throttle` class);
-wrangler should say so. Phase 4 needs no migration (new tables are created by the Hub itself).
+Phase 4b (sign-up, Registry, admin, one-line install) adds these; `developers.cloudflare.com` was still unreachable:
 
-### Known gaps (for Phase 4b)
+- [ ] A single Durable Object (the `Registry`) can take our load: assumed soft limit ~1,000 requests/s per object;
+      our load is one call per sign-in, per account per `USAGE_REPORT_MINUTES` and per Admin page load —
+      <https://developers.cloudflare.com/durable-objects/platform/limits/>
+- [ ] A Durable Object calling another one over RPC (Hub -> Registry reports, Registry -> Hub alerts / account
+      changes) is billed as one request on the callee and not on the Worker request limit —
+      <https://developers.cloudflare.com/durable-objects/platform/pricing/>
+- [ ] `ctx.waitUntil()` in a Durable Object keeps the report / alert call running after the event returns (the
+      Hub doesn't await the Registry's answer inside the event) —
+      <https://developers.cloudflare.com/durable-objects/api/state/>
+- [ ] D1 (not used; the alternative to the Registry DO): free-plan limits (assumed 5 million rows read / 100,000
+      rows written per day, 5 GB) — <https://developers.cloudflare.com/d1/platform/pricing/>
+- [ ] Static assets: the CLI tarball (`/dl/mcp-remote-<v>-<sha8>.tgz`, ~180 KB) is within the per-file asset
+      size limit (assumed 25 MiB), is served with a binary content type, and `_headers` caching rules apply —
+      <https://developers.cloudflare.com/workers/static-assets/>
+- [ ] `wrangler deploy` runs the build command (`node build-web.mjs`, which runs `npm pack -w mcp`) from the repo
+      checkout, so the deployed tarball matches the commit (it does locally with wrangler 4.152.0).
+- [ ] On a real deploy: `npm i -g https://<app>/dl/...tgz` installs on Linux and macOS (Node 22+), then
+      `mcp-remote pair --code ...` pairs; the Admin page and its numbers load on an Android phone; an owner alert
+      push arrives and opens Admin; a waitlisted Google account sees the waiting page and gets in after approval.
+
+Also on the first `npx wrangler deploy` after Phase 3: it applies migration `v2` (new `Throttle` class);
+wrangler should say so. Phase 4 needs no migration (new tables are created by the Hub itself). Phase 4b applies
+migration `v3` (new `Registry` class).
+
+### Known gaps
 
 - The global pairing-start cap (about 52 per hour for everyone) protects the quota, but someone hammering
-  `/api/pair/start` from many networks can use it up and block new pairings for everyone until it refills.
-  The planned one-line install for signed-in users (D12) should start pairing from the signed-in session
-  (pre-approved, tied to the account) and so bypass this unauthenticated cap.
+  `/api/pair/start` from many networks can use it up and block new *anonymous* pairings (`mcp-remote pair <url>`)
+  for everyone until it refills. Phase 4b: signed-in users add computers with **Add a computer** (one-line
+  install), which is charged to their account and does not use that cap.
+- Unknown install codes sent to `POST /api/pair/redeem` each wake a (fresh, empty) Pairing Durable Object, like
+  `/api/pair/wait` with a made-up code: limited per IP in isolate memory only (free, best effort); a distributed
+  flood is bounded only by the platform.
+- The Admin totals cover what Hubs and the Registry meter (Durable Object requests and SQLite rows); Worker-only
+  requests (static files, `/api/me`, sign-in) and anonymous pairing starts are not counted, and each account's
+  numbers can lag by up to `USAGE_REPORT_MINUTES` (an account that goes quiet right after a burst reports it with
+  its next event, or the next day). Up to 49 of the Registry's own events can be lost on a deploy.
+- Waitlisted people are not notified when you approve them (no email); they get in the next time they open the
+  page.
 - The pairing wait socket is accepted by the Worker, not by the Pairing Durable Object: the Worker answers at
   most one `ping` per 5 s and closes the socket (1008) on any other frame; client frames never reach the DO
   (tested: none arrive even when a raw client keeps sending after the close, and a late `claimed` frame does
@@ -682,6 +858,16 @@ wrangler should say so. Phase 4 needs no migration (new tables are created by th
 - A lost phone or a shared computer still gets notifications: on any other signed-in device, Settings ->
   Devices that get notifications -> **Remove** (or **Remove all devices**).
 - The app shows an old version: tap **Reload** on the "new version" banner (or close and reopen the app).
+- "You're on the waitlist" for someone you want in: Admin -> Waitlist -> Approve (or send them an invite link).
+  "This Google account is not on the sign-up list": `OPEN_SIGNUP` is `false`; add them to `ALLOWED_EMAILS` or
+  send an invite link.
+- No Admin tab: your email must be in `OWNER_EMAILS` (secret), exactly as Google reports it (case doesn't matter).
+- Admin numbers stay at 0: `USAGE_REPORT_MINUTES` is `off`, or nothing was used yet today (accounts report with
+  their next event, at most every 15 min).
+- `mcp-remote pair --code` says "unknown or expired code": get a new command in the app (codes last 10 minutes and
+  work once). "this code was already used": the computer is probably paired already (check Machines).
+- A daemon exits with code 3 and logs "account disabled": the owner disabled the account (Admin -> Enable, then
+  start the service again).
 - Worker logs: `cd worker && npx wrangler tail`.
 
 ## Local development (no Cloudflare/Google needed)

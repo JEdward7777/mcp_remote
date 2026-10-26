@@ -29,6 +29,14 @@ Android PWA  <--wss-->  Cloudflare Worker (workers.dev)  -->  per-user Hub Durab
   position) and send
   Google Maps links (`map_link`), which the app shows as tappable links.
 
+- **Sign-up, onboarding, admin** (Phase 4b): open sign-up with Google up to a user cap, then a waitlist the owner
+  approves with one tap; invite links skip it. After sign-in, Machines -> **Add a computer** shows one command
+  (`npm i -g <this server>/dl/mcp-remote-<version>-<sha>.tgz && mcp-remote pair --code ...`) that installs the CLI
+  and pairs that computer, no code typing. The owner's **Admin** page shows today's usage against the free
+  limits, sign-ups, active users, top accounts, the waitlist, invites and an audit log; a global guard alerts the
+  owner (Web Push) at 50% / 80% and can pause sign-ups or tighten free accounts. A single `Registry` Durable
+  Object is the only cross-tenant store and holds account metadata and counters only (D13).
+
 Free Cloudflare plan only. Everyone shares the deployer's quota, so each account has its own limits (messages
 per minute and per day, launches, connects, ...) enforced in its own Hub, the public endpoints (pairing,
 sign-in) are throttled per IP, and the phone shows today's usage; numbers and tuning in `harness/SETUP.md`
@@ -42,7 +50,10 @@ deployment and desktop setup.
 | `shared/` | `@mcp-remote/shared`: wire protocol (zod schemas + types) for every link, frame limits, backoff, `link.ts` (heartbeat / half-open detection, reconnect spreading), `maplink.ts` (Google Maps URLs), `links.ts` (which message parts become tappable) |
 | `worker/src/index.ts` | Worker router: `/auth/*` (Google OAuth, dev auth), `/api/*` (pairing, machines, WebSockets) |
 | `worker/src/hub.ts` | `Hub` Durable Object: machines, sessions, messages; phone + daemon sockets |
-| `worker/src/pairing.ts` | `Pairing` Durable Object: pending pairing codes (outside any tenant Hub) |
+| `worker/src/pairing.ts` | `Pairing` Durable Object: pending pairing codes (outside any tenant Hub), incl. pre-approved install codes |
+| `worker/src/registry.ts`, `signup.ts` | `Registry` Durable Object (the one cross-tenant store: account metadata, daily counters, invites, audit) and sign-up gating / global guard rules |
+| `worker/web/admin.ts`, `onboard.ts` | owner-only Admin page; one-line install panel |
+| `worker/scripts/dl.mjs` | packs the CLI into `worker/public/dl/` at build time (served as a static asset, sha256 published) |
 | `worker/src/budget.ts` | the one place for assumed free-plan numbers (sources / UNVERIFIED) and every limit |
 | `worker/src/ratelimit.ts`, `usage.ts`, `throttle.ts` | token buckets, per-account usage counters, `Throttle` DO for unauthenticated endpoints |
 | `worker/src/auth.ts`, `crypto.ts`, `oauth.ts` | session cookies, machine tokens, Google ID-token verification |

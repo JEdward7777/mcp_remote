@@ -554,7 +554,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     let added = false;
     try {
       const token = await mintMachineToken(env.SESSION_SECRET, r.tid, machineId);
-      const machine = await hubFor(env, r.tid).addMachine(machineId, hostname, await sha256Hex(token), r.email || undefined);
+      const machine = await hubFor(env, r.tid).addMachine(machineId, hostname, await sha256Hex(token), r.email || undefined, r.adm);
       if ("error" in machine) {
         await pairing.abortApprove();
         return err(409, machine.error);
@@ -641,7 +641,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     for (let attempt = 0; attempt < 5; attempt++) {
       const code = generateCode(SIGNED_CODE_LEN);
       const stub = env.PAIRING.get(env.PAIRING.idFromName(`pair:${normalizeCode(code, SIGNED_CODE_LEN)}`));
-      const r = await stub.initSigned(session.tid, session.email);
+      const r = await stub.initSigned(session.tid, session.email, session.adm ?? "env");
       if (r.ok) return json({ code, expires_at: r.expires_at, url: url.origin });
     }
     return err(503, "could not allocate a pairing code");
@@ -744,7 +744,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     try {
       const name = body.machine_name || claim.hostname;
       const token = await mintMachineToken(env.SESSION_SECRET, session.tid, machineId);
-      const machine = await hubFor(env, session.tid).addMachine(machineId, name, await sha256Hex(token), session.email);
+      const machine = await hubFor(env, session.tid).addMachine(machineId, name, await sha256Hex(token), session.email, session.adm ?? "env");
       if ("error" in machine) {
         await pairing.abortApprove();
         return err(409, machine.error);
@@ -855,7 +855,7 @@ async function handleAdmin(request: Request, env: Env, url: URL, session: Sessio
     return json({ tenants: await reg.listTenants(st as AccountStatus | "all") });
   }
 
-  const t = /^\/api\/admin\/tenants\/([^/]+)\/(approve|deny|disable|enable|plan)$/.exec(path);
+  const t = /^\/api\/admin\/tenants\/([^/]+)\/(approve|deny|disable|enable|plan|forget)$/.exec(path);
   if (t && request.method === "POST") {
     const tid = decodeURIComponent(t[1]!);
     if (!TID_RE.test(tid)) return err(400, "bad account id");
@@ -870,7 +870,7 @@ async function handleAdmin(request: Request, env: Env, url: URL, session: Sessio
       if (typeof body.plan !== "string" || !PLANS[body.plan]) return err(400, `plan must be one of: ${Object.keys(PLANS).join(", ")}`);
       action = { t: "plan", tid, plan: body.plan };
     } else {
-      action = { t: t[2] as "approve" | "deny" | "disable" | "enable", tid };
+      action = { t: t[2] as "approve" | "deny" | "disable" | "enable" | "forget", tid };
     }
     const r = await reg.act(actor, action);
     if (r.ok && action.t === "enable") disabledTenants.delete(tid);

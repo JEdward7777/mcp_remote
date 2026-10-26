@@ -543,7 +543,8 @@ export class Hub extends DurableObject<Env> {
       retryMs,
       text:
         `this account's daily budget is used up (${what} per UTC day, ${this.limits.daily_share_percent}% of the free ` +
-        `plan's daily limit, "${this.plan}" plan); it resets at 00:00 UTC, in ${humanWait(retryMs)}`,
+        `plan's daily limit, "${this.plan}" plan${this.guardShare(now) !== null && this.plan !== "owner" ? "; lowered for today because the whole server is close to its free limits" : ""}); ` +
+        `it resets at 00:00 UTC, in ${humanWait(retryMs)}`,
     };
   }
 
@@ -876,10 +877,13 @@ export class Hub extends DurableObject<Env> {
   // -------------------------------------------------------------------------
   // RPC used by the Worker (never reachable from outside it)
 
-  async addMachine(machineId: string, name: string, tokenHash: string, email?: string): Promise<MachineRecord | { error: string }> {
+  async addMachine(machineId: string, name: string, tokenHash: string, email?: string, adm?: Adm): Promise<MachineRecord | { error: string }> {
     const now = Date.now();
     this.begin("requests", now);
     try {
+      // How the account was admitted (signed cookie, or the pairing a signed-in user started): the
+      // daemon's connect check needs it even if no phone of this account ever connected.
+      if (adm === "env" || adm === "reg") this.rememberAdm(adm);
       return this.addMachineInner(machineId, name, tokenHash, now, email);
     } finally {
       this.saveSnap(undefined, now);
