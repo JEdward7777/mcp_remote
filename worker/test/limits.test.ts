@@ -3,12 +3,23 @@
 import { SELF, evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { tenantIdForDev } from "../src/auth";
-import { FREE_PLAN, PLANS, dailyBudget, formatRate, isOwnerEmail, limitsFor, parseRate, publicLimits, resolvePlan } from "../src/budget";
+import {
+  FREE_PLAN,
+  PLANS,
+  dailyBudget,
+  formatRate,
+  isOwnerEmail,
+  limitsFor,
+  pairStartGlobalPerHour,
+  parseRate,
+  publicLimits,
+  resolvePlan,
+} from "../src/budget";
 import type { Env } from "../src/env";
 import { Limiter, fullAt, take } from "../src/ratelimit";
-import { checkPairStart, clientKey, perShard, shardOf } from "../src/throttle";
+import { checkPairStart, clientKey, perShard, resetIsolateThrottles, shardOf } from "../src/throttle";
 import { UsageMeter, msUntilUtcMidnight, utcDay } from "../src/usage";
-import { E, ORIGIN, connect, cookieFor, daemon, last, newMachine, phone, setLimits, sleep, waitFor, withHub } from "./helpers";
+import { E, ORIGIN, connect, cookieFor, daemon, last, newMachine, phone, relaxLimits, setLimits, sleep, waitFor, withHub } from "./helpers";
 
 const MIN = 60_000;
 const r = (s: string) => parseRate(s)!;
@@ -96,8 +107,8 @@ describe("token buckets (pure, explicit time)", () => {
     expect(clientKey(req("<script>"))).toBe("ip:invalid");
     expect(shardOf("ip:203.0.113.7")).toBe(shardOf("ip:203.0.113.7"));
     const seen = new Set(Array.from({ length: 200 }, (_, i) => shardOf(`ip:10.0.0.${i}`)));
-    expect(seen.size).toBe(8);
-    expect(perShard(r("160,240/h"))).toEqual({ burst: 20, per: 30, perMs: 3600_000 });
+    expect(seen.size).toBe(4);
+    expect(perShard(r("20,52/h"))).toEqual({ burst: 5, per: 13, perMs: 3600_000 });
   });
 
   it("UTC day helpers", () => {
@@ -293,7 +304,7 @@ describe("per-tenant limits in the Hub (D10)", () => {
     for (let i = 0; i < 3; i++) p.send({ t: "send", session_id: sid, text: `u${i}`, client_id: `u${i}` });
     await waitFor(() => p.frames.filter((f) => f.t === "message").length === 3, "3 msgs");
     const rows = () => withHub("usage-a", (_h, s) => s.storage.sql.exec<{ messages: number }>("SELECT messages FROM usage").toArray());
-    expect(await rows()).toEqual([]); // not flushed yet (fewer than 50 events)
+    expect((await rows())[0]?.messages ?? 0).toBe(0); // the 3 messages are not written yet (fewer than 50 events)
     await evictDurableObject(E.HUB.get(E.HUB.idFromName(tenantIdForDev("usage-a"))));
     p.send({ t: "refresh" });
     await waitFor(() => [...p.frames].reverse().find((f) => f.t === "state")?.usage?.messages === 3, "usage restored");
@@ -419,7 +430,7 @@ describe("per-tenant limits in the Hub (D10)", () => {
     expect((await written()) - before).toBe(0);
   });
 
-  it("refused HTTP calls with no open socket write no usage row (counts stay in memory)", async () => {
+  it("with no open socket, allowed calls write their counts; refusals at most once per 10 s", async () => {
     const cookie = await cookieFor("nosock");
     await withHub("nosock", () => {});
     await setLimits("nosock", { http: r("2,1/min") });
@@ -433,7 +444,8 @@ describe("per-tenant limits in the Hub (D10)", () => {
     const statuses: number[] = [];
     for (let i = 0; i < 10; i++) statuses.push((await SELF.fetch(`${ORIGIN}/api/machines`, { headers: { cookie } })).status);
     expect(statuses.filter((x) => x === 429).length).toBe(8);
-    expect(stmts.filter((q) => /usage|meta/.test(q))).toEqual([]);
+    // 2 allowed calls -> 2 usage writes; the 8 refusals right after them (within 10 s of a write) -> none.
+    expect(stmts.filter((q) => /INSERT INTO usage/.test(q)).length).toBe(2);
     expect(await withHub("nosock", (hub) => hub.meter.today(Date.now()).requests)).toBeGreaterThanOrEqual(10);
   });
 
@@ -482,6 +494,127 @@ describe("per-tenant limits in the Hub (D10)", () => {
     for (let i = 0; i < 3; i++) expect(await connect("/api/daemon/ws", { authorization: `Bearer ${token}` })).toBe(401);
     const after = await withHub("count401", (hub) => hub.meter.today(Date.now()).requests as number);
     expect(after - before).toBe(3);
+  });
+
+  // --- review round 2 ---------------------------------------------------------------------------
+  const today = (u: string) =>
+    withHub(u, (hub) => {
+      hub.wake(Date.now());
+      hub.settleRows(Date.now());
+      return hub.meter.today(Date.now());
+    });
+  const hubStub = (u: string) => E.HUB.get(E.HUB.idFromName(tenantIdForDev(u)));
+
+  it("charges HTTP-only calls even when the Hub is evicted between every call", async () => {
+    const u = "evict-http";
+    const { d, p } = await setup(u);
+    d.send({ t: "hello", v: 1, sessions: Array.from({ length: 50 }, (_, i) => ({ session_id: `s${i}`, project: "p" })) });
+    await waitFor(() => last(p, "state")?.sessions.length === 50, "50 sessions");
+    d.ws.close(1000);
+    p.ws.close(1000);
+    await sleep(200);
+    const cookie = await cookieFor(u);
+    await evictDurableObject(hubStub(u));
+    const before = await today(u);
+    await evictDurableObject(hubStub(u));
+    for (let i = 0; i < 20; i++) {
+      expect((await SELF.fetch(`${ORIGIN}/api/state`, { headers: { cookie } })).status).toBe(200);
+      await evictDurableObject(hubStub(u));
+    }
+    const after = await today(u);
+    expect(after.requests - before.requests).toBeGreaterThanOrEqual(20);
+    expect(after.rows_read - before.rows_read).toBeGreaterThan(20 * 50); // each state read ~50 sessions
+  });
+
+  it("over budget, a phone connect reads no machines/sessions and closes write nothing", async () => {
+    const u = "blocked-connect";
+    const { d, p } = await setup(u);
+    d.send({ t: "hello", v: 1, sessions: Array.from({ length: 50 }, (_, i) => ({ session_id: `b${i}`, project: "p" })) });
+    await waitFor(() => last(p, "state")?.sessions.length === 50, "50");
+    await withHub(u, (hub) => {
+      hub.limits = { ...hub.limits, daily: { ...hub.limits.daily, rows_read: 1 } };
+    });
+    p.ws.close(1000);
+    d.ws.close(1000);
+    await sleep(200);
+    const before = await today(u);
+    let stateful = 0;
+    let refused = 0;
+    for (let i = 0; i < 15; i++) {
+      const q = await phone(u);
+      await waitFor(() => last(q, "state") || q.closed, "state or close");
+      const st = last(q, "state");
+      if (st) {
+        expect(st.sessions).toEqual([]);
+        expect(st.machines).toEqual([]);
+        expect(st.usage.blocked).toMatch(/daily budget is used up/);
+        stateful++;
+      } else {
+        expect(q.closed).toMatchObject({ code: 4029 });
+        expect(q.closed!.reason).toMatch(/^daily budget used up; retry in \d+s$/);
+        refused++;
+      }
+      q.ws.close(1000);
+    }
+    await sleep(100);
+    const after = await today(u);
+    expect(stateful).toBe(PLANS.free!.blocked_connects.burst);
+    expect(refused).toBe(15 - stateful);
+    expect(after.rows_written - before.rows_written).toBe(0);
+    expect(after.rows_read - before.rows_read).toBeLessThan(15 * 10); // no 50-session reads
+  });
+
+  it("caps computers per account (free: 10) with a clear refusal", async () => {
+    const u = "many-machines";
+    for (let i = 0; i < 10; i++) await newMachine(u, `box${i}`);
+    const s = (await (
+      await SELF.fetch(`${ORIGIN}/api/pair/start`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.33" },
+        body: "{}",
+      })
+    ).json()) as { code: string };
+    await setLimits(u, { pair_approve: r("100,100/min") });
+    const res = await SELF.fetch(`${ORIGIN}/api/pair/approve`, {
+      method: "POST",
+      headers: { cookie: await cookieFor(u), origin: ORIGIN, "content-type": "application/json" },
+      body: JSON.stringify({ code: s.code }),
+    });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(
+      /^this account already has 10 computers \(the "free" plan allows 10\); revoke one under Machines first/,
+    );
+    // Revoking one (without sessions) makes room.
+    const cookie = await cookieFor(u);
+    const list = (await (await SELF.fetch(`${ORIGIN}/api/machines`, { headers: { cookie } })).json()) as { machines: { machine_id: string }[] };
+    expect((await SELF.fetch(`${ORIGIN}/api/machines/${list.machines[0]!.machine_id}`, { method: "DELETE", headers: { cookie, origin: ORIGIN } })).status).toBe(200);
+    const ok = await SELF.fetch(`${ORIGIN}/api/pair/approve`, {
+      method: "POST",
+      headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
+      body: JSON.stringify({ code: s.code }),
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it("a message round trip fits the daily budget many times over (rows written per message)", async () => {
+    const u = "msg-cost";
+    const { d, p, sid } = await setup(u);
+    await relaxLimits(u);
+    await sleep(50);
+    const b = await today(u);
+    const N = 50;
+    for (let i = 0; i < N; i++) p.send({ t: "send", session_id: sid, text: `m${i}`, client_id: `c${i}` });
+    await waitFor(() => p.frames.filter((f) => f.t === "message").length >= N, "msgs", 10_000);
+    const ids = p.frames.filter((f) => f.t === "message").map((f) => f.message.id);
+    d.send({ t: "ack", session_id: sid, ids });
+    for (let i = 0; i < N; i++) d.send({ t: "send", req_id: `r${i}`, session_id: sid, text: `o${i}`, urgency: "normal" });
+    await waitFor(() => d.frames.filter((f) => f.t === "sent").length >= N, "sent", 10_000);
+    await sleep(100);
+    const a = await today(u);
+    const perMessage = (a.rows_written - b.rows_written) / (2 * N);
+    expect(perMessage).toBeLessThan(10);
+    // The free plan's 500 messages/day stay well inside its rows-written budget.
+    expect(perMessage * PLANS.free!.daily_messages).toBeLessThan(limitsFor("free", {}).daily.rows_written / 2);
   });
 
   it("rate limits the HTTP API per tenant with 429 + Retry-After", async () => {
@@ -557,6 +690,33 @@ describe("pairing abuse protection", () => {
     // Persisted: a fresh instance still knows.
     await evictDurableObject(stub);
     expect((await stub.hit([{ key: "ip:a", rate: two }], 1000)).ok).toBe(false);
+  });
+
+  it("derives the global pairing-start cap from the free plan and enforces it per shard", async () => {
+    expect(pairStartGlobalPerHour()).toBe(52); // 10% of 100,000 rows/day / 8 rows per start / 24 h
+    const defaults = publicLimits({});
+    expect(defaults.pair_start_global).toEqual({ burst: 20, per: 52, perMs: 3600_000 });
+    resetIsolateThrottles();
+    // Distinct IPs that land in the same shard share that shard's 1/4 of the global burst (5).
+    const target = shardOf("ip:192.0.2.0");
+    const ips = Array.from({ length: 400 }, (_, i) => `192.0.2.${i % 250}`)
+      .filter((ip, i, all) => all.indexOf(ip) === i)
+      .filter((ip) => shardOf(`ip:${ip}`) === target)
+      .slice(0, 7);
+    const results = [];
+    for (const ip of ips) {
+      const req = new Request("https://x/", { headers: { "cf-connecting-ip": ip } });
+      results.push((await checkPairStart(E, req, defaults, Date.UTC(2030, 0, 1))).ok);
+    }
+    expect(results.filter(Boolean).length).toBe(5);
+  });
+
+  it("Throttle writes one row per charged key (no secondary index)", async () => {
+    const stub = E.THROTTLE.get(E.THROTTLE.idFromName("cost-probe"));
+    const rate = r("100,100/h");
+    const x = await stub.hit([{ key: "ip:1", rate }, { key: "*", rate }, { key: "ip6:2001:db8:1::/48", rate }], 1000);
+    expect(x.ok).toBe(true);
+    expect(x.rowsWritten).toBeLessThanOrEqual(3);
   });
 
   it("uses the optional Rate Limiting binding first when configured", async () => {

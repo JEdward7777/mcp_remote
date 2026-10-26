@@ -71,7 +71,8 @@ afterAll(() => {
   rmSync(work, { recursive: true, force: true });
 });
 
-describe.skipIf(!tmuxBin)("real tmux", () => {
+// Real tmux processes are slow under load (CI, parallel test files): generous per-test timeout.
+describe.skipIf(!tmuxBin)("real tmux", { timeout: 20_000 }, () => {
   it("passes arguments literally, keeps the dead pane, reports the exit status and env", async () => {
     const t = new Tmux({ bin: tmuxBin!, socket });
     expect(tmuxVersionOk(await t.version())).toBe(true);

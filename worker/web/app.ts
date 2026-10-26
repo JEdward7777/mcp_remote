@@ -486,7 +486,11 @@ function updateSessions(v: SessionsView): void {
   for (const mid of byMachine.keys()) if (!ids.includes(mid)) ids.push(mid);
 
   v.empty.hidden = ids.length > 0;
-  v.empty.textContent = "No computers paired yet. Open Machines to pair one.";
+  // Over the daily budget the Hub sends no machine/session list at all (no database reads): say why.
+  const blocked = state.usage?.blocked && state.usage.day === utcToday() ? state.usage.blocked : null;
+  v.empty.textContent = blocked
+    ? `Unavailable until 00:00 UTC: ${blocked}.`
+    : "No computers paired yet. Open Machines to pair one.";
   v.usage.textContent = usageText();
   v.usage.hidden = !state.usage;
 

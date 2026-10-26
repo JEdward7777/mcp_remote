@@ -90,6 +90,9 @@ type MessageRow = {
   delivered: number;
 };
 
+/** With no socket open, refused calls write their counts at most this often. */
+const NO_SOCKET_REFUSAL_FLUSH_MS = 10_000;
+
 /** Marker: upsertSession found nothing to change. */
 const UNCHANGED = "\u0000unchanged";
 
@@ -216,6 +219,8 @@ export class Hub extends DurableObject<Env> {
   private woke = false;
   /** Set by upgrade() when it accepted a socket (that socket then carries the snapshot). */
   private accepted = false;
+  /** Last usage flush done for a refused call while no socket was open. */
+  private lastLooseFlush = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -311,8 +316,8 @@ export class Hub extends DurableObject<Env> {
    * The tenant's daily budget (budget.ts, DailyBudget): when any part is used up, the Hub refuses work
    * until 00:00 UTC. Returns the reason, or null.
    */
-  private overBudget(now: number): { what: string; text: string; retryMs: number } | null {
-    const t = this.meter.today(now);
+  private overBudget(now: number, storedOnly = false): { what: string; text: string; retryMs: number } | null {
+    const t = storedOnly ? this.meter.storedToday(now) : this.meter.today(now);
     const b = this.limits.daily;
     const reqs = t.requests + Math.ceil(t.frames / FREE_PLAN.wsIncomingMessagesPerBilledRequest);
     const what =
@@ -339,21 +344,34 @@ export class Hub extends DurableObject<Env> {
    * Returns the refusal response, or null when the connect may proceed.
    */
   private connectLimited(kind: "phone" | "daemon", now: number): Response | null {
-    const over = kind === "daemon" ? this.overBudget(now) : null; // a phone may connect to see why
-    const wait = over ? over.retryMs : this.limited("connects", now);
+    const over = this.overBudget(now);
+    // Blocked: a daemon waits until midnight; a phone may connect (rarely) to be told why.
+    const wait = over
+      ? kind === "daemon"
+        ? over.retryMs
+        : this.limited("blocked_connects", now)
+      : this.limited("connects", now);
     if (wait === null) return null;
     const secs = Math.ceil(wait / 1000);
     if (kind === "phone") {
       // A browser can't read an HTTP status on a failed upgrade: accept, then close with a reason.
       const pair = new WebSocketPair();
       pair[1].accept();
-      pair[1].close(CLOSE_RATE_LIMITED, `too many connections; retry in ${secs}s`);
+      pair[1].close(CLOSE_RATE_LIMITED, over ? `daily budget used up; retry in ${secs}s` : `too many connections; retry in ${secs}s`);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     return new Response(over ? `${over.text}; retry in ${secs}s` : `too many connections for this account; retry in ${secs}s`, {
       status: 429,
       headers: { "retry-after": String(secs) },
     });
+  }
+
+  /**
+   * Usage/bucket writes are skipped once the STORED counts already exceed the daily budget: the block
+   * survives an eviction anyway, and a blocked tenant's connects then cost no writes.
+   */
+  private mayWriteUsage(now: number): boolean {
+    return this.overBudget(now, true) === null;
   }
 
   /** Take one token; returns ms to wait when limited, else null. */
@@ -383,10 +401,18 @@ export class Hub extends DurableObject<Env> {
    * storage). `ws` defaults to any OPEN socket. With none open, the state stays in memory (counts are
    * flushed at the 50-event threshold; what an eviction loses then is bounded and accepted).
    */
-  private saveSnap(ws: WebSocket | undefined, now: number): void {
+  private saveSnap(ws: WebSocket | undefined, now: number, refusal = false): void {
     this.settleRows(now);
     const target = ws ?? this.openSockets()[0];
-    if (!target) return;
+    if (!target) {
+      // Nothing carries the state across an eviction: write the counts (one row). Refusals are not
+      // rate limited themselves, so for them at most once per NO_SOCKET_REFUSAL_FLUSH_MS.
+      if (this.meter.hasPending && this.mayWriteUsage(now) && (!refusal || now - this.lastLooseFlush >= NO_SOCKET_REFUSAL_FLUSH_MS)) {
+        this.lastLooseFlush = now;
+        this.meter.flush();
+      }
+      return;
+    }
     const att = target.deserializeAttachment() as Attachment | null;
     if (!att) return;
     try {
@@ -413,6 +439,7 @@ export class Hub extends DurableObject<Env> {
       return;
     }
     this.settleRows(now);
+    if (!this.mayWriteUsage(now)) return; // blocked, and the stored counts already say so: write nothing
     const snap = this.nextSnap(now);
     if (snap.b && Object.keys(snap.b).length) {
       this.sql.exec(
@@ -464,8 +491,7 @@ export class Hub extends DurableObject<Env> {
     const over = this.overBudget(now);
     const wait = over ? null : this.limited("http", now);
     if (!over && wait === null) return null;
-    // Refusals write nothing: the state rides along in memory / the next snapshot.
-    this.saveSnap(undefined, now);
+    this.saveSnap(undefined, now, true);
     if (over) return { ok: false, retryAfterMs: over.retryMs, error: over.text, says_when: true };
     return { ok: false, retryAfterMs: wait!, error: "too many requests for this account" };
   }
@@ -474,11 +500,13 @@ export class Hub extends DurableObject<Env> {
    * Pairing approvals: a persisted bucket (one meta row; read 1, write 1 only when allowed), so a
    * hibernation can't hand out a fresh burst to someone guessing codes.
    */
-  async allowPairApprove(now = Date.now()): Promise<{ ok: boolean; retryAfterMs: number; error?: string; says_when?: boolean }> {
+  async allowPairApprove(
+    now = Date.now(),
+  ): Promise<{ ok: boolean; retryAfterMs: number; error?: string; says_when?: boolean; status?: number }> {
     this.begin("requests", now);
     const over = this.overBudget(now);
     if (over) {
-      this.saveSnap(undefined, now);
+      this.saveSnap(undefined, now, true);
       return { ok: false, retryAfterMs: over.retryMs, error: over.text, says_when: true };
     }
     let b: Bucket | undefined;
@@ -490,14 +518,38 @@ export class Hub extends DurableObject<Env> {
       /* corrupt: start full */
     }
     const r = take(b, this.limits.pair_approve, now);
-    if (r.ok) {
-      this.sql.exec(
-        "INSERT INTO meta (k, v) VALUES ('rl_pair_approve', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-        JSON.stringify(r.bucket),
-      );
+    if (!r.ok) {
+      this.saveSnap(undefined, now, true);
+      return { ok: false, retryAfterMs: r.retryAfterMs };
+    }
+    this.sql.exec(
+      "INSERT INTO meta (k, v) VALUES ('rl_pair_approve', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+      JSON.stringify(r.bucket),
+    );
+    // Machine cap (bounds what any single call can cost, D10). Revoked computers without sessions are
+    // invisible on the phone and only kept as rows: drop them first (writes only when there are any).
+    this.sql.exec(
+      "DELETE FROM machines WHERE revoked_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.machine_id = machines.machine_id)",
+    );
+    const machines = this.sql
+      .exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM machines m WHERE m.revoked_at IS NULL OR EXISTS (SELECT 1 FROM sessions s WHERE s.machine_id = m.machine_id)",
+      )
+      .one().n;
+    if (machines >= this.limits.max_machines) {
+      this.saveSnap(undefined, now, true);
+      return {
+        ok: false,
+        status: 409,
+        retryAfterMs: 0,
+        says_when: true,
+        error:
+          `this account already has ${machines} computers (the "${this.plan}" plan allows ${this.limits.max_machines}); ` +
+          "revoke one under Machines first (a revoked computer still counts while it has sessions: Forget them)",
+      };
     }
     this.saveSnap(undefined, now);
-    return { ok: r.ok, retryAfterMs: r.retryAfterMs };
+    return { ok: true, retryAfterMs: 0 };
   }
 
   /** Idempotent schema upgrades for Hubs created by earlier versions. */
@@ -634,7 +686,7 @@ export class Hub extends DurableObject<Env> {
       return this.upgrade(request, now);
     } finally {
       // Refusals (401/403/429/...) are counted too; an accepted socket already got the snapshot.
-      if (!this.accepted) this.saveSnap(undefined, now);
+      if (!this.accepted) this.saveSnap(undefined, now, true);
     }
   }
 
@@ -656,7 +708,8 @@ export class Hub extends DurableObject<Env> {
       const server = pair[1];
       this.ctx.acceptWebSocket(server, ["phone"]);
       server.serializeAttachment({ kind: "phone" } satisfies Attachment);
-      this.sendPhone(server, this.stateFrame());
+      // Over budget: no machine/session reads at all, only the reason (from memory).
+      this.sendPhone(server, this.overBudget(now) ? { t: "state", machines: [], sessions: [], usage: this.usageInfo(now) } : this.stateFrame());
       this.saveSnap(server, now);
       this.accepted = true;
       return new Response(null, { status: 101, webSocket: pair[0] });
@@ -909,6 +962,8 @@ export class Hub extends DurableObject<Env> {
           this.sendPhone(ws, { t: "error", error: "cannot forget an online session" });
           return;
         }
+        // One forget may write up to MAX_HISTORY_PER_SESSION (+ slack) rows at once, i.e. overshoot the daily
+        // budget by that much once; accepted: bounded per session, and sessions are bounded by max_machines.
         this.sql.exec("DELETE FROM messages WHERE session_id = ?", f.session_id);
         this.sql.exec("DELETE FROM sessions WHERE session_id = ?", f.session_id);
         this.resyncDaemons(); // the id is free now; a computer refused it may claim it
@@ -1155,6 +1210,7 @@ export class Hub extends DurableObject<Env> {
         keep,
       )
       .toArray();
+    // Like forget_session: a single eviction can overshoot the daily budget by one session's history (bounded).
     for (const v of victims) {
       this.sql.exec("DELETE FROM messages WHERE session_id = ?", v.session_id);
       this.sql.exec("DELETE FROM sessions WHERE session_id = ?", v.session_id);

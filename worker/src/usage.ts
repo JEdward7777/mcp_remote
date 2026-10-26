@@ -133,6 +133,12 @@ export class UsageMeter {
     return out;
   }
 
+  /** Today's persisted totals only (what survives an eviction). */
+  storedToday(now: number): UsageDay {
+    this.rollover(now);
+    return { day: this.day, ...this.stored };
+  }
+
   /** Write pending counts (one upsert). No-op if nothing is pending. */
   flush(): void {
     this.lastRowsRead = 0;

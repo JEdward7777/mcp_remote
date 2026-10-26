@@ -332,10 +332,11 @@ export const ShimToDaemon = z.discriminatedUnion("t", [
 export type ShimToDaemon = z.infer<typeof ShimToDaemon>;
 
 export const DaemonToShim = z.discriminatedUnion("t", [
-  z.object({ t: z.literal("registered"), hub_connected: z.boolean() }),
+  /** `reason`: why the daemon is not connected to the server, when the server said (rate limit, daily budget). */
+  z.object({ t: z.literal("registered"), hub_connected: z.boolean(), reason: z.string().max(MAX_DETAIL_CHARS).optional() }),
   /** Registration rejected by the daemon itself (duplicate id, too many sessions); the daemon closes. */
   z.object({ t: z.literal("register_refused"), error: z.string() }),
-  z.object({ t: z.literal("hub_status"), connected: z.boolean() }),
+  z.object({ t: z.literal("hub_status"), connected: z.boolean(), reason: z.string().max(MAX_DETAIL_CHARS).optional() }),
   z.object({ t: z.literal("deliver"), messages: z.array(MessageRecord) }),
   z.object({ t: z.literal("sent"), req_id: ReqId, message_id: z.number().int() }),
   z.object({ t: z.literal("send_error"), req_id: ReqId, error: z.string() }),

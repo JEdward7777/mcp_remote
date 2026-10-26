@@ -324,16 +324,28 @@ The Hub counts the rows of every statement it runs (no extra queries). Once any 
 account's Hub refuses work until 00:00 UTC: phone requests get "this account's daily budget is used up
 (database rows written: 10000 of 10000 per UTC day, 10% of the free plan's daily limit, "free" plan); it
 resets at 00:00 UTC, in 5 h", the daemon is disconnected with close 4029 and waits until midnight (its
-sessions show offline), API calls and daemon connects get HTTP 429 with `Retry-After`, and the phone (which can
-still connect) shows the reason under the session list. Tune with `TENANT_DAILY_SHARE_PERCENT` (1-100,
-free plan) and `OWNER_DAILY_SHARE_PERCENT` (owner plan). With the default 10%, at least ten accounts would
-each have to use up their own budget before the shared free quota runs out; ordinary use (a few hundred
-messages a day) needs a small fraction of it.
+sessions show offline, and Claude's `send_message` says "... the server refused this account for now (daily
+budget used up); the daemon reconnects in 5 h"), API calls and daemon connects get HTTP 429 with
+`Retry-After`. A phone can still connect, at most 5 times in a burst and 6 per hour (`LIMIT_BLOCKED_CONNECTS`),
+and gets only the reason (no machine or session list, so no database reads); further connects are closed with
+4029. While blocked, nothing more is written for the account. Tune with `TENANT_DAILY_SHARE_PERCENT` (1-100,
+free plan) and `OWNER_DAILY_SHARE_PERCENT` (owner plan).
+
+Exhausting the shared free quota takes accounts whose shares add up to 100%: ten free accounts at 10% each, or
+the owner (50%) plus five free accounts. Ordinary use needs a fraction of a share: a message round trip writes
+about 6-8 rows, so the free plan's 500 messages a day use about 3,500 of its 10,000 rows written.
+
+Computers per account are capped too (free: 10, owner: 30; `MAX_MACHINES` for the free plan): this also bounds
+what any single request can cost (a session list reads at most 10 computers x 50 sessions). Pairing an 11th
+computer is refused with "this account already has 10 computers (the "free" plan allows 10); revoke one under
+Machines first (a revoked computer still counts while it has sessions: Forget them)". Forgetting a session (or
+the automatic eviction of old ones) deletes up to ~1,050 history rows in one go and may overshoot the daily
+budget by that much once; that is accepted, since it is bounded per session and sessions per account are capped.
 
 ### Plans: `free` and `owner`
 
 Each account record carries a `plan` (Hub `meta` row, `free` by default); it selects all limits. The `owner`
-plan is for the deployer: per-minute limits about 2-3x higher, 5,000 messages/day, and a 50% daily budget, so
+plan is for the deployer: per-minute limits about 2-3x higher, 5,000 messages/day, 30 computers and a 50% daily budget, so
 a runaway loop in your own sessions still can't take the whole quota. To get it for your account(s) without a
 code change, list the Google email(s):
 
@@ -374,12 +386,17 @@ nothing; a session really flapping up/down costs about one row per change (bound
 
 | Endpoint | Default | Env var | How |
 | --- | --- | --- | --- |
-| `POST /api/pair/start` | `5,10/h` per IP | `LIMIT_PAIR_START_IP` | `Throttle` Durable Object (8 shards, persisted) |
+| `POST /api/pair/start` | `5,10/h` per IP | `LIMIT_PAIR_START_IP` | `Throttle` Durable Object (4 shards, persisted) |
 | `POST /api/pair/start` per IPv6 /48 | `15,30/h` | `LIMIT_PAIR_START_IP48` | same call (one site rotating through its /64s) |
-| `POST /api/pair/start`, everyone together | `160,240/h` | `LIMIT_PAIR_START_GLOBAL` | split evenly over the 8 shards |
+| `POST /api/pair/start`, everyone together | `20,52/h` | `LIMIT_PAIR_START_GLOBAL` | split evenly over the 4 shards (5 burst, 13/h each) |
 | `/api/pair/wait` | `30,120/h` per IP | `LIMIT_PAIR_WAIT_IP` | isolate memory only (best effort, free) |
 | `/auth/login`, `/auth/callback` | `30,120/h` per IP | `LIMIT_AUTH_IP` | isolate memory only (they never touch a Durable Object) |
 | Approve attempts on one pairing code | 5 | - | the code locks: "run `mcp-remote pair` on the computer again" |
+
+The global default is derived in `budget.ts`: pairing starts from everyone together may use 10% of the free
+plan's daily rows written, at an estimated 8 rows per start (Throttle row, Pairing DO state + alarm, wipe at
+expiry; ~7 measured locally), i.e. 52 per hour. The Throttle table has no secondary index (it would double every
+write); refilled buckets are deleted by a bounded scan of 64 keys every 32 writes.
 
 Why a Durable Object for `/api/pair/start` only: each start creates a Pairing Durable Object (a write, an alarm
 and a wipe 10 minutes later, ~3 DO requests); the throttle check costs one DO request and writes a row only
@@ -417,7 +434,8 @@ frames, and database rows read and written per UTC day: in memory, written as on
 last socket closes and at midnight; counts not yet written (and the rate-limit buckets) survive hibernation
 inside a WebSocket attachment, are moved to another open socket when the one carrying them closes, and are
 written to the database (usage row + one `meta` row for the buckets) when the last socket closes. With no
-socket open (API calls only) they stay in memory until the 50-event flush; an eviction may lose those few.
+socket open (API calls only) every allowed call writes the counts (one row; those calls are rate limited), and
+refused calls at most once per 10 s.
 They never read another account's data (D9). The phone shows "Today (UTC): N of 500 messages on the free plan" under the session list;
 `GET /api/usage` returns the last 35 days (ready for the Phase 4b admin view). A deploy can lose up to 49
 not-yet-written events per account.

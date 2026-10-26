@@ -365,7 +365,10 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     if (!code) return err(400, "that does not look like a pairing code");
     // Per-tenant guess limit before any Pairing DO is woken (a wrong code wakes a fresh one).
     const allowed = await hubFor(env, session.tid).allowPairApprove();
-    if (!allowed.ok) return tooMany(allowed.retryAfterMs, allowed.error ?? "too many pairing approvals on this account", allowed.says_when);
+    if (!allowed.ok) {
+      if (allowed.status === 409) return err(409, allowed.error ?? "too many computers on this account");
+      return tooMany(allowed.retryAfterMs, allowed.error ?? "too many pairing approvals on this account", allowed.says_when);
+    }
     const pairing = env.PAIRING.get(env.PAIRING.idFromName(`pair:${code}`));
     const claim = await pairing.beginApprove(publicLimits(env as unknown as Record<string, unknown>).approve_attempts_per_code);
     if (!claim.ok) return err(claim.status ?? 404, claim.error);

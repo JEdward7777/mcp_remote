@@ -16,6 +16,9 @@ export default defineConfig({
           ALLOWED_EMAILS: "allowed@example.com",
           // Phase 3: the "boss" dev tenant runs on the owner plan (limits.test.ts).
           OWNER_EMAILS: "someone@example.com, Boss@dev.local",
+          // The derived global pairing-start cap (~52/h for everyone) is tested on its own in limits.test.ts;
+          // the rest of the suite starts many pairings from many fake IPs.
+          LIMIT_PAIR_START_GLOBAL: "10000,10000/h",
         },
       },
     }),

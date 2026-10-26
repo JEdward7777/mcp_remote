@@ -88,6 +88,8 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   let conn: LineConn<DaemonToShim> | null = null;
   let registered = false;
   let hubConnected = false;
+  /** Why the daemon is offline, when the server said so (rate limit / daily budget). */
+  let hubReason: string | null = null;
   let attempt = 0;
   let refusedAttempt = 0;
   /** Last reason the daemon refused our registration; reported by send_message. */
@@ -156,11 +158,13 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
             registerRefused = null;
             refusedAttempt = 0;
             hubConnected = f.hub_connected;
+            hubReason = f.reason ?? null;
             attempt = 0;
             log(`registered with daemon (server ${hubConnected ? "connected" : "not connected"})`);
             return;
           case "hub_status":
             hubConnected = f.connected;
+            hubReason = f.connected ? null : (f.reason ?? null);
             return;
           case "deliver":
             // Serialize so channel events keep the Hub's order.
@@ -248,7 +252,10 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
       });
     }
     if (!hubConnected) {
-      return Promise.resolve({ ok: false, error: "the mcp-remote daemon is not connected to the server right now" });
+      return Promise.resolve({
+        ok: false,
+        error: `the mcp-remote daemon is not connected to the server right now${hubReason ? `: ${hubReason}` : ""}`,
+      });
     }
     const reqId = `s${++reqSeq}`;
     return new Promise((resolve) => {

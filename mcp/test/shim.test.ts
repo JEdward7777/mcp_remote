@@ -80,6 +80,20 @@ describe("shim", () => {
     expect(up.session).toMatchObject({ session_id: "proj-id", project: "my-project", cwd: "/some/where/my-project" });
   }, 20_000);
 
+  it("send_message names the server's reason when the account is blocked (daily budget), not just 'not connected'", async () => {
+    const c = await startShim("blocked-id");
+    const ok = async () => !(await c.callTool({ name: "send_message", arguments: { text: "hi" } })).isError;
+    for (let i = 0; i < 50 && !(await ok()); i++) await sleep(100);
+    for (const ws of wss.clients) ws.close(4029, "daily budget used up; retry in 7200s");
+    let text = "";
+    for (let i = 0; i < 50 && !/daily budget/.test(text); i++) {
+      await sleep(100);
+      const r = await c.callTool({ name: "send_message", arguments: { text: "still there?" } });
+      text = (r.content as { text: string }[])[0]?.text ?? "";
+    }
+    expect(text).toMatch(/^Message NOT sent: the mcp-remote daemon is not connected to the server right now: the server refused this account for now \(daily budget used up\); the daemon reconnects in /);
+  }, 20_000);
+
   it("reports the daemon's refusal (duplicate session id) from send_message instead of 'daemon not running'", async () => {
     const first = await startShim("same-id");
     const ok = async () => !(await first.callTool({ name: "send_message", arguments: { text: "hi" } })).isError;

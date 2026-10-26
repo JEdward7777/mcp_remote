@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS buckets (
   at INTEGER NOT NULL,
   full_at INTEGER NOT NULL
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS buckets_full ON buckets(full_at);
+DROP INDEX IF EXISTS buckets_full;
 `;
 
 const CACHE_MAX = 4096;
@@ -43,6 +43,8 @@ export class Throttle extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private readonly cache = new Map<string, Bucket | null>();
   private writes = 0;
+  /** Where the bounded cleanup scan continues (key order; restarts from the top at the end / on wake). */
+  private scanFrom = "";
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -82,13 +84,22 @@ export class Throttle extends DurableObject<Env> {
       this.remember(c.key, r.bucket);
     }
     if (++this.writes % CLEANUP_EVERY === 0) {
-      // A bucket that has refilled is the same as no bucket: forget it (bounded batch, via the index).
-      const cur = this.sql.exec<{ k: string }>(
-        "DELETE FROM buckets WHERE k IN (SELECT k FROM buckets WHERE full_at < ? LIMIT ?) RETURNING k",
-        now,
+      // A bucket that has refilled is the same as no bucket: forget it. No index on full_at (it would
+      // double every write); instead walk the primary key CLEANUP_BATCH rows at a time.
+      const scan = this.sql.exec<{ k: string; full_at: number }>(
+        "SELECT k, full_at FROM buckets WHERE k > ? ORDER BY k LIMIT ?",
+        this.scanFrom,
         CLEANUP_BATCH,
       );
-      for (const r of cur.toArray()) this.cache.delete(r.k);
+      const rows = scan.toArray();
+      rowsRead += scan.rowsRead;
+      this.scanFrom = rows.length === CLEANUP_BATCH ? rows[rows.length - 1]!.k : "";
+      const dead = rows.filter((x) => x.full_at < now).map((x) => x.k);
+      if (dead.length) {
+        const del = this.sql.exec("DELETE FROM buckets WHERE k IN (SELECT value FROM json_each(?))", JSON.stringify(dead));
+        rowsWritten += del.rowsWritten;
+        for (const k of dead) this.cache.delete(k);
+      }
     }
     return { ok: true, retryAfterMs: 0, rowsRead, rowsWritten };
   }

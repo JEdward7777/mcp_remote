@@ -89,6 +89,8 @@ export class Daemon {
   private reqSeq = 0;
   private reconnectTimer: NodeJS.Timeout | undefined;
   private heartbeat: Heartbeat | null = null;
+  /** Why we are not connected, when the server said so (429 / 4029): passed on to send_message errors. */
+  private offlineReason: string | null = null;
   private replacedStreak = 0;
   private openedAt = 0;
   private server: Server | null = null;
@@ -241,7 +243,11 @@ export class Daemon {
         sessionId = f.session.session_id;
         this.shims.set(sessionId, { conn, session: f.session, refused: null, launched: link === "linked", token: f.launch_token });
         log(`shim up: ${f.session.project} (${sessionId})`);
-        conn.send({ t: "registered", hub_connected: this.hubReady } satisfies DaemonToShim);
+        conn.send({
+          t: "registered",
+          hub_connected: this.hubReady,
+          ...(!this.hubReady && this.offlineReason ? { reason: this.offlineReason } : {}),
+        } satisfies DaemonToShim);
         this.toHub({ t: "session_up", session: f.session });
         return;
       }
@@ -254,7 +260,11 @@ export class Daemon {
       if (!sessionId) return conn.send({ t: "error", error: "register first" } satisfies DaemonToShim);
       if (f.t === "send") {
         if (!this.hubReady) {
-          conn.send({ t: "send_error", req_id: f.req_id, error: "daemon is not connected to the server right now" } satisfies DaemonToShim);
+          conn.send({
+            t: "send_error",
+            req_id: f.req_id,
+            error: `daemon is not connected to the server right now${this.offlineReason ? `: ${this.offlineReason}` : ""}`,
+          } satisfies DaemonToShim);
           return;
         }
         const refused = this.shims.get(sessionId)?.refused;
@@ -358,10 +368,11 @@ export class Daemon {
     this.ws = ws;
     let revoked = false;
     /** What the server told us about when to come back (429 / 5xx / 4029). */
-    const hints: ReconnectHints = {};
+    const hints: ReconnectHints & { text?: string } = {};
 
     ws.on("unexpected-response", (_req, res) => {
       if (res.statusCode === 429) {
+        hints.text = "too many connections for this account, HTTP 429";
         hints.retryAfterMs = parseRetryAfter(res.headers["retry-after"] as string | undefined);
         hints.rateLimited = true;
         log(`server is rate limiting this account's connections (HTTP 429${hints.retryAfterMs ? `, retry after ${humanWait(hints.retryAfterMs)}` : ""})`);
@@ -390,6 +401,7 @@ export class Daemon {
       if (this.replacedStreak === 0) this.attempt = 0;
       this.openedAt = Date.now();
       this.hubReady = true;
+      this.offlineReason = null;
       log(`connected to ${this.opts.config.url}`);
       this.sendHello();
       this.sendLaunchInfo();
@@ -527,6 +539,13 @@ export class Daemon {
         delay = reconnectDelay(this.attempt++, profile, hints, random);
       }
       log(`disconnected (${code}${reason.length ? " " + reason.toString() : ""}); retrying in ${humanWait(delay)}`);
+      // Tell the shims why, so send_message says "daily budget used up" instead of a bare "not connected".
+      const why = code === CLOSE_RATE_LIMITED ? reason.toString().replace(/;?\s*retry in \d+s$/, "") : hints.text;
+      const next = why ? `the server refused this account for now (${why}); the daemon reconnects in ${humanWait(delay)}` : null;
+      if (next !== this.offlineReason) {
+        this.offlineReason = next;
+        this.broadcastShims({ t: "hub_status", connected: false, ...(next ? { reason: next } : {}) });
+      }
       this.opts.onReconnectScheduled?.(delay, { ...hints });
       this.reconnectTimer = setTimeout(() => this.connectHub(), delay);
     });

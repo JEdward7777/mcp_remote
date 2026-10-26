@@ -120,8 +120,9 @@ export function dailyBudget(sharePercent: number): DailyBudget {
  *  - the daily budget (`daily`, default 10% of each free daily limit) bounds the whole day. The
  *    per-minute rates alone do NOT (rate x 1440 is far above a fair daily share for frames, history
  *    and HTTP), which is why the daily budget exists.
- * With the default 10% share, at least 10 accounts would have to run into their own budgets before the
- * shared free quota is exhausted; normal use (hundreds of messages a day) stays far below it.
+ * Exhausting the shared free quota takes accounts whose shares add up to 100%: e.g. ten free accounts at
+ * 10% each, or the owner (50%) plus five free accounts. Normal use (hundreds of messages a day) stays far
+ * below a share.
  */
 export interface TenantLimits {
   /** Phone -> session messages. */
@@ -144,12 +145,19 @@ export interface TenantLimits {
   pair_approve: Rate;
   /** Messages (in + out) per UTC day. */
   daily_messages: number;
+  /**
+   * Computers (paired, plus revoked ones that still have sessions) per account. Also what bounds the cost
+   * of any single call: a state frame reads at most max_machines x MAX_STORED_SESSIONS_PER_MACHINE sessions.
+   */
+  max_machines: number;
+  /** Phone connects while the daily budget is used up (each one only gets the reason, no SQL). */
+  blocked_connects: Rate;
   /** Share (%) of each free daily limit this tenant may use; `daily` is derived from it. */
   daily_share_percent: number;
   daily: DailyBudget;
 }
 
-export type LimitName = Exclude<keyof TenantLimits, "daily_messages" | "daily_share_percent" | "daily">;
+export type LimitName = Exclude<keyof TenantLimits, "daily_messages" | "daily_share_percent" | "daily" | "max_machines">;
 
 const FREE_SHARE = 10;
 const OWNER_SHARE = 50;
@@ -166,6 +174,8 @@ export const PLANS: Record<string, TenantLimits> = {
     http: rate("30,30/min"),
     pair_approve: rate("5,10/h"),
     daily_messages: 500,
+    max_machines: 10,
+    blocked_connects: rate("5,6/h"),
     daily_share_percent: FREE_SHARE,
     daily: dailyBudget(FREE_SHARE),
   },
@@ -184,6 +194,8 @@ export const PLANS: Record<string, TenantLimits> = {
     http: rate("60,120/min"),
     pair_approve: rate("10,20/h"),
     daily_messages: 5000,
+    max_machines: 30,
+    blocked_connects: rate("10,12/h"),
     daily_share_percent: OWNER_SHARE,
     daily: dailyBudget(OWNER_SHARE),
   },
@@ -203,7 +215,9 @@ export const LIMIT_ENV: Record<LimitName, string> = {
   connects: "LIMIT_CONNECTS",
   http: "LIMIT_HTTP",
   pair_approve: "LIMIT_PAIR_APPROVE",
+  blocked_connects: "LIMIT_BLOCKED_CONNECTS",
 };
+export const MAX_MACHINES_ENV = "MAX_MACHINES";
 export const DAILY_CAP_ENV = "DAILY_MESSAGE_CAP";
 /** % of each free daily limit one free-plan tenant may use (1-100). */
 export const SHARE_ENV = "TENANT_DAILY_SHARE_PERCENT";
@@ -262,6 +276,11 @@ export function limitsFor(plan: string | null | undefined, env: EnvLike): Tenant
     if (r) out[n] = r;
     else warnOnce(key, v);
   }
+  const mm = env[MAX_MACHINES_ENV];
+  if (typeof mm === "string" && mm !== "") {
+    if (/^\d{1,4}$/.test(mm.trim()) && Number(mm.trim()) >= 1) out.max_machines = Number(mm.trim());
+    else warnOnce(MAX_MACHINES_ENV, mm);
+  }
   const cap = env[DAILY_CAP_ENV];
   if (typeof cap === "string" && cap !== "") {
     if (/^\d{1,9}$/.test(cap.trim())) out.daily_messages = Number(cap.trim());
@@ -290,10 +309,23 @@ export interface PublicLimits {
   approve_attempts_per_code: number;
 }
 
+/**
+ * Rows written by one pairing start, end to end (Throttle bucket row, Pairing DO state put + alarm, the
+ * wipe at expiry). ESTIMATE: ~7 measured by the Phase 3 round-2 reviewer in local workerd; 8 for margin.
+ */
+export const PAIR_START_ROWS_WRITTEN_EST = 8;
+/** Share (%) of the free plan's daily rows written that unauthenticated pairing starts may use, all together. */
+export const PAIR_START_GLOBAL_SHARE = 10;
+const PAIR_START_GLOBAL_BURST = 20;
+/** 10% of 100,000 rows/day / 8 rows per start / 24 h = 52 starts per hour for everyone together. */
+export function pairStartGlobalPerHour(): number {
+  return Math.floor((FREE_PLAN.sqliteRowsWrittenPerDay * PAIR_START_GLOBAL_SHARE) / 100 / PAIR_START_ROWS_WRITTEN_EST / 24);
+}
+
 export const PUBLIC_DEFAULTS: PublicLimits = {
   pair_start_ip: rate("5,10/h"),
   pair_start_ip48: rate("15,30/h"),
-  pair_start_global: rate("160,240/h"),
+  pair_start_global: rate(`${PAIR_START_GLOBAL_BURST},${pairStartGlobalPerHour()}/h`),
   pair_wait_ip: rate("30,120/h"),
   auth_ip: rate("30,120/h"),
   approve_attempts_per_code: 5,
@@ -320,7 +352,7 @@ export function publicLimits(env: EnvLike): PublicLimits {
 }
 
 /** Throttle DO shards for unauthenticated limits: bounded object count, spreads hot keys. */
-export const THROTTLE_SHARDS = 8;
+export const THROTTLE_SHARDS = 4;
 
 // ---------------------------------------------------------------------------
 // Usage accounting (Hub)

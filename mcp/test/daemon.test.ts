@@ -567,3 +567,26 @@ describe("daemon reconnect hardening (phase 3)", () => {
     }
   });
 });
+
+describe("daemon tells shims why the server refused (phase 3 review round 2)", () => {
+  it("passes a 4029 reason (daily budget) to the shim and to send errors", async () => {
+    wss.on("connection", (ws) => setTimeout(() => ws.close(4029, "daily budget used up; retry in 9000s"), 30));
+    daemon = new Daemon({
+      config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
+      socket: join(dir, "d.sock"),
+      launcher: false,
+      reconnect: FAST_RECONNECT,
+      random: () => 0,
+    });
+    await daemon.start();
+    const s = await shim("sx");
+    const st = await waitFor(() => s.frames.find((f) => f.t === "hub_status" && f.connected === false && f.reason), "hub_status reason");
+    expect(st.reason).toMatch(/^the server refused this account for now \(daily budget used up\); the daemon reconnects in \d+ (h|min)$/);
+    s.conn.send({ t: "send", req_id: "q1", text: "hello", urgency: "normal" });
+    const e = await waitFor(() => s.frames.find((f) => f.t === "send_error" && f.req_id === "q1"), "send_error");
+    expect(e.error).toMatch(/^daemon is not connected to the server right now: the server refused this account for now \(daily budget used up\)/);
+    // A shim that registers later learns the reason too.
+    const late = await shim("sy");
+    expect(late.frames[0]).toMatchObject({ t: "registered", hub_connected: false, reason: st.reason });
+  });
+});
