@@ -101,3 +101,52 @@ export function wsUrl(base: string, path: string): string {
   u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
   return u.toString();
 }
+
+/** Secrets / shell-only settings for the daemon and the sessions it launches (0600, never in the unit file). */
+export function serviceEnvPath(): string {
+  return join(configDir(), "service.env");
+}
+
+export const SERVICE_ENV_TEMPLATE = `# Environment for the mcp-remote daemon and the Claude Code sessions it launches from the phone.
+# Read by \`mcp-remote daemon\` at startup (systemd, launchd or by hand); keep this file mode 0600.
+# Put secrets and shell-only settings here, not in the service unit/plist. One KEY=value per line, e.g.:
+#   CLAUDE_CODE_OAUTH_TOKEN=...        (from \`claude setup-token\`)
+#   CLAUDE_CODE_USE_BEDROCK=1
+#   AWS_PROFILE=work
+#   HTTPS_PROXY=http://proxy.example:3128
+# After editing: restart the daemon. Sessions already running keep their old environment, and the
+# dedicated tmux server keeps the environment it started with until it exits (no launched sessions left,
+# or \`tmux -L mcp-remote kill-server\`).
+`;
+
+/**
+ * Load <config dir>/service.env into process.env (KEY=value lines, # comments, optional quotes).
+ * Returns the variable names loaded (values are never logged).
+ */
+export function loadServiceEnv(path = serviceEnvPath()): string[] {
+  if (!existsSync(path)) return [];
+  if (process.platform !== "win32") {
+    const mode = statSync(path).mode & 0o777;
+    if (mode & 0o077) {
+      log(`warning: ${path} had mode ${mode.toString(8)}; tightening to 600 (it may hold secrets)`);
+      chmodSync(path, 0o600);
+    }
+  }
+  const keys: string[] = [];
+  for (const raw of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (!m) {
+      log(`warning: ignoring a line in ${path} that is not KEY=value`);
+      continue;
+    }
+    const key = m[1]!;
+    if (key === "MCP_REMOTE_CONFIG_DIR") continue; // would point away from the file being read
+    let v = m[2]!;
+    if ((v.startsWith('"') && v.endsWith('"') && v.length >= 2) || (v.startsWith("'") && v.endsWith("'") && v.length >= 2)) v = v.slice(1, -1);
+    process.env[key] = v;
+    keys.push(key);
+  }
+  return keys;
+}

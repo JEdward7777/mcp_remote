@@ -51,13 +51,20 @@ describe("launch config", () => {
     expect(LaunchConfig.safeParse({ extra_args: ["a\nb"] }).success).toBe(false);
     expect(LaunchConfig.safeParse({ max_sessions: 99 }).success).toBe(false);
     // Conversation selection belongs to the launcher (round-4 nit).
-    for (const a of ["--continue", "-c", "--resume", "-r", "--session-id", "--fork-session", "--resume=abc", "--session-id=x", "-rabc", "-cr", "-dc", "--from-pr", "--from-pr=12"]) {
+    for (const a of ["--continue", "-c", "--resume", "-r", "--session-id", "--fork-session", "--resume=abc", "--session-id=x", "-rabc", "-cr", "-pc", "--from-pr", "--from-pr=12"]) {
       const r = LaunchConfig.safeParse({ extra_args: ["--model", "opus", a] });
       expect(r.success).toBe(false);
       expect(r.error!.issues[0]!.message).toMatch(/managed by mcp-remote/);
     }
     expect(LaunchConfig.safeParse({ extra_args: ["--continue-on-error-is-not-a-flag"] }).success).toBe(true);
     for (const ok of ["-d", "-p", "--model", "claude-opus", "-1", "--verbose"]) expect(LaunchConfig.safeParse({ extra_args: [ok] }).success).toBe(true);
+    // Round 6: clusters are read like commander does (verified): a value-taking flag swallows the rest.
+    for (const ok of [["-dc"], ["-nrobot"], ["-wfeature-cr"], ["-n", "-c"], ["-p", "-dapi"], ["--append-system-prompt", "-c is fine in prose"]]) {
+      expect(LaunchConfig.safeParse({ extra_args: ok }).success, JSON.stringify(ok)).toBe(true);
+    }
+    const bad = LaunchConfig.safeParse({ extra_args: ["-d", "-c"] }); // -d's value is optional: -c is a flag
+    expect(bad.success).toBe(false);
+    expect(bad.error!.issues[0]!.path).toEqual(["extra_args", 1]);
     expect(() => saveLaunchConfig(LaunchConfig.parse({ extra_args: [] }) && ({ ...LaunchConfig.parse({}), extra_args: ["-c"] } as never))).toThrow(
       /extra_args\.0: -c is managed by mcp-remote/,
     );

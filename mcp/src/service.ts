@@ -12,7 +12,8 @@
 //
 // Windows: printed manual steps only (Task Scheduler); remote launch needs tmux, so use WSL for that.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { SERVICE_ENV_TEMPLATE, ensureConfigDir, serviceEnvPath } from "./config";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,8 @@ export interface ServiceSpec {
   path: string;
   /** Only set when the user runs with a non-default config dir. */
   configDir?: string;
+  /** Claude Code's config dir (CLAUDE_CONFIG_DIR) if the user has one: where the shim is registered and the login lives. */
+  claudeConfigDir?: string;
   logDir?: string;
 }
 
@@ -43,6 +46,7 @@ export function sdQuote(s: string, kind: "exec" | "env" = "exec"): string {
 export function systemdUnit(spec: ServiceSpec): string {
   const env = [`Environment=${sdQuote(`PATH=${spec.path}`, "env")}`];
   if (spec.configDir) env.push(`Environment=${sdQuote(`MCP_REMOTE_CONFIG_DIR=${spec.configDir}`, "env")}`);
+  if (spec.claudeConfigDir) env.push(`Environment=${sdQuote(`CLAUDE_CONFIG_DIR=${spec.claudeConfigDir}`, "env")}`);
   return `# Written by \`mcp-remote install-service\`. Remove with \`mcp-remote uninstall-service\`.
 [Unit]
 Description=mcp-remote daemon (phone <-> Claude Code relay)
@@ -57,7 +61,9 @@ RestartPreventExitStatus=3 4
 # Phone-launched Claude Code sessions live in a tmux server this daemon starts. Only stop the daemon itself
 # on stop/restart; the next daemon re-adopts the sessions.
 KillMode=process
-# PATH captured at install time so node, claude and tmux are found (systemd's default PATH is minimal).
+# PATH (and CLAUDE_CONFIG_DIR / MCP_REMOTE_CONFIG_DIR if set) captured at install time so node, claude and tmux
+# are found (systemd's default PATH is minimal). Secrets (e.g. CLAUDE_CODE_OAUTH_TOKEN), provider settings and
+# proxies go in service.env (mode 0600) in the mcp-remote config dir, which the daemon reads; not in this file.
 ${env.join("\n")}
 
 [Install]
@@ -76,6 +82,7 @@ export function launchdPlist(spec: ServiceSpec): string {
     ["MCP_REMOTE_FATAL_EXIT_ZERO", "1"],
   ];
   if (spec.configDir) env.push(["MCP_REMOTE_CONFIG_DIR", spec.configDir]);
+  if (spec.claudeConfigDir) env.push(["CLAUDE_CONFIG_DIR", spec.claudeConfigDir]);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Written by \`mcp-remote install-service\`. Remove with \`mcp-remote uninstall-service\`. -->
@@ -135,6 +142,7 @@ export function currentSpec(): ServiceSpec {
   const cli = realpathSync(fileURLToPath(import.meta.url));
   const spec: ServiceSpec = { node: realpathSync(process.execPath), cli, path: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin" };
   if (process.env.MCP_REMOTE_CONFIG_DIR) spec.configDir = process.env.MCP_REMOTE_CONFIG_DIR;
+  if (process.env.CLAUDE_CONFIG_DIR) spec.claudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
   return spec;
 }
 
@@ -152,10 +160,24 @@ function runVisible(cmd: string, args: string[]): void {
   execFileSync(cmd, args, { stdio: "inherit" });
 }
 
+/** Create an empty, commented service.env (0600) if there is none. Returns its path. */
+export function ensureServiceEnv(): string {
+  ensureConfigDir();
+  const path = serviceEnvPath();
+  if (!existsSync(path)) {
+    writeFileSync(path, SERVICE_ENV_TEMPLATE, { mode: 0o600 });
+    if (process.platform !== "win32") chmodSync(path, 0o600);
+  }
+  return path;
+}
+
 export function installService(opts: { dryRun?: boolean; noStart?: boolean; platform?: NodeJS.Platform } = {}): void {
   const platform = opts.platform ?? process.platform;
   const spec = currentSpec();
   const out = process.stderr;
+  if (!opts.dryRun && platform !== "win32") {
+    out.write(`secrets / provider settings for the service: ${ensureServiceEnv()} (0600; see the comments in it)\n`);
+  }
   if (/[\\/]_npx[\\/]/.test(spec.cli)) {
     out.write(`warning: ${spec.cli} looks like a temporary npx copy; install mcp-remote globally first (see SETUP.md).\n`);
   }

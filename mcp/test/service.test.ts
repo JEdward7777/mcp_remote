@@ -12,9 +12,13 @@ describe("service files", () => {
     expect(u).toMatch(/^RestartPreventExitStatus=3 4$/m);
     expect(u).toMatch(/^KillMode=process$/m);
     expect(u).toContain('Environment="PATH=/usr/bin:/bin"');
-    expect(u).not.toContain("MCP_REMOTE_CONFIG_DIR");
+    expect(u).not.toContain('Environment="MCP_REMOTE_CONFIG_DIR');
     expect(u).toMatch(/^WantedBy=default.target$/m);
     expect(systemdUnit({ ...spec, configDir: "/tmp/x" })).toContain('Environment="MCP_REMOTE_CONFIG_DIR=/tmp/x"');
+    // Round 6: Claude Code's own config dir travels too (shim registration + login live there).
+    expect(systemdUnit({ ...spec, claudeConfigDir: "/home/you/.claude-work" })).toContain('Environment="CLAUDE_CONFIG_DIR=/home/you/.claude-work"');
+    expect(u).not.toContain('Environment="CLAUDE_CONFIG_DIR');
+    expect(u).toMatch(/service\.env/); // points at where secrets go
   });
 
   it("escapes systemd specials", () => {
@@ -34,6 +38,9 @@ describe("service files", () => {
     expect(p).toMatch(/<key>AbandonProcessGroup<\/key>\s*<true\/>/);
     expect(p).toContain("<string>/Users/you/Library/Logs/mcp-remote.log</string>");
     expect(p).toContain("<string>daemon</string>");
+    expect(launchdPlist({ ...spec, claudeConfigDir: "/Users/you/.claude-work" })).toMatch(
+      /<key>CLAUDE_CONFIG_DIR<\/key>\s*<string>\/Users\/you\/.claude-work<\/string>/,
+    );
   });
 
   it("prints Windows steps", () => {

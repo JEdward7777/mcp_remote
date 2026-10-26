@@ -1,8 +1,9 @@
-import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { configPath, loadConfig, normalizeWorkerUrl, saveConfig, socketPath, wsUrl } from "../src/config";
+import { configPath, loadConfig, loadServiceEnv, normalizeWorkerUrl, saveConfig, serviceEnvPath, socketPath, wsUrl } from "../src/config";
+import { ensureServiceEnv } from "../src/service";
 
 let dir: string;
 beforeEach(() => {
@@ -63,5 +64,37 @@ describe("urls", () => {
   it("maps http(s) to ws(s)", () => {
     expect(wsUrl("https://a.b", "/api/daemon/ws")).toBe("wss://a.b/api/daemon/ws");
     expect(wsUrl("http://localhost:1", "/x")).toBe("ws://localhost:1/x");
+  });
+});
+
+describe("service.env (round-6 finding)", () => {
+  it("creates a 0600 template and loads KEY=value lines into the environment", () => {
+    const p = ensureServiceEnv();
+    expect(p).toBe(serviceEnvPath());
+    expect(statSync(p).mode & 0o777).toBe(0o600);
+    expect(loadServiceEnv()).toEqual([]); // only comments
+    writeFileSync(
+      p,
+      "# comment\nCLAUDE_CODE_OAUTH_TOKEN=tok-123\nexport HTTPS_PROXY='http://p:3128'\nAWS_PROFILE=\"work\"\nMCP_REMOTE_CONFIG_DIR=/elsewhere\nnot a line\n",
+      { mode: 0o644 },
+    );
+    chmodSync(p, 0o644);
+    const saved = { ...process.env };
+    try {
+      expect(loadServiceEnv()).toEqual(["CLAUDE_CODE_OAUTH_TOKEN", "HTTPS_PROXY", "AWS_PROFILE"]);
+      expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("tok-123");
+      expect(process.env.HTTPS_PROXY).toBe("http://p:3128");
+      expect(process.env.AWS_PROFILE).toBe("work");
+      expect(process.env.MCP_REMOTE_CONFIG_DIR).toBe(dir); // never redirected by the file
+      expect(statSync(p).mode & 0o777).toBe(0o600); // tightened
+    } finally {
+      for (const k of ["CLAUDE_CODE_OAUTH_TOKEN", "HTTPS_PROXY", "AWS_PROFILE"]) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+    // An existing file is never overwritten.
+    ensureServiceEnv();
+    expect(readFileSync(p, "utf8")).toContain("tok-123");
   });
 });

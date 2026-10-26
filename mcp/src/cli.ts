@@ -1,6 +1,6 @@
 // mcp-remote CLI: pair | daemon | shim | projects | config | setup-claude | attach | install-service | uninstall-service
 import { Daemon } from "./daemon";
-import { configPath, loadConfig } from "./config";
+import { configPath, loadConfig, loadServiceEnv, serviceEnvPath } from "./config";
 import { attach, configCommand, projectsCommand, setupClaude } from "./desk";
 import { installService, uninstallService } from "./service";
 import { runClaude } from "./run-claude";
@@ -57,6 +57,8 @@ async function main(argv: string[]): Promise<void> {
     case "daemon": {
       setLogPrefix("mcp-remote daemon");
       const config = loadConfig();
+      const envKeys = loadServiceEnv();
+      if (envKeys.length) log(`loaded ${envKeys.length} setting(s) from ${serviceEnvPath()}: ${envKeys.join(", ")}`);
       log(`using ${configPath()} (machine ${config.machine_name ?? config.machine_id})`);
       // Launched sessions run under `mcp-remote run-claude` (this same CLI) so their exit status is recorded.
       const d = new Daemon({ config, launcher: { wrapper: [realpathSync(process.execPath), realpathSync(fileURLToPath(import.meta.url))] } });

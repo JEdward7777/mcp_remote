@@ -29,17 +29,44 @@ export const PERMISSION_MODE_HELP: Record<PermissionMode, string> = {
 /** Conversation-selection flags the launcher sets itself; extra args may not override them. */
 export const RESERVED_ARGS = ["--continue", "--resume", "--session-id", "--fork-session", "--from-pr"];
 
-/** The managed flag an argument would set, if any: long forms (also `--x=value`) and any short-flag
- * cluster containing c or r (`-c`, `-r`, `-rabc`, `-cr`, `-dc`). */
-export function reservedFlag(a: string): string | null {
-  const long = RESERVED_ARGS.find((r) => a === r || a.startsWith(`${r}=`));
-  if (long) return long;
-  if (/^-[A-Za-z]/.test(a) && !a.startsWith("--")) {
-    const letters = a.slice(1).split("=")[0]!;
-    const m = letters.match(/[cr]/);
-    if (m) return letters.length === 1 ? a : `-${m[0]} (in ${a})`;
+/** Claude Code 2.1.310's short flags (`claude --help`): which take a value (required "<x>" or optional "[x]"). */
+const SHORT_REQUIRED_VALUE = new Set(["n"]);
+const SHORT_OPTIONAL_VALUE = new Set(["d", "w", "r"]);
+const SHORT_BOOLEAN = new Set(["c", "p", "h", "v"]);
+
+/**
+ * The managed flags extra args would set, walking short-flag clusters the way commander (Claude Code's
+ * parser) does: `-cr` = -c -r, `-pc` = -p -c, but a value-taking flag swallows the rest of its cluster
+ * (`-dc` = --debug c, `-nrobot` = --name robot, `-rabc` = --resume abc) and a required-value flag also
+ * swallows the next argument (`-n -c` = --name "-c"). Long flags' values are not modelled: write
+ * `--flag=value` if a value itself looks like a managed flag.
+ */
+export function reservedFlags(args: string[]): { index: number; flag: string }[] {
+  const out: { index: number; flag: string }[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const long = RESERVED_ARGS.find((r) => a === r || a.startsWith(`${r}=`));
+    if (long) {
+      out.push({ index: i, flag: long });
+      continue;
+    }
+    if (!/^-[A-Za-z]/.test(a) || /\s/.test(a)) continue;
+    const letters = a.slice(1);
+    for (let k = 0; k < letters.length; k++) {
+      const ch = letters[k]!;
+      if (ch === "c" || ch === "r") {
+        out.push({ index: i, flag: letters.length === 1 ? a : `-${ch} (in ${a})` });
+        break;
+      }
+      if (SHORT_OPTIONAL_VALUE.has(ch)) break; // rest of the cluster is its value
+      if (SHORT_REQUIRED_VALUE.has(ch)) {
+        if (k === letters.length - 1) i++; // the next argument is its value
+        break;
+      }
+      if (!SHORT_BOOLEAN.has(ch)) break; // unknown: Claude Code reports it
+    }
   }
-  return null;
+  return out;
 }
 
 /** One extra CLI argument. Validated so it can never be read as a tmux command separator. */
@@ -48,18 +75,7 @@ const ExtraArg = z
   .min(1)
   .max(512)
   .refine((a) => !a.endsWith(";"), "an argument may not end with ';' (tmux would read it as a command separator)")
-  .refine((a) => !/[\0\n\r]/.test(a), "no control characters")
-  .superRefine((a, ctx) => {
-    const hit = reservedFlag(a);
-    if (hit) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          `${hit} is managed by mcp-remote (it picks --session-id / --resume / --continue per launch from the ` +
-          "phone's resume option); remove it from extra-args",
-      });
-    }
-  });
+  .refine((a) => !/[\0\n\r]/.test(a), "no control characters");
 
 export const ProjectEntry = z.object({ path: z.string().min(1).max(1024), name: z.string().min(1).max(128).optional() });
 
@@ -72,7 +88,21 @@ export const LaunchConfig = z.object({
   permission_mode: PermissionMode.nullable().default(null),
   /** Absolute path to the claude binary; null = look up `claude` on PATH when launching. */
   claude_path: z.string().min(1).max(1024).nullable().default(null),
-  extra_args: z.array(ExtraArg).max(32).default([]),
+  extra_args: z
+    .array(ExtraArg)
+    .max(32)
+    .default([])
+    .superRefine((args, ctx) => {
+      for (const { index, flag } of reservedFlags(args)) {
+        ctx.addIssue({
+          code: "custom",
+          path: [index],
+          message:
+            `${flag} is managed by mcp-remote (it picks --session-id / --resume / --continue per launch from the ` +
+            "phone's resume option); remove it from extra-args",
+        });
+      }
+    }),
   /** Concurrent phone-launched sessions (starting/running/needs_attention). */
   max_sessions: z.number().int().min(1).max(MAX_LAUNCHES_PER_MACHINE).default(4),
   /** Default for the phone's auto-restart toggle. */

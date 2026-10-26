@@ -130,6 +130,19 @@ mcp-remote install-service          # --dry-run prints the file instead; --no-st
 
 `mcp-remote uninstall-service` removes it. Without a service, `mcp-remote daemon` in a terminal works too.
 
+Environment: the unit/plist carries `PATH`, and `CLAUDE_CONFIG_DIR` / `MCP_REMOTE_CONFIG_DIR` if you have them set
+when you run `install-service` (so launched sessions find the same Claude Code login and shim registration as
+your shell). Run `install-service` from the shell you use Claude Code in. **Secrets and shell-only settings do not
+belong in the unit/plist** (they are world-readable files): put them in `~/.config/mcp-remote/service.env`, which
+`install-service` creates empty with mode 0600 and the daemon reads at startup on every platform, one `KEY=value`
+per line, e.g. `CLAUDE_CODE_OAUTH_TOKEN=...` (from `claude setup-token`, the usual login for an always-on
+machine), `CLAUDE_CODE_USE_BEDROCK=1` / `AWS_PROFILE=...`, `CLAUDE_CODE_USE_VERTEX=1`, `HTTPS_PROXY=...`.
+Restart the service after editing it. Already-running launched sessions keep their environment, and the dedicated
+tmux server keeps the one it started with until it exits (it does when no launched session is left, or
+`tmux -L mcp-remote kill-server`). Launched sessions get the daemon's whole environment except the markers of a
+Claude Code session the daemon may itself have been started from (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
+`CLAUDE_CODE_SSE_PORT`, session ids).
+
 Exit codes: 3 = the machine was revoked or the account is no longer allowed (pair again); 4 = another computer runs a
 daemon with the same token (e.g. a copied `~/.config/mcp-remote`: pair each computer separately, never copy
 `config.json`). Restarting can't help in either case, which is why the service files above don't. Other exits
@@ -256,8 +269,10 @@ conversation in the same folder is never picked; launches recorded by an older v
 conversation" once and are exact from then on), and **Remove** for ended ones. Limit: if you run `/clear` in a
 launched session at the desk, Claude Code continues under a new conversation id the daemon doesn't know, so a
 later **Restart + resume** reopens the conversation from before `/clear` (use **Restart** for a fresh one).
-`--continue`, `--resume`, `--session-id`, `--fork-session`, `--from-pr` and short flags containing `c` or `r`
-(`-c`, `-r`, `-rabc`, `-dc`) are refused in `extra-args`, since the daemon chooses the conversation. Launched sessions
+`--continue`, `--resume`, `--session-id`, `--fork-session`, `--from-pr` and the short `-c` / `-r` (also inside
+clusters like `-cr`, `-pc`, `-rabc`; read the way Claude Code's parser does, so `-nrobot` or `-dc`, which are a
+name and a debug filter, are fine) are refused in `extra-args`, since the daemon chooses the conversation. If a
+long option's value looks like one of them, write it as `--option=value`. Launched sessions
 appear in the session list like any other (badge "launched") and keep their thread across restarts.
 
 At the desk, `mcp-remote attach mr-<id>` opens a launched session's terminal (detach with `Ctrl-b d`); they run on
