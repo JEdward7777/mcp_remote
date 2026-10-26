@@ -27,7 +27,7 @@ HTTP surface:
 | `POST /api/pair/claim` | poll secret | daemon saved its token: the pairing is forgotten |
 | `POST /api/pair/approve` | cookie + Origin | phone approves `{code, machine_name?}` |
 | `POST /api/push/subscribe` | cookie + Origin | register this phone's Web Push subscription (`PushSubscription.toJSON()`; known push services only; max 5 per account) |
-| `DELETE /api/push/subscribe` | cookie + Origin | `{endpoint}`: unregister it |
+| `DELETE /api/push/subscribe` | cookie + Origin | `{endpoint}`, `{id}` (any device of the account, e.g. a lost phone) or `{all: true}`: unregister |
 | `GET /api/ws` (WebSocket) | cookie + Origin | phone socket |
 | `GET /api/daemon/ws` (WebSocket) | machine token | daemon socket |
 

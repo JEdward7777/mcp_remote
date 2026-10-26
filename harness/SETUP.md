@@ -111,6 +111,10 @@ Open `$URL` in Chrome on Android and sign in. Then:
    to get just "New message from a session". If you blocked notifications earlier: Chrome -> site settings (lock
    icon in the address bar, or Android Settings -> Apps -> Chrome -> Notifications) -> allow, then **Turn on**
    again. Android's own per-app settings (Settings -> Apps -> mcp remote -> Notifications) can also silence them.
+   **Settings -> Devices that get notifications** lists every registered phone/browser ("Chrome on Android",
+   when it was added): **Remove** one (e.g. a lost phone, from any other device) or **Remove all devices**.
+   **Sign out** turns notifications off for that browser first, so a signed-out browser (or the next person
+   signing in on it) never gets your notifications.
 3. **Location** (optional): nothing to set up. The first time a session asks and you tap **Share**, Chrome asks
    for location permission for the site ("Allow only while using the app" is enough). To stop sessions from
    asking at all: **Settings -> Location** off (this also deletes the stored last position).
@@ -342,42 +346,55 @@ exit) with growing delays, resuming the conversation, and gives up after 5 crash
 | `normal` | shown | yes; one per session (a newer message replaces it quietly) |
 | `urgent` | shown, vibrates | yes, high priority (`Urgency: high`), buzzes again and stays until dismissed |
 
-"The app is open" means a phone (or browser tab) is connected whose page is visible and showed a sign of life in
-the last 75 s (a message, or the keepalive ping that the runtime answers without waking the Hub). A hidden page
-tells the Hub so (one small frame), and so does a phone whose screen turns off; a phone that vanished without
-closing its socket stops counting after ~75 s. While no app is open, the Hub sends a Web Push to every
-registered phone itself (encrypted with the phone's keys, RFC 8291; signed with your VAPID key, RFC 8292;
+The decision is per device. "The app is open on a device" means that browser is connected, its page is visible
+and it showed a sign of life in the last 75 s (a message, or the keepalive ping that the runtime answers
+without waking the Hub). The page says whether it is visible when it connects (a socket opened in the
+background counts as hidden) and whenever that changes, including when the screen turns off; a phone that
+vanished without closing its socket stops counting after ~75 s. Every registered device whose app is not open
+gets a Web Push (so a browser tab left open on your desktop doesn't keep your phone silent). The Hub sends it
+itself (encrypted with the phone's keys, RFC 8291; signed with your VAPID key, RFC 8292;
 outbound `fetch` from the Hub, at most 5 s each, all phones in parallel, awaited inside the same event). Claude's
 tool result says what happened: "push notification sent to 1 phone", "the phone app is open, so it is shown
-there", "no notification: notifications are not enabled on any phone", or what the push service answered.
+there", "push notification sent to 1 phone; also shown in the app that is open", "no notification: notifications are not enabled on any phone", or what the push service answered.
 
 Push services are only ever called for endpoints on the known Web Push hosts (FCM `fcm.googleapis.com` /
 `android.googleapis.com` for Chrome, Mozilla, Apple, Microsoft); other endpoints are refused when a phone
-registers. A `404`/`410` answer deletes that phone's registration (the app re-registers when next opened); `429`
+registers. A `404`/`410` answer deletes that phone's registration (Settings on that phone then offers
+**Turn on** again; it re-registers by itself only when the server's VAPID keys changed); `429`
 or `5xx` skips that phone for the `Retry-After` time (at least 1 min, at most 1 h) without retrying the message;
 other errors drop that notification (logged with the status, never the content). The payload holds only the
 session id, message id, urgency and, with the preview setting on, the project name and the first 100
 characters.
 
-**Location (D14).** `get_location` (in Claude) asks the phone; nothing is ever tracked in the background:
+**Location (D14).** `get_location` (in Claude) asks the phone; nothing is ever tracked in the background, and
+you consent to each request:
 
 - App open: a banner "*project* asks for your location: *reason*" with **Share** / **Not now**. Share reads the
   position once (`navigator.geolocation`, high accuracy, 20 s) and sends it.
 - App not open: a high-priority notification "Claude wants your location" (the push service drops it if the phone
-  can't be reached within 2 min). Tapping it (or its **Share location** button) opens the app and shares once,
-  even later; **Not now** or ignoring it shares nothing.
-- Claude gets the position with its accuracy and age, or a clear reason: declined, location turned off,
-  no phone reachable, rate limited, or no answer within its timeout (default 60 s, at most 120 s; an answer that
-  comes later is kept as the last-known position for the next call).
-- A last-known position (at most `max_age_s` old, default 5 min) answers at once without asking again.
-- Storage: only the last position, only in your account's Hub, deleted after 6 hours or when you turn location
-  off; never written to any log. The phone list only learns *when* it was taken.
+  can't be reached within 2 min). Tapping it (or its **Share location** button) is the consent: the app opens,
+  checks with the server that this exact request is still open (the notification carries the request's random
+  token), and shares once. A request can be answered for 10 minutes; after that, or once answered, a tap
+  shares nothing ("expired or was already answered"). **Not now** or ignoring it shares nothing. A link to the
+  app with made-up request parameters shares nothing either. The notification disappears once the request is
+  answered or gone (the next time the app is open).
+- Claude gets the position with its accuracy and age, or a clear reason without any position: declined,
+  location turned off, no phone reachable, rate limited, or no answer within its timeout (default 60 s, at most
+  120 s).
+- Only the session whose request you answered gets the position. That session may reuse it for its own later
+  calls if it is at most `max_age_s` old (default 5 min; `0` = always ask) and is told how old it is; any other
+  session's request asks you again. An answer that comes after the session stopped waiting is kept for that
+  session only.
+- Storage: only the last shared position (with the session it belongs to), only in your account's Hub, deleted
+  after 6 hours or when you turn location off (which also cancels pending requests); never written to any log.
+  The phone's Settings only show *when* and *with which project* it was shared.
 - Calls that have to ask the phone are limited (free plan: 5 at once, 20 per hour, `LIMIT_LOCATION`).
 
 **Map links.** `map_link` builds a Google Maps link locally (no API key, no network): a pin, or directions
 (from a given origin, or from wherever the phone is when the link is opened). In messages, the app makes only
 Google Maps links (`https://www.google.com/maps/...`, `maps.google.com`, `maps.app.goo.gl`, `goo.gl/maps`) and
-`geo:` coordinates tappable; any other link stays plain text you can copy, so a session that read something
+`geo:` coordinates tappable (checked on the parsed URL; links with `..`, `%2e` or backslashes are refused so a
+path can't escape `/maps`); any other link stays plain text you can copy, so a session that read something
 malicious can't put a convincing tappable phishing link on your phone.
 
 ## Limits and the free plan (Phase 3)
@@ -662,6 +679,8 @@ wrangler should say so. Phase 4 needs no migration (new tables are created by th
   usually means the VAPID keys changed: open the app on the phone once (it re-registers).
 - `get_location` keeps saying "No answer within ...": the phone didn't get or didn't tap the notification;
   check notifications as above. "turned off": phone app -> Settings -> Location.
+- A lost phone or a shared computer still gets notifications: on any other signed-in device, Settings ->
+  Devices that get notifications -> **Remove** (or **Remove all devices**).
 - The app shows an old version: tap **Reload** on the "new version" banner (or close and reopen the app).
 - Worker logs: `cd worker && npx wrangler tail`.
 

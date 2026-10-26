@@ -24,8 +24,9 @@ Android PWA  <--wss-->  Cloudflare Worker (workers.dev)  -->  per-user Hub Durab
   (`silent` / `normal` / `urgent`, D19). Messaging is discrete and intentional (D17).
 - **Notifications, location, maps** (Phase 4): the phone app is an installable PWA (Android) with Web Push sent
   directly by the Worker (VAPID, no push service account): `normal` messages notify, `urgent` ones notify with high
-  priority and stay, `silent` ones don't, and nothing is pushed while the app is open. Claude can ask for the
-  phone's location on demand (`get_location`; you tap Share every time, or open the notification) and send
+  priority and stay, `silent` ones don't, and a device showing the app gets no push. Claude can ask for the
+  phone's location on demand (`get_location`; you confirm each request, and only the asking session gets the
+  position) and send
   Google Maps links (`map_link`), which the app shows as tappable links.
 
 Free Cloudflare plan only. Everyone shares the deployer's quota, so each account has its own limits (messages
