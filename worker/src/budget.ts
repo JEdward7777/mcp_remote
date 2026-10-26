@@ -128,7 +128,7 @@ export const PLANS: Record<string, TenantLimits> = {
   free: {
     phone_send: rate("10,20/min"),
     agent_send: rate("10,20/min"),
-    launch: rate("5,6/min"),
+    launch: rate("20,20/min"),
     history: rate("20,60/min"),
     phone_frames: rate("60,120/min"),
     daemon_frames: rate("200,600/min"),

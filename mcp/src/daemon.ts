@@ -4,15 +4,25 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import WebSocket from "ws";
 import {
+  CLOSE_RATE_LIMITED,
+  DAEMON_RECONNECT,
   DaemonToHub,
+  Heartbeat,
   HubToDaemon,
   MAX_SESSIONS_PER_MACHINE,
+  PING_INTERVAL_MS,
+  PONG_TIMEOUT_MS,
   PROTOCOL_VERSION,
+  type ReconnectHints,
+  type ReconnectProfile,
   ShimToDaemon,
   type DaemonToShim,
   type SessionAnnounce,
-  backoffDelay,
+  humanWait,
   parseFrame,
+  parseRetryAfter,
+  reconnectDelay,
+  retryHintFromText,
 } from "@mcp-remote/shared";
 import { type Config, ensureConfigDir, socketPath, wsUrl } from "./config";
 import { LineConn } from "./ipc";
@@ -30,8 +40,6 @@ const MAX_REPLACED_STREAK = 3;
 const REPLACED_DELAY_MS = 30_000;
 /** A connection that lived this long without being replaced resets the streak. */
 const STABLE_AFTER_MS = 5 * 60_000;
-const PING_EVERY_MS = 30_000;
-const DEAD_AFTER_MS = 75_000;
 const SEND_TIMEOUT_MS = 15_000;
 
 interface ShimEntry {
@@ -62,6 +70,14 @@ export interface DaemonOptions {
   stableAfterMs?: number;
   /** Remote launch support (launch.json); `false` disables it, an object overrides launcher options (tests). */
   launcher?: false | Partial<LauncherOptions>;
+  /** Keepalive ping interval / pong deadline (tests shorten them). */
+  pingEveryMs?: number;
+  pongTimeoutMs?: number;
+  /** Reconnect backoff profile and randomness (tests make them deterministic). */
+  reconnect?: ReconnectProfile;
+  random?: () => number;
+  /** Observes every scheduled reconnect (tests). */
+  onReconnectScheduled?: (delayMs: number, hints: ReconnectHints) => void;
 }
 
 export class Daemon {
@@ -72,8 +88,7 @@ export class Daemon {
   private attempt = 0;
   private reqSeq = 0;
   private reconnectTimer: NodeJS.Timeout | undefined;
-  private pingTimer: NodeJS.Timeout | undefined;
-  private lastRx = 0;
+  private heartbeat: Heartbeat | null = null;
   private replacedStreak = 0;
   private openedAt = 0;
   private server: Server | null = null;
@@ -117,7 +132,7 @@ export class Daemon {
     // Launched tmux sessions keep running; the next daemon re-adopts them from launches.json.
     this.launcher?.dispose();
     clearTimeout(this.reconnectTimer);
-    clearInterval(this.pingTimer);
+    this.heartbeat?.stop();
     this.ws?.close(1000, "daemon stopping");
     for (const s of this.shims.values()) s.conn.close();
     this.server?.close();
@@ -342,9 +357,19 @@ export class Daemon {
     });
     this.ws = ws;
     let revoked = false;
+    /** What the server told us about when to come back (429 / 5xx / 4029). */
+    const hints: ReconnectHints = {};
 
     ws.on("unexpected-response", (_req, res) => {
-      if (res.statusCode === 401) {
+      if (res.statusCode === 429) {
+        hints.retryAfterMs = parseRetryAfter(res.headers["retry-after"] as string | undefined);
+        hints.rateLimited = true;
+        log(`server is rate limiting this account's connections (HTTP 429${hints.retryAfterMs ? `, retry after ${humanWait(hints.retryAfterMs)}` : ""})`);
+      } else if (res.statusCode !== undefined && res.statusCode >= 500) {
+        hints.serverError = true;
+        hints.retryAfterMs = parseRetryAfter(res.headers["retry-after"] as string | undefined);
+        log(`server error on connect: HTTP ${res.statusCode}`);
+      } else if (res.statusCode === 401) {
         revoked = true;
         log(
           "server rejected this machine's token (revoked or unknown, e.g. after a SESSION_SECRET rotation). " +
@@ -365,23 +390,30 @@ export class Daemon {
       if (this.replacedStreak === 0) this.attempt = 0;
       this.openedAt = Date.now();
       this.hubReady = true;
-      this.lastRx = Date.now();
       log(`connected to ${this.opts.config.url}`);
       this.sendHello();
       this.sendLaunchInfo();
       this.broadcastShims({ t: "hub_status", connected: true });
-      clearInterval(this.pingTimer);
-      this.pingTimer = setInterval(() => {
-        if (Date.now() - this.lastRx > DEAD_AFTER_MS) {
-          log("no traffic from server; reconnecting");
+      // Half-open detection: the Hub's auto-response answers "ping" without waking the Durable
+      // Object; if not even that comes back in time, the connection is dead (e.g. NAT dropped it).
+      this.heartbeat?.stop();
+      this.heartbeat = new Heartbeat({
+        intervalMs: this.opts.pingEveryMs ?? PING_INTERVAL_MS,
+        timeoutMs: this.opts.pongTimeoutMs ?? PONG_TIMEOUT_MS,
+        ping: () => {
+          if (ws.readyState !== WebSocket.OPEN) return false;
+          ws.send("ping");
+          return true;
+        },
+        onDead: () => {
+          log("no answer to keepalive ping from server; reconnecting");
           ws.terminate();
-          return;
-        }
-        if (ws.readyState === WebSocket.OPEN) ws.send("ping");
-      }, PING_EVERY_MS);
+        },
+      });
+      this.heartbeat.start();
     });
     ws.on("message", (data, isBinary) => {
-      this.lastRx = Date.now();
+      if (this.ws === ws) this.heartbeat?.received();
       if (isBinary) return;
       const text = data.toString();
       if (text === "pong") return;
@@ -447,7 +479,8 @@ export class Daemon {
       if (this.ws === ws) this.ws = null;
       const wasReady = this.hubReady;
       this.hubReady = false;
-      clearInterval(this.pingTimer);
+      this.heartbeat?.stop();
+      this.heartbeat = null;
       for (const [k, p] of this.pending) {
         clearTimeout(p.timer);
         this.pending.delete(k);
@@ -472,6 +505,13 @@ export class Daemon {
         this.replacedStreak = 0;
         this.attempt = 0;
       }
+      if (code === CLOSE_RATE_LIMITED) {
+        hints.rateLimited = true;
+        hints.retryAfterMs = retryHintFromText(reason.toString());
+      }
+      const profile = this.opts.reconnect ?? DAEMON_RECONNECT;
+      const random = this.opts.random ?? Math.random;
+      // attempt 0 (a working connection just dropped, e.g. a Worker deploy): spread over profile.spreadMs.
       if (code === 4002) {
         this.replacedStreak++;
         if (this.replacedStreak >= MAX_REPLACED_STREAK) {
@@ -482,11 +522,12 @@ export class Daemon {
           this.fatal(EXIT_DUPLICATE);
           return;
         }
-        delay = (this.opts.replacedDelayMs ?? REPLACED_DELAY_MS) * this.replacedStreak + backoffDelay(this.attempt++, { baseMs: 1000, capMs: 60_000 });
+        delay = (this.opts.replacedDelayMs ?? REPLACED_DELAY_MS) * this.replacedStreak + reconnectDelay(this.attempt++, profile, hints, random);
       } else {
-        delay = backoffDelay(this.attempt++, { baseMs: 1000, capMs: 60_000 });
+        delay = reconnectDelay(this.attempt++, profile, hints, random);
       }
-      log(`disconnected (${code}${reason.length ? " " + reason.toString() : ""}); retrying in ${Math.round(delay / 1000)}s`);
+      log(`disconnected (${code}${reason.length ? " " + reason.toString() : ""}); retrying in ${humanWait(delay)}`);
+      this.opts.onReconnectScheduled?.(delay, { ...hints });
       this.reconnectTimer = setTimeout(() => this.connectHub(), delay);
     });
   }

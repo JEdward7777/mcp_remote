@@ -23,7 +23,17 @@ export async function pair(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ hostname: (opts.name ?? hostname()).slice(0, 128) }),
   });
-  if (!r.ok) throw new Error(`pairing start failed: HTTP ${r.status} ${await r.text()}`);
+  if (!r.ok) {
+    const body = await r.text();
+    let msg = body;
+    try {
+      msg = (JSON.parse(body) as { error?: string }).error ?? body;
+    } catch {
+      /* not JSON */
+    }
+    if (r.status === 429) throw new Error(`the server refused to start pairing: ${msg} (HTTP 429)`);
+    throw new Error(`pairing start failed: HTTP ${r.status} ${msg}`);
+  }
   const start = PairStartResponse.parse(await r.json());
   if (opts.onCode) opts.onCode(start.code, url);
   else {

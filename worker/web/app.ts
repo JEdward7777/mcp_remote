@@ -8,8 +8,11 @@ import type {
   PhoneToHub,
   SessionRecord,
   Urgency,
+  UsageInfo,
 } from "@mcp-remote/shared";
 import { backoffDelay } from "@mcp-remote/shared/backoff";
+import { parseRetryAfter, realClock } from "@mcp-remote/shared/link";
+import { type AuthCheck, PhoneLink, type SocketLike } from "./link";
 
 interface Me {
   tenant: string;
@@ -25,12 +28,12 @@ const state = {
   threads: new Map<string, MessageRecord[]>(),
   hasMore: new Map<string, boolean>(),
   connected: false,
+  /** Today's usage for this account (Phase 3), from state frames; messages bumped locally between them. */
+  usage: null as UsageInfo | null,
 };
 
-let ws: WebSocket | null = null;
+/** Retry counter for boot() when the server can't be reached at all. */
 let attempt = 0;
-let reconnectTimer: number | undefined;
-let pingTimer: number | undefined;
 let clientSeq = 0;
 /** Random per-page prefix so client_ids from other tabs/devices (echoed to all phones) never collide. */
 const pageId = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -82,41 +85,44 @@ function urgencyBadge(u: Urgency | null): HTMLElement | null {
 // Networking
 
 function send(frame: PhoneToHub): boolean {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  ws.send(JSON.stringify(frame));
-  return true;
+  return link.send(JSON.stringify(frame));
 }
 
-function connect(): void {
-  clearTimeout(reconnectTimer);
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const sock = new WebSocket(`${proto}//${location.host}/api/ws`);
-  ws = sock;
-  sock.onopen = () => {
+/** Before each reconnect: a Worker-only request (no Durable Object) that tells signed-out / throttled apart. */
+async function checkAuth(): Promise<AuthCheck> {
+  const r = await fetch("/api/me");
+  if (r.status === 401) return "signed_out";
+  if (r.status === 429) return { rateLimited: true, retryAfterMs: parseRetryAfter(r.headers.get("retry-after")) };
+  if (r.status >= 500) return { serverError: true, retryAfterMs: parseRetryAfter(r.headers.get("retry-after")) };
+  return "ok";
+}
+
+const link = new PhoneLink({
+  url: () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/ws`,
+  open: (url) => new WebSocket(url) as unknown as SocketLike,
+  clock: realClock,
+  isVisible: () => document.visibilityState === "visible",
+  checkAuth,
+  onOpen: () => {
     attempt = 0;
     state.connected = true;
     renderStatus();
-    clearInterval(pingTimer);
-    pingTimer = window.setInterval(() => sock.readyState === WebSocket.OPEN && sock.send("ping"), 30_000);
     // Anything may have happened while we were disconnected: drop every cached thread except the
     // visible one (refetched now; the fresh copy wins on merge) so others reload when opened.
     const sid = currentSession();
     for (const k of [...state.threads.keys()]) if (k !== sid) state.threads.delete(k);
     if (sid) send({ t: "history", session_id: sid });
-  };
-  sock.onmessage = (ev) => {
-    if (ev.data === "pong") return;
+  },
+  onFrame: (data) => {
     let f: HubToPhone;
     try {
-      f = JSON.parse(String(ev.data)) as HubToPhone;
+      f = JSON.parse(data) as HubToPhone;
     } catch {
       return;
     }
     onFrame(f);
-  };
-  sock.onclose = (ev) => {
-    if (ws === sock) ws = null;
+  },
+  onDown: () => {
     state.connected = false;
     if (pendingSends.size) {
       // Unconfirmed sends: keep the text in the compose box so nothing typed is lost.
@@ -128,42 +134,22 @@ function connect(): void {
       pendingLaunchOps.clear();
       render();
     }
-    clearInterval(pingTimer);
     renderStatus();
-    if (ev.code === 1008 || ev.code === 4401) {
-      void boot();
-      return;
-    }
-    scheduleReconnect();
-  };
-}
-
-function scheduleReconnect(): void {
-  clearTimeout(reconnectTimer);
-  const delay = backoffDelay(attempt++, { baseMs: 1000, capMs: 30_000 });
-  reconnectTimer = window.setTimeout(async () => {
-    // If the cookie expired, go back to the sign-in screen instead of looping.
-    const r = await fetch("/api/me").catch(() => null);
-    if (r && r.status === 401) {
-      void boot();
-      return;
-    }
-    connect();
-  }, delay);
-}
-
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && state.me && !ws) {
-    attempt = 0;
-    connect();
-  }
+  },
+  onSignedOut: () => void boot(),
 });
+
+// Android: a backgrounded PWA's socket may be dead or half-open when it comes back.
+document.addEventListener("visibilitychange", () => state.me && link.wake());
+window.addEventListener("online", () => state.me && link.wake());
+window.addEventListener("pageshow", () => state.me && link.wake());
 
 function onFrame(f: HubToPhone): void {
   switch (f.t) {
     case "state":
       state.machines = f.machines;
       state.sessions = f.sessions;
+      if (f.usage) state.usage = f.usage;
       // Drop cached threads of sessions the Hub no longer has (e.g. a confirmed Forget).
       for (const k of [...state.threads.keys()]) {
         if (!f.sessions.some((x) => x.session_id === k)) state.threads.delete(k);
@@ -181,7 +167,10 @@ function onFrame(f: HubToPhone): void {
         }
       }
       const list = state.threads.get(f.message.session_id);
-      if (list && !list.some((m) => m.id === f.message.id)) list.push(f.message);
+      const isNew = !list || !list.some((m) => m.id === f.message.id);
+      if (list && isNew) list.push(f.message);
+      // Every stored message reaches every phone once: count it towards today's usage line.
+      if (isNew && state.usage && state.usage.day === utcToday()) state.usage.messages++;
       const s = state.sessions.find((x) => x.session_id === f.message.session_id);
       if (s) {
         s.last_message_at = f.message.created_at;
@@ -264,6 +253,18 @@ function toast(msg: string): void {
   t.textContent = msg;
   t.hidden = false;
   window.setTimeout(() => (t.hidden = true), 4000);
+}
+
+function utcToday(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/** "Today: 12 of 500 messages" (UTC day, phone + agent together). */
+function usageText(): string {
+  const u = state.usage;
+  if (!u) return "";
+  const n = u.day === utcToday() ? u.messages : 0;
+  return `Today (UTC): ${n} of ${u.message_cap} messages on the ${u.plan} plan`;
 }
 
 function renderStatus(): void {
@@ -458,14 +459,16 @@ interface MachineSection {
 interface SessionsView {
   root: HTMLElement;
   empty: HTMLElement;
+  usage: HTMLElement;
   sections: Map<string, MachineSection>;
 }
 
 function buildSessions(): SessionsView {
   const root = h("section", { class: "list" });
   const empty = h("p", { class: "empty" });
-  root.append(empty);
-  return { root, empty, sections: new Map() };
+  const usage = h("p", { class: "muted usage" });
+  root.append(empty, usage);
+  return { root, empty, usage, sections: new Map() };
 }
 
 function updateSessions(v: SessionsView): void {
@@ -481,6 +484,8 @@ function updateSessions(v: SessionsView): void {
 
   v.empty.hidden = ids.length > 0;
   v.empty.textContent = "No computers paired yet. Open Machines to pair one.";
+  v.usage.textContent = usageText();
+  v.usage.hidden = !state.usage;
 
   for (const [mid, sec] of v.sections) {
     if (!ids.includes(mid)) {
@@ -489,6 +494,7 @@ function updateSessions(v: SessionsView): void {
     }
   }
   let prev: Element = v.empty;
+  // The usage line stays last.
   for (const mid of ids) {
     let sec = v.sections.get(mid);
     if (!sec) {
@@ -835,8 +841,7 @@ function renderShell(): void {
 }
 
 async function boot(): Promise<void> {
-  ws?.close();
-  ws = null;
+  link.stop();
   const r = await fetch("/api/me").catch(() => null);
   if (!r || !r.ok) {
     state.me = null;
@@ -850,7 +855,7 @@ async function boot(): Promise<void> {
   state.me = (await r.json()) as Me;
   renderShell();
   render(true);
-  connect();
+  link.start();
 }
 
 void boot();

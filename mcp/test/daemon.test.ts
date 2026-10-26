@@ -23,6 +23,8 @@ async function waitFor<T>(fn: () => T | undefined | null | false, what = "condit
   }
 }
 
+const FAST_RECONNECT = { baseMs: 20, capMs: 200, spreadMs: 40, minMs: 10 };
+
 let dir: string;
 let wss: WebSocketServer;
 let hubSockets: WsSocket[];
@@ -68,6 +70,8 @@ function startDaemon(onFatal?: (code: number) => void): Daemon {
     config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
     socket: join(dir, "d.sock"),
     launcher: false,
+    // Phase 3 spreads the first reconnect over 15 s; tests use a tiny deterministic profile.
+    reconnect: FAST_RECONNECT,
     ...(onFatal ? { onFatal } : {}),
   });
   return daemon;
@@ -179,6 +183,7 @@ describe("daemon", () => {
     launcher: false,
       onFatal: (c) => (exitCode = c),
       replacedDelayMs: 10,
+      reconnect: FAST_RECONNECT,
     });
     wss.on("connection", (ws) => setTimeout(() => ws.close(4002, "replaced by a newer connection"), 20));
     await daemon.start();
@@ -195,6 +200,7 @@ describe("daemon", () => {
       onFatal: (c) => (exitCode = c),
       replacedDelayMs: 10,
       stableAfterMs: 100,
+      reconnect: FAST_RECONNECT,
     });
     // Every connection is replaced, but only after living longer than stableAfterMs.
     wss.on("connection", (ws) => setTimeout(() => ws.close(4002, "replaced"), 150));
@@ -442,5 +448,122 @@ describe("daemon remote launch", () => {
     expect(calls).toEqual([]);
     expect(readFileSync(statePath, "utf8")).toBe(before);
     expect(tmux.sessions.has(id)).toBe(true);
+  });
+});
+
+describe("daemon reconnect hardening (phase 3)", () => {
+  const cfg = () => ({ url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" });
+
+  it("detects a half-open connection from a missing pong and reconnects", async () => {
+    // A hub that never answers "ping" (like a dead NAT mapping: nothing comes back).
+    wss.removeAllListeners("connection");
+    wss.on("connection", (ws) => hubSockets.push(ws));
+    const delays: number[] = [];
+    daemon = new Daemon({
+      config: cfg(),
+      socket: join(dir, "d.sock"),
+      launcher: false,
+      reconnect: FAST_RECONNECT,
+      pingEveryMs: 60,
+      pongTimeoutMs: 60,
+      onReconnectScheduled: (d) => delays.push(d),
+    });
+    await daemon.start();
+    await waitFor(() => hubSockets.length >= 2, "reconnect after missing pong", 3000);
+    expect(delays.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("keeps a connection whose pings are answered", async () => {
+    const delays: number[] = [];
+    daemon = new Daemon({
+      config: cfg(),
+      socket: join(dir, "d.sock"),
+      launcher: false,
+      reconnect: FAST_RECONNECT,
+      pingEveryMs: 40,
+      pongTimeoutMs: 40,
+      onReconnectScheduled: (d) => delays.push(d),
+    });
+    await daemon.start();
+    await sleep(500);
+    expect(hubSockets.length).toBe(1);
+    expect(delays).toEqual([]);
+  });
+
+  async function rejectingServer(status: number, headers: Record<string, string>): Promise<number> {
+    wss.close();
+    wss = new WebSocketServer({
+      port: 0,
+      host: "127.0.0.1",
+      verifyClient: (_info, cb) => cb(false, status, "refused", headers),
+    });
+    await new Promise<void>((r) => wss.once("listening", () => r()));
+    return (wss.address() as { port: number }).port;
+  }
+
+  it("honors HTTP 429 Retry-After from the Worker", async () => {
+    port = await rejectingServer(429, { "Retry-After": "7" });
+    const seen: { d: number; h: any }[] = [];
+    daemon = new Daemon({
+      config: cfg(),
+      socket: join(dir, "d.sock"),
+      launcher: false,
+      reconnect: FAST_RECONNECT,
+      random: () => 0,
+      onReconnectScheduled: (d, h) => seen.push({ d, h }),
+    });
+    await daemon.start();
+    await waitFor(() => seen.length >= 1, "scheduled");
+    expect(seen[0]!.h).toMatchObject({ rateLimited: true, retryAfterMs: 7000 });
+    expect(seen[0]!.d).toBeGreaterThanOrEqual(7000);
+  });
+
+  it("backs off at least 5 s after an HTTP 5xx and 60 s after 429 without Retry-After", async () => {
+    port = await rejectingServer(503, {});
+    const seen: number[] = [];
+    daemon = new Daemon({ config: cfg(), socket: join(dir, "d.sock"), launcher: false, reconnect: FAST_RECONNECT, random: () => 0, onReconnectScheduled: (d) => seen.push(d) });
+    await daemon.start();
+    await waitFor(() => seen.length >= 1, "scheduled 5xx");
+    expect(seen[0]).toBeGreaterThanOrEqual(5000);
+    daemon.stop();
+    port = await rejectingServer(429, {});
+    const seen2: number[] = [];
+    daemon = new Daemon({ config: cfg(), socket: join(dir, "d2.sock"), launcher: false, reconnect: FAST_RECONNECT, random: () => 0, onReconnectScheduled: (d) => seen2.push(d) });
+    await daemon.start();
+    await waitFor(() => seen2.length >= 1, "scheduled 429");
+    expect(seen2[0]).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it("waits out a 4029 'rate limited' close using the hinted delay", async () => {
+    wss.on("connection", (ws) => setTimeout(() => ws.close(4029, "rate limited: too many requests; retry in 9s"), 20));
+    const seen: { d: number; h: any }[] = [];
+    daemon = new Daemon({ config: cfg(), socket: join(dir, "d.sock"), launcher: false, reconnect: FAST_RECONNECT, random: () => 0, onReconnectScheduled: (d, h) => seen.push({ d, h }) });
+    await daemon.start();
+    await waitFor(() => seen.length >= 1, "scheduled");
+    expect(seen[0]!.h).toMatchObject({ rateLimited: true, retryAfterMs: 9000 });
+    expect(seen[0]!.d).toBeGreaterThanOrEqual(9000);
+    await sleep(200);
+    expect(hubSockets.length).toBe(1); // no quick retry
+  });
+
+  it("spreads the first reconnect after a working connection drops (deploy) and grows after that", async () => {
+    const seen: number[] = [];
+    let n = 0;
+    wss.on("connection", (ws) => setTimeout(() => ws.close(1012, "service restart"), 20));
+    daemon = new Daemon({
+      config: cfg(),
+      socket: join(dir, "d.sock"),
+      launcher: false,
+      reconnect: { baseMs: 20, capMs: 400, spreadMs: 300, minMs: 10 },
+      random: () => (n++ % 2 ? 1 : 0.5),
+      onReconnectScheduled: (d) => seen.push(d),
+    });
+    await daemon.start();
+    await waitFor(() => seen.length >= 2, "two reconnects", 4000);
+    // Each connection opened before it dropped, so every retry is a "first retry": spread over [10, 300].
+    for (const d of seen) {
+      expect(d).toBeGreaterThanOrEqual(10);
+      expect(d).toBeLessThanOrEqual(300);
+    }
   });
 });

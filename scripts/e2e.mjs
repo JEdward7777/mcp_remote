@@ -614,6 +614,40 @@ async function main() {
     await waitFor(() => launchOf(fid)?.state === "exited", { timeout: 15_000, what: "fork stopped 3" });
   }
 
+  // --- per-tenant limits (Phase 3) -----------------------------------------------------------
+  logStep("per-tenant rate limits and usage");
+  await waitFor(() => sessionOf(pa, "sess-a")?.online, { timeout: 15_000, what: "sess-a online for the limit checks" });
+  pa.send({ t: "refresh" });
+  const st0 = await waitFor(() => [...pa.frames].reverse().find((f) => f.t === "state" && f.usage), { what: "state with usage" });
+  check(
+    "phone state carries today's usage for this account (plan, messages, cap)",
+    st0.usage.plan === "free" && st0.usage.messages > 0 && st0.usage.message_cap === 500 && st0.usage.day === new Date().toISOString().slice(0, 10),
+    JSON.stringify(st0.usage),
+  );
+  let rlErr = null;
+  for (let i = 0; i < 15 && !rlErr; i++) {
+    pa.send({ t: "send", session_id: "sess-a", text: `burst ${i}`, client_id: `rl-${i}` });
+    rlErr = await waitFor(
+      () => pa.frames.find((f) => (f.t === "error" || f.t === "message") && f.client_id === `rl-${i}`),
+      { what: `answer to burst ${i}` },
+    ).then((f) => (f.t === "error" ? f : null));
+  }
+  check(
+    "a burst of phone messages hits the rate limit with a clear error",
+    !!rlErr && /^rate limited: too many messages; try again in \d+s$/.test(rlErr.error) && rlErr.retry_after_s > 0,
+    JSON.stringify(rlErr),
+  );
+  let agentErr = null;
+  for (let i = 0; i < 15 && !agentErr; i++) {
+    const r = await shimA2.client.callTool({ name: "send_message", arguments: { text: `agent burst ${i}`, urgency: "silent" } });
+    if (r.isError) agentErr = r.content?.[0]?.text ?? "";
+  }
+  check(
+    "a burst of agent send_message calls gets 'Message NOT sent: rate limited ... try again in Ns'",
+    /^Message NOT sent: rate limited: too many messages from your sessions \(20 per minute\); try again in \d+s$/.test(agentErr ?? ""),
+    String(agentErr),
+  );
+
   // --- revoke -----------------------------------------------------------------------------
   logStep("revoking the machine");
   const daemonLive = liveDaemon;
@@ -636,6 +670,35 @@ async function main() {
   });
   await waitFor(() => daemon2.exitCode !== null, { timeout: 15_000, what: "revoked daemon to give up" });
   check("a revoked token cannot reconnect", daemon2.exitCode === 3 && /revoked/.test(daemon2.output), daemon2.output.slice(-300));
+
+  // --- unauthenticated abuse protection (Phase 3) -------------------------------------------
+  logStep("pairing-start throttle");
+  let throttled = null;
+  for (let i = 0; i < 10 && !throttled; i++) {
+    const r = await fetch(`${base}/api/pair/start`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    if (r.status === 429) throttled = { retry: r.headers.get("retry-after"), body: await r.json() };
+    else await r.body?.cancel();
+  }
+  check(
+    "repeated /api/pair/start from one network is throttled (429 + Retry-After + clear text)",
+    !!throttled && Number(throttled.retry) > 0 && /^too many pairing attempts from your network; try again in \d+ min$/.test(throttled.body.error),
+    JSON.stringify(throttled),
+  );
+  const pairThrottled = spawnLogged("pair-throttled", process.execPath, [CLI, "pair", base], {
+    env: { ...process.env, MCP_REMOTE_CONFIG_DIR: join(tmp, "throttled") },
+  });
+  await waitFor(() => pairThrottled.exitCode !== null, { timeout: 15_000, what: "throttled pair to exit" });
+  check(
+    "`mcp-remote pair` explains the throttle instead of a raw HTTP error",
+    pairThrottled.exitCode !== 0 && /too many pairing attempts from your network; try again in/.test(pairThrottled.output),
+    pairThrottled.output.slice(-400),
+  );
+  const big = await fetch(`${base}/api/pair/start`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hostname: "x".repeat(10_000) }),
+  });
+  check("an oversize pairing request is refused with 413", big.status === 413, String(big.status));
 
   await shimA2.client.close();
   await shimB.client.close();

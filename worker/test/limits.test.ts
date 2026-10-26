@@ -228,11 +228,11 @@ describe("per-tenant limits in the Hub (D10)", () => {
 
   it("rate limits launch requests and history fetches", async () => {
     const { p, sid } = await setup("rl-launch");
-    for (let i = 0; i < 6; i++) p.send({ t: "launch_stop", machine_id: "nope", launch_id: "mr-000000000000", client_id: `l${i}` });
-    const lr = await waitFor(() => p.frames.find((f) => f.t === "launch_result" && f.client_id === "l5"), "launch rl");
+    for (let i = 0; i < 21; i++) p.send({ t: "launch_stop", machine_id: "nope", launch_id: "mr-000000000000", client_id: `l${i}` });
+    const lr = await waitFor(() => p.frames.find((f) => f.t === "launch_result" && f.client_id === "l20"), "launch rl");
     expect(lr).toMatchObject({ ok: false });
     expect(lr.error).toMatch(/^rate limited: too many start\/stop requests; try again in \d+s$/);
-    expect(p.frames.find((f) => f.t === "launch_result" && f.client_id === "l4").error).toBe("unknown computer");
+    expect(p.frames.find((f) => f.t === "launch_result" && f.client_id === "l19").error).toBe("unknown computer");
     for (let i = 0; i < 21; i++) p.send({ t: "history", session_id: sid });
     const he = await waitFor(() => p.frames.find((f) => f.t === "error" && /history/.test(f.error)), "history rl");
     expect(he.error).toMatch(/^rate limited: too many history requests; try again in \d+s$/);
