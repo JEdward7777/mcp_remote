@@ -1,5 +1,5 @@
 // Local configuration: ~/.config/mcp-remote/config.json (0600) in a 0700 directory.
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -109,7 +109,12 @@ export function serviceEnvPath(): string {
 
 export const SERVICE_ENV_TEMPLATE = `# Environment for the mcp-remote daemon and the Claude Code sessions it launches from the phone.
 # Read by \`mcp-remote daemon\` at startup (systemd, launchd or by hand); keep this file mode 0600.
-# Put secrets and shell-only settings here, not in the service unit/plist. One KEY=value per line, e.g.:
+# Put secrets and shell-only settings here, not in the service unit/plist.
+# Syntax: KEY=value or export KEY=value, one per line; # starts a comment (also after an unquoted value).
+# 'single quotes' are literal; "double quotes" and unquoted values expand $VAR and \${VAR} from the daemon's
+# environment and earlier lines (e.g. PATH="$HOME/.local/bin:$PATH"). No other shell syntax ($(...), escapes).
+# HOME, XDG_CONFIG_HOME, APPDATA, USERPROFILE, MCP_REMOTE_CONFIG_DIR and MCP_REMOTE_SOCKET are ignored here.
+# Examples:
 #   CLAUDE_CODE_OAUTH_TOKEN=...        (from \`claude setup-token\`)
 #   CLAUDE_CODE_USE_BEDROCK=1
 #   AWS_PROFILE=work
@@ -119,34 +124,87 @@ export const SERVICE_ENV_TEMPLATE = `# Environment for the mcp-remote daemon and
 # or \`tmux -L mcp-remote kill-server\`).
 `;
 
+/** A problem with the daemon's own settings: restarting can't fix it (exit code 5, see service.ts). */
+export class ConfigError extends Error {}
+
 /**
- * Load <config dir>/service.env into process.env (KEY=value lines, # comments, optional quotes).
- * Returns the variable names loaded (values are never logged).
+ * Keys service.env may not set: they would move the config dir / socket away from the config.json that was
+ * already read (or point the file at another one).
+ */
+export const SERVICE_ENV_BLOCKED = ["MCP_REMOTE_CONFIG_DIR", "MCP_REMOTE_SOCKET", "HOME", "XDG_CONFIG_HOME", "APPDATA", "USERPROFILE"];
+
+/**
+ * Parse one service.env value: 'single quotes' are literal; "double quotes" and unquoted values expand
+ * $VAR / ${VAR} from `env`; an unquoted value ends at " #" (inline comment). Undefined variables expand
+ * to "". Returns null for a value this small parser can't read (unterminated quote, trailing text).
+ */
+export function parseEnvValue(raw: string, env: NodeJS.ProcessEnv): string | null {
+  const expand = (t: string) =>
+    t.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (_m, a: string | undefined, b: string | undefined) => env[a ?? b ?? ""] ?? "");
+  const v = raw.trim();
+  if (v.startsWith("'")) {
+    const end = v.indexOf("'", 1);
+    if (end < 0 || !/^\s*(#.*)?$/.test(v.slice(end + 1))) return null;
+    return v.slice(1, end);
+  }
+  if (v.startsWith('"')) {
+    const end = v.indexOf('"', 1);
+    if (end < 0 || !/^\s*(#.*)?$/.test(v.slice(end + 1))) return null;
+    return expand(v.slice(1, end));
+  }
+  const unquoted = v.replace(/\s+#.*$/, "");
+  if (/["'`\\]/.test(unquoted) || /\$\(/.test(unquoted)) return null; // shell syntax we don't support
+  return expand(unquoted);
+}
+
+/**
+ * Load <config dir>/service.env into process.env. Syntax: `KEY=value` or `export KEY=value`, one per line;
+ * # comments; values as in parseEnvValue. The file must be a regular file owned by you (not a symlink) and
+ * is kept at mode 0600. Returns the variable names loaded (values are never logged).
  */
 export function loadServiceEnv(path = serviceEnvPath()): string[] {
-  if (!existsSync(path)) return [];
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return [];
+  }
+  if (st.isSymbolicLink() || !st.isFile()) throw new ConfigError(`${path} must be a regular file, not a symlink or anything else`);
   if (process.platform !== "win32") {
-    const mode = statSync(path).mode & 0o777;
+    const uid = process.getuid?.();
+    if (uid !== undefined && st.uid !== uid) throw new ConfigError(`${path} is owned by uid ${st.uid}, not you (uid ${uid}); refusing to read it`);
+    const mode = st.mode & 0o777;
     if (mode & 0o077) {
-      log(`warning: ${path} had mode ${mode.toString(8)}; tightening to 600 (it may hold secrets)`);
-      chmodSync(path, 0o600);
+      try {
+        chmodSync(path, 0o600);
+      } catch (e) {
+        throw new ConfigError(`${path} has mode ${mode.toString(8)} and could not be made 0600 (${e instanceof Error ? e.message : e}); fix it with chmod 600`);
+      }
+      log(`warning: ${path} had mode ${mode.toString(8)}; tightened to 600 (it may hold secrets)`);
     }
   }
   const keys: string[] = [];
-  for (const raw of readFileSync(path, "utf8").split(/\r?\n/)) {
+  const lines = readFileSync(path, "utf8").split(/\r?\n/);
+  lines.forEach((raw, i) => {
     const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (!line || line.startsWith("#")) return;
+    const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
     if (!m) {
-      log(`warning: ignoring a line in ${path} that is not KEY=value`);
-      continue;
+      log(`warning: ${path}:${i + 1} ignored: not KEY=value`);
+      return;
     }
     const key = m[1]!;
-    if (key === "MCP_REMOTE_CONFIG_DIR") continue; // would point away from the file being read
-    let v = m[2]!;
-    if ((v.startsWith('"') && v.endsWith('"') && v.length >= 2) || (v.startsWith("'") && v.endsWith("'") && v.length >= 2)) v = v.slice(1, -1);
-    process.env[key] = v;
+    if (SERVICE_ENV_BLOCKED.includes(key)) {
+      log(`warning: ${path}:${i + 1} ignored: ${key} can't be set here (it would move mcp-remote's config dir or socket)`);
+      return;
+    }
+    const value = parseEnvValue(m[2]!, process.env);
+    if (value === null) {
+      log(`warning: ${path}:${i + 1} ignored: the value of ${key} uses syntax this file doesn't support (see the comments at the top)`);
+      return;
+    }
+    process.env[key] = value;
     keys.push(key);
-  }
+  });
   return keys;
 }

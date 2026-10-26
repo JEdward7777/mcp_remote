@@ -6,7 +6,7 @@
 //
 // macOS: launchd agent. launchd has no "don't restart on these exit codes" setting: KeepAlive
 // {SuccessfulExit: false} restarts on any non-zero exit (including signals) and not on exit 0. So the agent
-// sets MCP_REMOTE_FATAL_EXIT_ZERO=1, which makes the daemon exit 0 instead of 3/4 (it logs the real reason
+// sets MCP_REMOTE_FATAL_EXIT_ZERO=1, which makes the daemon exit 0 instead of 3/4/5 (it logs the real reason
 // first). Limit: after a revoke, the agent still starts at the next login (RunAtLoad), logs, and exits 0.
 // AbandonProcessGroup keeps launched tmux sessions alive when the daemon stops.
 //
@@ -56,8 +56,9 @@ Type=simple
 ExecStart=${sdQuote(spec.node)} ${sdQuote(spec.cli)} daemon
 Restart=on-failure
 RestartSec=10
-# 3 = machine revoked / account no longer allowed, 4 = token in use by another computer: restarting can't help.
-RestartPreventExitStatus=3 4
+# 3 = machine revoked / account no longer allowed, 4 = token in use by another computer, 5 = unusable settings
+# (config.json / service.env): restarting can't help.
+RestartPreventExitStatus=3 4 5
 # Phone-launched Claude Code sessions live in a tmux server this daemon starts. Only stop the daemon itself
 # on stop/restart; the next daemon re-adopts the sessions.
 KillMode=process
@@ -130,7 +131,7 @@ export function windowsSteps(spec: ServiceSpec): string {
       Program:   ${spec.node}
       Arguments: "${spec.cli}" daemon
   - Settings: "If the task fails, restart every 1 minute", up to 3 times; "Stop the task if it runs longer than": off.
-  - Set the user environment variable MCP_REMOTE_FATAL_EXIT_ZERO=1 so the daemon exits 0 (not 3/4) when it was
+  - Set the user environment variable MCP_REMOTE_FATAL_EXIT_ZERO=1 so the daemon exits 0 (not 3/4/5) when it was
     revoked or its token is used elsewhere, which Task Scheduler does not count as a failure to restart.
 Remote launch of Claude Code sessions needs tmux, so it is not available on native Windows; run mcp-remote inside
 WSL for that.

@@ -1,5 +1,5 @@
 // mcp-remote CLI: pair | daemon | shim | projects | config | setup-claude | attach | install-service | uninstall-service
-import { Daemon } from "./daemon";
+import { Daemon, EXIT_CONFIG } from "./daemon";
 import { configPath, loadConfig, loadServiceEnv, serviceEnvPath } from "./config";
 import { attach, configCommand, projectsCommand, setupClaude } from "./desk";
 import { installService, uninstallService } from "./service";
@@ -34,7 +34,7 @@ env:
   MCP_REMOTE_CONFIG_DIR   config directory (default ~/.config/mcp-remote)
   MCP_REMOTE_SOCKET       daemon IPC socket path (default <config dir>/daemon.sock)
   MCP_REMOTE_SESSION_ID   fixed session id for this shim (default: random per launch)
-  MCP_REMOTE_FATAL_EXIT_ZERO=1  exit 0 instead of 3/4 when restarting can't help (launchd/Task Scheduler)
+  MCP_REMOTE_FATAL_EXIT_ZERO=1  exit 0 instead of 3/4/5 when restarting can't help (launchd/Task Scheduler)
 `;
 
 async function main(argv: string[]): Promise<void> {
@@ -56,8 +56,15 @@ async function main(argv: string[]): Promise<void> {
     }
     case "daemon": {
       setLogPrefix("mcp-remote daemon");
-      const config = loadConfig();
-      const envKeys = loadServiceEnv();
+      let config, envKeys;
+      try {
+        config = loadConfig();
+        envKeys = loadServiceEnv();
+      } catch (e) {
+        // No restart loop: the systemd unit lists 5 in RestartPreventExitStatus; launchd maps it to 0.
+        log(e instanceof Error ? e.message : String(e));
+        process.exit(process.env.MCP_REMOTE_FATAL_EXIT_ZERO === "1" ? 0 : EXIT_CONFIG);
+      }
       if (envKeys.length) log(`loaded ${envKeys.length} setting(s) from ${serviceEnvPath()}: ${envKeys.join(", ")}`);
       log(`using ${configPath()} (machine ${config.machine_name ?? config.machine_id})`);
       // Launched sessions run under `mcp-remote run-claude` (this same CLI) so their exit status is recorded.

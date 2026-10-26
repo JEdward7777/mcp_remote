@@ -122,7 +122,7 @@ mcp-remote install-service          # --dry-run prints the file instead; --no-st
   `loginctl enable-linger $USER`. Re-run `install-service` after upgrading node (the path changes).
 - **macOS**: writes `~/Library/LaunchAgents/com.mcp-remote.daemon.plist` (RunAtLoad, `KeepAlive` with
   `SuccessfulExit=false`, `AbandonProcessGroup`) and loads it with `launchctl bootstrap gui/$(id -u)`.
-  Logs: `~/Library/Logs/mcp-remote.log`. launchd can't be told "don't restart on exit 3/4", so the agent sets
+  Logs: `~/Library/Logs/mcp-remote.log`. launchd can't be told "don't restart on exit 3/4/5", so the agent sets
   `MCP_REMOTE_FATAL_EXIT_ZERO=1`: the daemon then exits 0 in those cases (after logging why) and launchd leaves it
   stopped. Limit: it is started again at your next login, logs the same reason and exits again.
 - **Windows**: prints Task Scheduler steps (no installer). Remote launch needs tmux, so it is only available when
@@ -134,8 +134,14 @@ Environment: the unit/plist carries `PATH`, and `CLAUDE_CONFIG_DIR` / `MCP_REMOT
 when you run `install-service` (so launched sessions find the same Claude Code login and shim registration as
 your shell). Run `install-service` from the shell you use Claude Code in. **Secrets and shell-only settings do not
 belong in the unit/plist** (they are world-readable files): put them in `~/.config/mcp-remote/service.env`, which
-`install-service` creates empty with mode 0600 and the daemon reads at startup on every platform, one `KEY=value`
-per line, e.g. `CLAUDE_CODE_OAUTH_TOKEN=...` (from `claude setup-token`, the usual login for an always-on
+`install-service` creates empty with mode 0600 and the daemon reads at startup on every platform. Syntax:
+`KEY=value` or `export KEY=value`, one per line; `#` starts a comment (also after an unquoted value);
+`'single quotes'` are literal; `"double quotes"` and unquoted values expand `$VAR` / `${VAR}` from the daemon's
+environment and earlier lines (so `PATH="$HOME/.local/bin:$PATH"` works); no other shell syntax (`$(...)`,
+backslashes) — such lines are skipped with a warning naming the key. `HOME`, `XDG_CONFIG_HOME`, `APPDATA`,
+`USERPROFILE`, `MCP_REMOTE_CONFIG_DIR` and `MCP_REMOTE_SOCKET` are ignored there (they would move the config dir
+the daemon already read). The file must be a regular file you own (not a symlink); a looser mode is tightened to
+0600. E.g. `CLAUDE_CODE_OAUTH_TOKEN=...` (from `claude setup-token`, the usual login for an always-on
 machine), `CLAUDE_CODE_USE_BEDROCK=1` / `AWS_PROFILE=...`, `CLAUDE_CODE_USE_VERTEX=1`, `HTTPS_PROXY=...`.
 Restart the service after editing it. Already-running launched sessions keep their environment, and the dedicated
 tmux server keeps the one it started with until it exits (it does when no launched session is left, or
@@ -145,7 +151,10 @@ Claude Code session the daemon may itself have been started from (`CLAUDECODE`, 
 
 Exit codes: 3 = the machine was revoked or the account is no longer allowed (pair again); 4 = another computer runs a
 daemon with the same token (e.g. a copied `~/.config/mcp-remote`: pair each computer separately, never copy
-`config.json`). Restarting can't help in either case, which is why the service files above don't. Other exits
+`config.json`); 5 = the daemon's own settings are unusable (no or invalid `config.json`, or a `service.env` that is a
+symlink, not yours, or can't be made 0600; the log says which). Restarting can't help in any of these cases, which
+is why the service files above don't (`RestartPreventExitStatus=3 4 5`; under launchd the daemon exits 0 instead).
+A unit written by an older `install-service` only lists `3 4`: run `mcp-remote install-service` again. Other exits
 (crash, network) are restarted; the daemon also reconnects with backoff on its own. Stopping or restarting the
 service does **not** end Claude Code sessions launched from the phone: they live in a separate tmux server and the
 next daemon re-adopts them.

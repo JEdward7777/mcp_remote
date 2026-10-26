@@ -32,7 +32,7 @@ into. State is kept in `launches.json` (including pending auto-restarts) so a re
 sessions.
 
 Env: `MCP_REMOTE_CONFIG_DIR`, `MCP_REMOTE_SOCKET`, `MCP_REMOTE_SESSION_ID`, `MCP_REMOTE_LAUNCH_TOKEN` (set by the
-daemon for launched sessions), `MCP_REMOTE_FATAL_EXIT_ZERO=1` (exit 0 instead of 3/4; used by the launchd agent), `MCP_REMOTE_ACTIVATE=1` (shim
+daemon for launched sessions), `MCP_REMOTE_FATAL_EXIT_ZERO=1` (exit 0 instead of 3/4/5; used by the launchd agent), `MCP_REMOTE_ACTIVATE=1` (shim
 registers even though its parent `claude` was not started with `--dangerously-load-development-channels`; without
 it, and without a session id or launch token, the shim stays dormant).
 

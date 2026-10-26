@@ -9,7 +9,7 @@ describe("service files", () => {
     const u = systemdUnit(spec);
     expect(u).toContain(`ExecStart="${spec.node}" "/home/you/My Apps/mcp-remote/dist/cli.js" daemon`);
     expect(u).toMatch(/^Restart=on-failure$/m);
-    expect(u).toMatch(/^RestartPreventExitStatus=3 4$/m);
+    expect(u).toMatch(/^RestartPreventExitStatus=3 4 5$/m);
     expect(u).toMatch(/^KillMode=process$/m);
     expect(u).toContain('Environment="PATH=/usr/bin:/bin"');
     expect(u).not.toContain('Environment="MCP_REMOTE_CONFIG_DIR');

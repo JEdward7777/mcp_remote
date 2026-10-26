@@ -132,7 +132,7 @@ function clip(s: string | null): string | null {
 
 /**
  * Markers of the Claude Code process the daemon itself may have been started from (only those): with them a
- * launched `claude` would think it is nested (CLAUDECODE=1 makes 2.1.310 refuse to start), attach to that
+ * launched `claude` would think it is nested (CLAUDECODE=1 makes it refuse to start), attach to that
  * session's IDE port, or reuse its session ids. Everything else, including CLAUDE_CODE_OAUTH_TOKEN, the
  * Bedrock/Vertex/Foundry provider switches and CLAUDE_CODE_SHELL, is passed through.
  */
@@ -145,6 +145,16 @@ export const NESTED_SESSION_VARS = [
   "CLAUDE_SESSION_ID",
   "CLAUDE_CODE_PROJECT_DIR_NAME",
   "CLAUDE_PROJECT_DIR",
+  // Child-session markers (round 7; all present in the 2.1.310 binary).
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_SESSION_ATTENDED",
+  "CLAUDE_PID",
+  "AI_AGENT",
+  "CLAUDE_CODE_CHROME_MCP_ORG_DENIED",
+  "CLAUDE_CODE_BRIDGE_SESSION_ID",
+  "CLAUDE_CODE_HOST_SESSION_ID",
+  "CLAUDE_CODE_HOST_WORKTREE",
+  "CLAUDE_CODE_HOST_WORKTREE_FENCE",
 ];
 
 /** Environment for the tmux server (and so for launched sessions). */

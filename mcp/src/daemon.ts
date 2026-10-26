@@ -23,6 +23,8 @@ import { log } from "./log";
 export const EXIT_REVOKED = 3;
 /** Another daemon keeps taking over this machine's connection (same token on two computers). */
 export const EXIT_DUPLICATE = 4;
+/** The daemon's own settings are unusable (config.json, service.env): restarting can't help either. */
+export const EXIT_CONFIG = 5;
 /** After this many consecutive "replaced" closes, give up instead of fighting forever. */
 const MAX_REPLACED_STREAK = 3;
 const REPLACED_DELAY_MS = 30_000;
