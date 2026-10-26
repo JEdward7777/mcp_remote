@@ -8,7 +8,8 @@
 // With --continue it refuses ("No conversation found to continue", exit 1) unless a previous run in this
 // folder received a message; with --resume <id> it refuses ("No conversation found with session ID: <id>")
 // unless a run started with --session-id <id> received one, like the real CLI. Every start is logged as one JSON line to $FAKE_CLAUDE_LOG.
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -32,7 +33,10 @@ if (argv.includes("--continue") && !existsSync(historyFile)) {
 }
 const flagValue = (f) => (argv.indexOf(f) >= 0 ? argv[argv.indexOf(f) + 1] : null);
 const convId = flagValue("--resume") ?? flagValue("--session-id");
-const convFile = convId ? join(cwd, `.fake-claude-history-${convId}`) : null;
+// Like Claude Code 2.1.310: <config>/projects/<cwd, non-alphanumerics as "-">/<id>.jsonl, written once
+// something was said.
+const transcriptDir = join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
+const convFile = convId ? join(transcriptDir, `${convId}.jsonl`) : null;
 if (argv.includes("--resume") && !existsSync(convFile)) {
   process.stdout.write(`No conversation found with session ID: ${convId}\n`);
   process.exit(1);
@@ -79,7 +83,10 @@ client.fallbackNotificationHandler = async (n) => {
   const text = String(n.params?.content ?? "");
   log("channel", { text });
   writeFileSync(historyFile, "1");
-  if (convFile) writeFileSync(convFile, "1");
+  if (convFile) {
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(convFile, "{}\n");
+  }
   if (text === "crash") {
     process.stdout.write("fatal: simulated crash\n");
     process.exit(7);

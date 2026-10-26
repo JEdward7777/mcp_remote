@@ -27,7 +27,20 @@ export const PERMISSION_MODE_HELP: Record<PermissionMode, string> = {
 };
 
 /** Conversation-selection flags the launcher sets itself; extra args may not override them. */
-export const RESERVED_ARGS = ["--continue", "-c", "--resume", "-r", "--session-id", "--fork-session"];
+export const RESERVED_ARGS = ["--continue", "--resume", "--session-id", "--fork-session", "--from-pr"];
+
+/** The managed flag an argument would set, if any: long forms (also `--x=value`) and any short-flag
+ * cluster containing c or r (`-c`, `-r`, `-rabc`, `-cr`, `-dc`). */
+export function reservedFlag(a: string): string | null {
+  const long = RESERVED_ARGS.find((r) => a === r || a.startsWith(`${r}=`));
+  if (long) return long;
+  if (/^-[A-Za-z]/.test(a) && !a.startsWith("--")) {
+    const letters = a.slice(1).split("=")[0]!;
+    const m = letters.match(/[cr]/);
+    if (m) return letters.length === 1 ? a : `-${m[0]} (in ${a})`;
+  }
+  return null;
+}
 
 /** One extra CLI argument. Validated so it can never be read as a tmux command separator. */
 const ExtraArg = z
@@ -37,7 +50,7 @@ const ExtraArg = z
   .refine((a) => !a.endsWith(";"), "an argument may not end with ';' (tmux would read it as a command separator)")
   .refine((a) => !/[\0\n\r]/.test(a), "no control characters")
   .superRefine((a, ctx) => {
-    const hit = RESERVED_ARGS.find((r) => a === r || a.startsWith(`${r}=`));
+    const hit = reservedFlag(a);
     if (hit) {
       ctx.addIssue({
         code: "custom",

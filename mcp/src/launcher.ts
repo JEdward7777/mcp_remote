@@ -13,6 +13,7 @@
 //   - one `tmux list-panes` every LIVENESS_MS while any launch is active, to notice exits
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import {
@@ -51,6 +52,14 @@ const Entry = LaunchRecord.extend({
   claude_session: z.string().uuid().nullable().default(null),
   /** pid of the process that started the first shim linked for the current spawn (the session's Claude Code). */
   shim_parent: z.number().int().nullable().default(null),
+  /**
+   * claude_session is a fork (--continue --fork-session --session-id) that Claude Code may not have saved
+   * yet: it only writes a transcript once something is said. Until its transcript is seen, a resume forks
+   * the folder's conversation again instead of `--resume`-ing an id that may not exist.
+   */
+  fork_pending: z.boolean().default(false),
+  /** claude_session came from forking the folder's conversation (not from a fresh start). */
+  from_fork: z.boolean().default(false),
 });
 type Entry = z.infer<typeof Entry> & {
   linked?: boolean;
@@ -102,6 +111,8 @@ export interface LauncherOptions {
   runDir?: string;
   /** Wait before pressing the dev-channels key again on an unchanged screen (default 3s). */
   keyRetryMs?: number;
+  /** Claude Code's config dir (default $CLAUDE_CONFIG_DIR or ~/.claude); tests point it elsewhere. */
+  claudeConfigDir?: string;
 }
 
 function newId(): string {
@@ -261,6 +272,8 @@ export class Launcher {
       restart_at: null,
       claude_session: null,
       shim_parent: null,
+      fork_pending: false,
+      from_fork: false,
     };
     this.entries.push(e);
     e.busy = true;
@@ -462,6 +475,18 @@ export class Launcher {
     return argv;
   }
 
+  /**
+   * Does Claude Code have a saved transcript for this launch's conversation? Claude Code 2.1.310 stores it
+   * as <CLAUDE_CONFIG_DIR or ~/.claude>/projects/<cwd, every non-alphanumeric character as "-">/<id>.jsonl
+   * (observed on the installed CLI). Only used to decide whether a pending fork can be resumed; if this
+   * guess is ever wrong the launcher forks again, which still reaches the folder's conversation.
+   */
+  private transcriptExists(e: Entry): boolean {
+    if (!e.claude_session) return false;
+    const root = this.o.claudeConfigDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+    return existsSync(join(root, "projects", e.path.replace(/[^A-Za-z0-9]/g, "-"), `${e.claude_session}.jsonl`));
+  }
+
   private statusFile(e: Entry): string {
     return join(this.o.runDir ?? join(configDir(), "run"), `${e.launch_id}.exit`);
   }
@@ -490,8 +515,14 @@ export class Launcher {
     //  - resume without one ("resume last conversation", or state from an older version): the folder's
     //    last conversation, forked under a new id we choose (2.1.310 requires --fork-session whenever
     //    --session-id is combined with --continue/--resume).
+    if (e.continued && e.claude_session && e.fork_pending) {
+      if (this.transcriptExists(e)) e.fork_pending = false; // the fork was saved: resume it exactly
+      else e.claude_session = null; // never saved: fork the folder's conversation again
+    }
     e.forking = e.continued && !e.claude_session;
     if (!e.continued || e.forking) e.claude_session = randomUUID();
+    if (!e.continued) e.fork_pending = e.from_fork = false;
+    if (e.forking) e.fork_pending = e.from_fork = true;
     e.shim_parent = null;
     e.lastRefusal = undefined;
     let argv = this.claudeArgv(e);
@@ -700,6 +731,10 @@ export class Launcher {
     let detail: string | null;
     if (NO_CONVERSATION.test(screen)) {
       e.noConversation = true;
+      // `--resume` of a forked id that Claude Code doesn't have: forget it, so the next resume forks the
+      // folder's conversation again rather than failing the same way. (A fresh start's id is kept: there
+      // was nothing to resume, and forking would pick up some other session's conversation.)
+      if (!e.forking && e.from_fork) e.claude_session = null;
       detail = !e.forking
         ? "No conversation to resume for this session yet (nothing was said in it); restart without resume"
         : "No earlier conversation in this folder to continue; restart without resume";
@@ -834,6 +869,8 @@ export class Launcher {
         restart_at: null,
         claude_session: null,
         shim_parent: null,
+        fork_pending: false,
+        from_fork: false,
         fresh: false,
         panePid: p.pid,
       };

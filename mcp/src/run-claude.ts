@@ -4,7 +4,7 @@
 // moment leaves #{pane_dead_status} empty for good). argv only, no shell.
 import { spawn } from "node:child_process";
 import { constants } from "node:os";
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 
 export interface ExitRecord {
   token: string | null;
@@ -28,7 +28,10 @@ export function runClaude(args: string[]): void {
   const token = process.env.MCP_REMOTE_LAUNCH_TOKEN ?? null;
   const record = (r: Omit<ExitRecord, "token">) => {
     try {
-      writeFileSync(file, JSON.stringify({ token, ...r }), { mode: 0o600 });
+      // Atomic (temp + rename): the daemon may read it the moment it appears.
+      const tmp = `${file}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ token, ...r }), { mode: 0o600 });
+      renameSync(tmp, file);
     } catch {
       /* the daemon falls back to tmux's status */
     }

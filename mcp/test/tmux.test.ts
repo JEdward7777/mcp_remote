@@ -81,7 +81,14 @@ describe.skipIf(!tmuxBin)("real tmux", () => {
       name,
       cwd: work,
       env: { MCP_REMOTE_SESSION_ID: name },
-      argv: ["sh", "-c", 'printf "%s|%s|%s\\n" "$1" "$MCP_REMOTE_SESSION_ID" "$(pwd)"; exit 3', "argv0", "$(id);`whoami`"],
+      argv: [
+        "sh",
+        "-c",
+        'printf "%s|%s|%s\\n" "$1" "$MCP_REMOTE_SESSION_ID" "$(pwd)" | tee "$2"; exit 3',
+        "argv0",
+        "$(id);`whoami`",
+        join(work, "literal.txt"),
+      ],
     });
     let p;
     for (let i = 0; i < 60; i++) {
@@ -93,9 +100,12 @@ describe.skipIf(!tmuxBin)("real tmux", () => {
     // tmux 3.4 occasionally never records the status (the reason run-claude exists; its own test is strict).
     expect([3, null]).toContain(p!.status);
     expect(p!.pid).toBeGreaterThan(1);
-    expect(await t.capture(name)).toMatch(/Pane is dead/); // the screen only shows the notice
-    const screen = await t.capture(name, 60);
-    expect(screen).toContain(`$(id);\`whoami\`|${name}|${work}`);
+    // In the same tmux race the "Pane is dead" notice is missing too; check it only when tmux has a status.
+    if (p!.status !== null) expect(await t.capture(name)).toMatch(/Pane is dead/); // the screen only shows the notice
+    const expected = `$(id);\`whoami\`|${name}|${work}`;
+    expect(readFileSync(join(work, "literal.txt"), "utf8")).toContain(expected);
+    // The pane output itself can also be lost in tmux's race; check it when tmux recorded the exit.
+    if (p!.status !== null) expect(await t.capture(name, 60)).toContain(expected);
     expect((await t.showEnv(name)).MCP_REMOTE_SESSION_ID).toBe(name);
     await t.kill(name);
     await t.kill(name); // idempotent

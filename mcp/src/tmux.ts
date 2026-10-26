@@ -180,7 +180,18 @@ export class Tmux implements TmuxDriver {
 
   async spawn(spec: SpawnSpec): Promise<void> {
     // The folder becomes the session's start directory without ever being parsed by tmux.
-    await this.run(spawnArgs(this.o, spec), spec.cwd);
+    // When the last session on our server has just been killed, the server is exiting, and a new-session
+    // in that moment fails with "server exited unexpectedly" (seen under load); retry that case.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.run(spawnArgs(this.o, spec), spec.cwd);
+        return;
+      } catch (e) {
+        const msg = String((e as { stderr?: string }).stderr ?? "");
+        if (attempt >= 3 || !/server exited unexpectedly|lost server/i.test(msg)) throw e;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
   }
 
   async list(): Promise<PaneInfo[]> {

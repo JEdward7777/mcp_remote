@@ -256,12 +256,17 @@ conversation in the same folder is never picked; launches recorded by an older v
 conversation" once and are exact from then on), and **Remove** for ended ones. Limit: if you run `/clear` in a
 launched session at the desk, Claude Code continues under a new conversation id the daemon doesn't know, so a
 later **Restart + resume** reopens the conversation from before `/clear` (use **Restart** for a fresh one).
-`--continue`, `-c`, `--resume`, `-r`, `--session-id` and `--fork-session` are refused in `extra-args` for that reason. Launched sessions
+`--continue`, `--resume`, `--session-id`, `--fork-session`, `--from-pr` and short flags containing `c` or `r`
+(`-c`, `-r`, `-rabc`, `-dc`) are refused in `extra-args`, since the daemon chooses the conversation. Launched sessions
 appear in the session list like any other (badge "launched") and keep their thread across restarts.
 
 At the desk, `mcp-remote attach mr-<id>` opens a launched session's terminal (detach with `Ctrl-b d`); they run on
 a dedicated tmux server: `tmux -L mcp-remote ls`. Each runs
-`claude --dangerously-load-development-channels server:mcp-remote [--permission-mode X] [--session-id <uuid> | --resume <uuid> | --continue] [extra args]`
+`claude --dangerously-load-development-channels server:mcp-remote [--permission-mode X] [extra args]` plus one of
+`--session-id <new uuid>` (fresh), `--resume <uuid>` (resume this launch's saved conversation) or
+`--continue --fork-session --session-id <new uuid>` ("resume last conversation", or resuming a fork Claude Code
+hasn't saved yet: it saves a conversation only once something was said, so the daemon checks for its transcript
+under `~/.claude/projects/` first)
 in the project folder (under a small `mcp-remote run-claude` wrapper that records its exit code, which tmux
 sometimes loses), with `MCP_REMOTE_SESSION_ID` and a per-start `MCP_REMOTE_LAUNCH_TOKEN` in its environment
 so the shim it starts is linked to the launch. The daemon only reads a session's screen (and only answers the
@@ -280,8 +285,11 @@ exit) with growing delays, resuming the conversation, and gives up after 5 crash
   mr-<id>` to answer it; the session continues on its own once the shim registers. "did not start the mcp-remote
   shim within 90s" usually means the shim isn't registered (`mcp-remote setup-claude`), Claude Code isn't logged
   in, or a prompt this version doesn't recognize is showing (attach to see it).
-- "exited (1) No conversation to resume / No earlier conversation in this folder": nothing was said in that
-  conversation yet (Claude Code only saves it after the first message); use **Restart** instead of **Restart + resume**.
+- "exited (1) No conversation to resume for this session yet": the launch was started fresh and nothing was said
+  in it, so there is nothing to resume; **Restart** gives the same empty start. "No earlier conversation in this
+  folder": the folder has no conversation at all yet. A "resume last conversation" launch that was stopped before
+  anything was said is handled for you: **Restart + resume** forks the folder's conversation again (if Claude
+  Code had no record of it after all, the next **Restart + resume** does the same).
 - A launched session that never comes up although Claude Code runs: the detail line shows if the daemon refused
   its shim (daemon log: `refused shim for mr-...`). `claude` behind wrappers (Volta, npm's wrapper, scripts) is fine.
   Register the shim with `mcp-remote setup-claude` (absolute node + CLI paths); an `npx`-style registration or a

@@ -435,7 +435,7 @@ describe("launcher", () => {
   });
 
   it("forks the folder's last conversation under a new id for launches recorded before conversation ids existed", async () => {
-    const l1 = make();
+    const l1 = make({ claudeConfigDir: join(dir, "claude-config") });
     await l1.init();
     const a = (await l1.launch(alphaId(), { continue: false })) as { launch_id: string };
     await l1.stop(a.launch_id);
@@ -444,15 +444,18 @@ describe("launcher", () => {
     delete st.launches[0].claude_session; // as written by the previous version
     delete st.launches[0].shim_parent;
     writeFileSync(l1.statePath, JSON.stringify(st));
-    const l2 = make();
+    const l2 = make({ claudeConfigDir: join(dir, "claude-config") });
     await l2.init();
     await l2.restart(a.launch_id, true);
     const last = tmux.spawns.at(-1)!.argv;
     expect(last).toContain("--continue");
     expect(last).toContain("--fork-session");
     expect(last).not.toContain("--resume");
-    const forked = last[last.indexOf("--session-id") + 1];
-    // ...and from then on it resumes exactly that id.
+    const forked = last[last.indexOf("--session-id") + 1]!;
+    // ...and once Claude Code has saved it, it resumes exactly that id.
+    const slug = proj.replace(/[^A-Za-z0-9]/g, "-");
+    mkdirSync(join(dir, "claude-config", "projects", slug), { recursive: true });
+    writeFileSync(join(dir, "claude-config", "projects", slug, `${forked}.jsonl`), "{}\n");
     await l2.restart(a.launch_id, true);
     const again = tmux.spawns.at(-1)!.argv;
     expect(again[again.indexOf("--resume") + 1]).toBe(forked);
@@ -522,5 +525,54 @@ describe("launcher", () => {
     tmux.die(a.launch_id, null, "Killed");
     await waitFor(() => rec(l, a.launch_id).state === "exited", "exited", 6000);
     expect(rec(l, a.launch_id).exit_code).toBe(137);
+  });
+
+  it("stop + Restart+resume of a fork that was never saved forks again instead of --resume-ing nothing (round-5 finding)", async () => {
+    const claudeDir = join(dir, "claude-config");
+    const l = make({ claudeConfigDir: claudeDir });
+    await l.init();
+    const argvOf = (i: number) => tmux.spawns[i]!.argv;
+    const idAfter = (a: string[], flag: string) => a[a.indexOf(flag) + 1]!;
+    const a = (await l.launch(alphaId(), { continue: true })) as { launch_id: string };
+    expect(argvOf(0)).toContain("--fork-session");
+    const fork1 = idAfter(argvOf(0), "--session-id");
+    await l.stop(a.launch_id); // nobody said anything: Claude Code saved no transcript for fork1
+    await l.restart(a.launch_id, true);
+    expect(argvOf(1)).toContain("--fork-session");
+    expect(argvOf(1)).not.toContain("--resume");
+    const fork2 = idAfter(argvOf(1), "--session-id");
+    expect(fork2).not.toBe(fork1);
+    // Now something was said: Claude Code wrote the transcript (path format of 2.1.310).
+    const slug = proj.replace(/[^A-Za-z0-9]/g, "-");
+    mkdirSync(join(claudeDir, "projects", slug), { recursive: true });
+    writeFileSync(join(claudeDir, "projects", slug, `${fork2}.jsonl`), "{}\n");
+    await l.stop(a.launch_id);
+    await l.restart(a.launch_id, true);
+    expect(idAfter(argvOf(2), "--resume")).toBe(fork2);
+    expect(argvOf(2)).not.toContain("--fork-session");
+    // Confirmed: further resumes stay exact even if the file check would now fail.
+    rmSync(join(claudeDir, "projects"), { recursive: true });
+    await l.stop(a.launch_id);
+    await l.restart(a.launch_id, true);
+    expect(idAfter(argvOf(3), "--resume")).toBe(fork2);
+  });
+
+  it("forgets a pending fork's id when --resume of it finds no conversation", async () => {
+    const claudeDir = join(dir, "claude-config");
+    const l = make({ claudeConfigDir: claudeDir });
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: true })) as { launch_id: string };
+    const fork1 = tmux.spawns[0]!.argv[tmux.spawns[0]!.argv.indexOf("--session-id") + 1]!;
+    // The transcript check says it exists (e.g. a stale file), but Claude Code disagrees.
+    const slug = proj.replace(/[^A-Za-z0-9]/g, "-");
+    mkdirSync(join(claudeDir, "projects", slug), { recursive: true });
+    writeFileSync(join(claudeDir, "projects", slug, `${fork1}.jsonl`), "");
+    await l.stop(a.launch_id);
+    await l.restart(a.launch_id, true);
+    expect(tmux.spawns[1]!.argv).toContain("--resume");
+    tmux.die(a.launch_id, 1, `No conversation found with session ID: ${fork1}`);
+    await waitFor(() => rec(l, a.launch_id).state === "exited", "exited");
+    await l.restart(a.launch_id, true);
+    expect(tmux.spawns[2]!.argv).toContain("--fork-session");
   });
 });

@@ -274,7 +274,13 @@ async function main() {
     { mode: 0o600 },
   );
   const fakeLog = join(tmp, "fake-claude.log");
-  const daemonEnv = { ...process.env, MCP_REMOTE_CONFIG_DIR: machineDir, FAKE_CLAUDE_LOG: fakeLog, FAKE_CLAUDE_SHIM_CLI: CLI };
+  const daemonEnv = {
+    ...process.env,
+    MCP_REMOTE_CONFIG_DIR: machineDir,
+    FAKE_CLAUDE_LOG: fakeLog,
+    FAKE_CLAUDE_SHIM_CLI: CLI,
+    CLAUDE_CONFIG_DIR: join(tmp, "claude-config"), // where the fake (and the daemon's check) keep transcripts
+  };
   const daemon = spawnLogged("daemon", process.execPath, [CLI, "daemon"], { env: daemonEnv });
   await waitFor(() => /connected to/.test(daemon.output), { timeout: 15_000, what: "daemon to connect" });
   const sockStat = statSync(join(machineDir, "daemon.sock"));
@@ -576,6 +582,36 @@ async function main() {
       "stop reaches claude behind the wrapper (SIGHUP via the process group) and ends its tmux session",
       ws.ok && !tmuxHas(wl.launch_id) && fakeEvents().some((e) => e.event === "signal" && e.sig === "SIGHUP" && e.pid === wPid),
     );
+
+    logStep("remote launch: 'resume last conversation' fork, stopped before anything was said, then Restart + resume");
+    const fk = await op({ t: "launch", project_id: gamma.id, continue: true }, "fork launch");
+    const fl = await waitFor(() => fk.ok && mstate().launch.launches.find((l) => l.continued && l.state !== "exited"), { what: "fork launch record" });
+    const fid = fl.launch_id;
+    await waitFor(() => launchOf(fid)?.state === "running", { timeout: 30_000, what: "fork running" });
+    const argvs = () => fakeEvents().filter((e) => e.event === "start" && e.session === fid).map((e) => e.argv);
+    const idOf = (a, flag) => a[a.indexOf(flag) + 1];
+    const f1 = argvs()[0];
+    check("'resume last conversation' forks the folder's conversation under a new id", f1.includes("--continue") && f1.includes("--fork-session") && /^[0-9a-f-]{36}$/.test(idOf(f1, "--session-id")), JSON.stringify(f1));
+    await op({ t: "launch_stop", launch_id: fid }, "stop fork");
+    await waitFor(() => launchOf(fid)?.state === "exited", { timeout: 15_000, what: "fork stopped" });
+    const r1 = await op({ t: "launch_restart", launch_id: fid, continue: true }, "resume unsaved fork");
+    await waitFor(() => launchOf(fid)?.state === "running", { timeout: 30_000, what: "re-forked running" });
+    const f2 = argvs()[1];
+    check(
+      "Restart + resume of an unsaved fork forks again (no --resume of a conversation that doesn't exist)",
+      r1.ok && f2.includes("--fork-session") && !f2.includes("--resume") && idOf(f2, "--session-id") !== idOf(f1, "--session-id"),
+      JSON.stringify(f2),
+    );
+    pa.send({ t: "send", session_id: fid, text: "now it exists" });
+    await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.text === "echo: now it exists"), { what: "fork echo", timeout: 15_000 });
+    await op({ t: "launch_stop", launch_id: fid }, "stop fork 2");
+    await waitFor(() => launchOf(fid)?.state === "exited", { timeout: 15_000, what: "fork stopped 2" });
+    await op({ t: "launch_restart", launch_id: fid, continue: true }, "resume saved fork");
+    await waitFor(() => launchOf(fid)?.state === "running", { timeout: 30_000, what: "resumed fork running" });
+    const f3 = argvs()[2];
+    check("once the fork was saved, Restart + resume reopens exactly it (--resume <fork id>)", idOf(f3, "--resume") === idOf(f2, "--session-id"), JSON.stringify(f3));
+    await op({ t: "launch_stop", launch_id: fid }, "stop fork 3");
+    await waitFor(() => launchOf(fid)?.state === "exited", { timeout: 15_000, what: "fork stopped 3" });
   }
 
   // --- revoke -----------------------------------------------------------------------------
