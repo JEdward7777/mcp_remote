@@ -128,6 +128,15 @@ describe("service worker: Web Push -> notification (D19)", () => {
     ]);
   });
 
+  it("owner alert (Phase 4b): title/body as sent, one per kind, opens Admin", async () => {
+    await sw.push({ k: "a", g: "usage-50", t: "Usage passed 50% of the free plan", b: "Durable Object requests: 51% of the daily free limit." });
+    await sw.push({ k: "a", g: "<b>x</b>", t: "x" });
+    const [a, b] = sw.shown;
+    expect(a!.title).toBe("Usage passed 50% of the free plan");
+    expect(a!.opts).toMatchObject({ body: "Durable Object requests: 51% of the daily free limit.", tag: "admin:usage-50", data: { url: "/#/admin" } });
+    expect(b!.opts.tag).toBe("admin:bxb");
+  });
+
   it("a click focuses the open app (and tells it where to go) or opens it; never another origin", async () => {
     const click = (url: string, action = "") => sw.fire("notificationclick", { action, notification: { close: () => {}, data: { url } } });
     await click("/#/s/sess-1");
