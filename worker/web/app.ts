@@ -296,6 +296,8 @@ function onFrame(f: HubToPhone): void {
       render();
       return;
     case "location_request":
+      // One prompt per session: a newer request from the same session replaces an unanswered older one.
+      for (const [rid, r] of state.locRequests) if (r.session_id === f.session_id && !state.sharing.has(rid)) state.locRequests.delete(rid);
       state.locRequests.set(f.rid, { rid: f.rid, machine_id: f.machine_id, session_id: f.session_id, project: f.project, reason: f.reason });
       if (document.visibilityState === "visible") navigator.vibrate?.([80, 60, 80]);
       render();

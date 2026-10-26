@@ -3,7 +3,7 @@
 import { SELF, evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { tenantIdForDev } from "../src/auth";
-import { MAX_PUSH_DEVICES } from "../src/budget";
+import { MAX_PUSH_DEVICES, limitsFor } from "../src/budget";
 import { describePushOutcomes } from "../src/hub";
 import { pushExtraOrigins } from "../src/env";
 import { E, ORIGIN, cookieFor, daemon, last, newMachine, phone, setLimits, sleep, waitFor, withHub } from "./helpers";
@@ -110,6 +110,16 @@ describe("push subscriptions (/api/push/subscribe)", () => {
     const f = await waitFor(() => last(p, "settings"), "settings frame");
     expect(f.settings.push_devices.length).toBe(1);
     void s;
+  });
+
+  it("push cap and location rate are per plan and tunable for the free plan", () => {
+    expect(limitsFor("free", {}).daily_pushes).toBe(200);
+    expect(limitsFor("owner", {}).daily_pushes).toBe(2000);
+    expect(limitsFor("free", { DAILY_PUSH_CAP: "7", LIMIT_LOCATION: "2,4/h" })).toMatchObject({
+      daily_pushes: 7,
+      location: { burst: 2, per: 4, perMs: 3_600_000 },
+    });
+    expect(limitsFor("free", { DAILY_PUSH_CAP: "lots" }).daily_pushes).toBe(200);
   });
 
   it("extra (local test) push origins only count with DEV_AUTH=1", () => {
