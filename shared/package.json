@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./backoff": "./src/backoff.ts"
+    "./backoff": "./src/backoff.ts",
+    "./link": "./src/link.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",

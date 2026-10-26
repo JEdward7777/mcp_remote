@@ -38,6 +38,8 @@ interface PairingState {
   hostname: string;
   expires_at: number;
   status: "pending" | "approving" | "approved";
+  /** Approve attempts on this code (Phase 3: locks after approve_attempts_per_code). */
+  attempts?: number;
   result?: Extract<PairResult, { t: "approved" }>;
   /** Tenant that approved; used to drop the machine again if the token is never claimed. */
   tid?: string;
@@ -97,11 +99,28 @@ export class Pairing extends DurableObject<Env> {
     return { ok: true, expires_at };
   }
 
-  /** Atomically claim a pending pairing for approval. */
-  async beginApprove(): Promise<{ ok: true; hostname: string } | { ok: false; error: string }> {
+  /**
+   * Atomically claim a pending pairing for approval. A code that has seen `maxAttempts` approve
+   * attempts is locked (the computer must start a new pairing); a wrong code writes nothing.
+   */
+  async beginApprove(
+    maxAttempts = Number.POSITIVE_INFINITY,
+  ): Promise<{ ok: true; hostname: string } | { ok: false; error: string; status?: number }> {
     const s = await this.load();
     if (!s) return { ok: false, error: "unknown or expired code" };
-    if (s.status !== "pending") return { ok: false, error: "code already used" };
+    const attempts = (s.attempts ?? 0) + 1;
+    if (attempts > maxAttempts) {
+      return {
+        ok: false,
+        status: 429,
+        error: "too many approval attempts for this code; run `mcp-remote pair` on the computer again for a new code",
+      };
+    }
+    s.attempts = attempts;
+    if (s.status !== "pending") {
+      await this.ctx.storage.put("state", s);
+      return { ok: false, error: "code already used" };
+    }
     s.status = "approving";
     await this.ctx.storage.put("state", s);
     return { ok: true, hostname: s.hostname };

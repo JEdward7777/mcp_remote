@@ -19,17 +19,21 @@
   "durable_objects": {
     "bindings": [
       { "name": "HUB", "class_name": "Hub" },
-      { "name": "PAIRING", "class_name": "Pairing" }
+      { "name": "PAIRING", "class_name": "Pairing" },
+      { "name": "THROTTLE", "class_name": "Throttle" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["Hub", "Pairing"] }
+    { "tag": "v1", "new_sqlite_classes": ["Hub", "Pairing"] },
+    { "tag": "v2", "new_sqlite_classes": ["Throttle"] }
   ],
   // Non-secret settings. GOOGLE_CLIENT_ID and ALLOWED_EMAILS are set with `wrangler secret put`
   // (see harness/SETUP.md) so personal data stays out of the repo; don't also list them here.
   "vars": {
     // "true" lets any verified Google account sign up; otherwise only ALLOWED_EMAILS can.
     "OPEN_SIGNUP": "false"
+    // Per-tenant and abuse limits (Phase 3) have safe defaults in src/budget.ts. To tune one, add it
+    // here, e.g. "LIMIT_PHONE_SEND": "10,20/min" or "DAILY_MESSAGE_CAP": "500" (see harness/SETUP.md).
   },
   "observability": { "enabled": true }
 }

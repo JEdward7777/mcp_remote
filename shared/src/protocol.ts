@@ -159,6 +159,25 @@ export const MachineRecord = z.object({
 });
 export type MachineRecord = z.infer<typeof MachineRecord>;
 
+/**
+ * Per-tenant usage for the current UTC day (Phase 3, D10). Counts only this tenant's own Hub
+ * (D9: never cross-tenant). `message_cap` is the plan's daily message limit (in + out).
+ */
+export const UsageInfo = z.object({
+  plan: z.string().max(32),
+  /** UTC day, YYYY-MM-DD. */
+  day: z.string().max(10),
+  messages: z.number().int().nonnegative(),
+  message_cap: z.number().int().nonnegative(),
+  launches: z.number().int().nonnegative(),
+  /** Requests the Hub handled (WebSocket frames, connects, API calls). */
+  requests: z.number().int().nonnegative(),
+});
+export type UsageInfo = z.infer<typeof UsageInfo>;
+
+/** Seconds until a rate-limited request may succeed (set on rate-limit errors). */
+const RetryAfterS = z.number().int().nonnegative().optional();
+
 // ---------------------------------------------------------------------------
 // phone <-> Hub
 
@@ -198,6 +217,7 @@ export const HubToPhone = z.discriminatedUnion("t", [
     t: z.literal("state"),
     machines: z.array(MachineRecord),
     sessions: z.array(SessionRecord),
+    usage: UsageInfo.optional(),
   }),
   z.object({ t: z.literal("message"), message: MessageRecord, client_id: ReqId.optional() }),
   z.object({
@@ -207,11 +227,11 @@ export const HubToPhone = z.discriminatedUnion("t", [
     has_more: z.boolean(),
   }),
   z.object({ t: z.literal("delivered"), session_id: SessionId, ids: z.array(z.number().int()) }),
-  z.object({ t: z.literal("error"), error: z.string(), client_id: ReqId.optional() }),
+  z.object({ t: z.literal("error"), error: z.string(), client_id: ReqId.optional(), retry_after_s: RetryAfterS }),
   /** Launch list changed on one machine (cheaper than a full state frame). */
   z.object({ t: z.literal("launches"), machine_id: MachineId, launches: z.array(LaunchRecord) }),
   /** Answer to a launch / launch_stop / launch_restart / launch_dismiss request. */
-  z.object({ t: z.literal("launch_result"), client_id: ReqId, ok: z.boolean(), error: z.string().optional() }),
+  z.object({ t: z.literal("launch_result"), client_id: ReqId, ok: z.boolean(), error: z.string().optional(), retry_after_s: RetryAfterS }),
 ]);
 export type HubToPhone = z.infer<typeof HubToPhone>;
 
@@ -267,7 +287,13 @@ export const HubToDaemon = z.discriminatedUnion("t", [
   z.object({ t: z.literal("launch_restart"), req_id: ReqId, launch_id: LaunchId, continue: z.boolean() }),
   z.object({ t: z.literal("launch_dismiss"), req_id: ReqId, launch_id: LaunchId }),
   /** session_id is set when the error concerns one session (e.g. a refused session_up). */
-  z.object({ t: z.literal("error"), error: z.string(), req_id: ReqId.optional(), session_id: SessionId.optional() }),
+  z.object({
+    t: z.literal("error"),
+    error: z.string(),
+    req_id: ReqId.optional(),
+    session_id: SessionId.optional(),
+    retry_after_s: RetryAfterS,
+  }),
 ]);
 export type HubToDaemon = z.infer<typeof HubToDaemon>;
 

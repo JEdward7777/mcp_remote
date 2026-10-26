@@ -1,5 +1,5 @@
 // Worker entry: auth, pairing and routing to the per-tenant Hub (D7, D9, D4).
-import { PairApproveRequest, PairStartRequest, type PairStartResponse } from "@mcp-remote/shared";
+import { PairApproveRequest, PairStartRequest, type PairStartResponse, humanWait } from "@mcp-remote/shared";
 import {
   DEV_USER_RE,
   OAUTH_COOKIE,
@@ -31,10 +31,14 @@ import {
   newPending,
   verifyIdToken,
 } from "./oauth";
+import { publicLimits } from "./budget";
+import type { Limited } from "./hub";
 import { generateCode, normalizeCode } from "./pairing";
+import { checkPairStart, clientKey, localHit } from "./throttle";
 
 export { Hub } from "./hub";
 export { Pairing } from "./pairing";
+export { Throttle } from "./throttle";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const MAX_JSON_BODY = 4096;
@@ -47,6 +51,25 @@ function err(status: number, error: string): Response {
   return json({ error }, status);
 }
 
+/** 429 with Retry-After and a sentence a person can act on. */
+function tooMany(retryAfterMs: number, what: string): Response {
+  const secs = Math.max(1, Math.ceil(retryAfterMs / 1000));
+  return json({ error: `${what}; try again in ${humanWait(retryAfterMs)}`, retry_after_s: secs }, 429, { "retry-after": String(secs) });
+}
+
+function unwrap<T>(r: Limited<T>): { value: T } | Response {
+  return r.ok ? { value: r.value } : tooMany(r.retryAfterMs, "too many requests for this account");
+}
+
+class BodyError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
 function redirect(location: string, cookies: string[] = []): Response {
   const h = new Headers({ location, "cache-control": "no-store" });
   for (const c of cookies) h.append("set-cookie", c);
@@ -57,12 +80,42 @@ function secretOk(env: Env): boolean {
   return typeof env.SESSION_SECRET === "string" && env.SESSION_SECRET.length >= 32;
 }
 
+/**
+ * Small JSON bodies only. Oversize bodies are refused from Content-Length before reading, and a
+ * chunked body is read only up to the limit, so nothing large is buffered and no DO is woken.
+ */
 async function readJson(request: Request): Promise<unknown> {
   const ct = request.headers.get("content-type") ?? "";
-  if (!ct.toLowerCase().startsWith("application/json")) throw new Error("content-type must be application/json");
-  const text = await request.text();
-  if (text.length > MAX_JSON_BODY) throw new Error("body too large");
-  return text ? JSON.parse(text) : {};
+  if (!ct.toLowerCase().startsWith("application/json")) throw new BodyError("content-type must be application/json", 415);
+  const len = request.headers.get("content-length");
+  if (len !== null && !(Number(len) <= MAX_JSON_BODY)) throw new BodyError("body too large", 413);
+  let text = "";
+  if (request.body) {
+    const reader = request.body.getReader();
+    const dec = new TextDecoder();
+    let n = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      n += value.byteLength;
+      if (n > MAX_JSON_BODY) {
+        await reader.cancel().catch(() => {});
+        throw new BodyError("body too large", 413);
+      }
+      text += dec.decode(value, { stream: true });
+    }
+    text += dec.decode();
+  }
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    throw new BodyError("invalid JSON", 400);
+  }
+}
+
+function bodyErr(e: unknown, fallback: string): Response {
+  if (e instanceof BodyError) return err(e.status, e.message);
+  return err(400, e instanceof Error && e.message ? fallback : "bad request");
 }
 
 /** Cookie-authenticated, state-changing requests must come from our own origin (CSRF / CSWSH). */
@@ -97,6 +150,18 @@ async function issueSession(env: Env, c: { tid: string; email: string; name?: st
 // ---------------------------------------------------------------------------
 
 async function handleAuth(request: Request, env: Env, url: URL): Promise<Response> {
+  if (url.pathname === "/auth/login" || url.pathname === "/auth/callback") {
+    // These never touch a Durable Object; a free, isolate-local limit is enough to blunt floods.
+    const r = localHit(`auth:${clientKey(request)}`, publicLimits(env as unknown as Record<string, unknown>).auth_ip);
+    if (!r.ok) {
+      const secs = Math.ceil(r.retryAfterMs / 1000);
+      const h = new Headers({ "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "retry-after": String(secs) });
+      return new Response(
+        `<!doctype html><meta name="viewport" content="width=device-width"><title>Sign-in</title><p>Too many sign-in attempts from your network. Try again in ${humanWait(r.retryAfterMs)}.</p>`,
+        { status: 429, headers: h },
+      );
+    }
+  }
   switch (url.pathname) {
     case "/auth/login": {
       if (!env.GOOGLE_CLIENT_ID) return err(500, "GOOGLE_CLIENT_ID is not configured");
@@ -188,8 +253,11 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       const body = PairStartRequest.parse(await readJson(request));
       if (body.hostname) hostname = body.hostname;
     } catch (e) {
-      return err(400, e instanceof Error ? e.message : "bad request");
+      return bodyErr(e, "expected {hostname?}");
     }
+    // Each start creates a Pairing DO (put + alarm + wipe): throttle per IP and overall first.
+    const gate = await checkPairStart(env, request, publicLimits(env as unknown as Record<string, unknown>));
+    if (!gate.ok) return tooMany(gate.retryAfterMs, "too many pairing attempts from your network");
     for (let attempt = 0; attempt < 5; attempt++) {
       const code = generateCode();
       const pairingId = randomToken(16);
@@ -205,8 +273,17 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   }
 
   if (path === "/api/pair/wait") {
+    // Everything that can be checked without the Pairing DO is checked first.
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return err(426, "expected websocket");
     const code = normalizeCode(url.searchParams.get("code") ?? "");
     if (!code) return err(400, "bad code");
+    const pid = url.searchParams.get("pairing_id") ?? "";
+    const authz = request.headers.get("authorization") ?? "";
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(pid) || !/^Bearer [A-Za-z0-9_-]{16,128}$/.test(authz)) {
+      return err(400, "bad pairing request");
+    }
+    const w = localHit(`pw:${clientKey(request)}`, publicLimits(env as unknown as Record<string, unknown>).pair_wait_ip);
+    if (!w.ok) return tooMany(w.retryAfterMs, "too many pairing requests from your network");
     const stub = env.PAIRING.get(env.PAIRING.idFromName(`pair:${code}`));
     const fwd = new Request(`https://pairing/wait?pairing_id=${encodeURIComponent(url.searchParams.get("pairing_id") ?? "")}`, {
       headers: {
@@ -253,18 +330,25 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   }
 
   if (path === "/api/machines" && request.method === "GET") {
-    return json({ machines: await hubFor(env, session.tid).listMachines() });
+    const r = unwrap(await hubFor(env, session.tid).listMachines());
+    return r instanceof Response ? r : json({ machines: r.value });
+  }
+
+  if (path === "/api/usage" && request.method === "GET") {
+    return json(await hubFor(env, session.tid).usage());
   }
 
   const revoke = /^\/api\/machines\/([A-Za-z0-9_-]{1,64})$/.exec(path);
   if (revoke && request.method === "DELETE") {
     if (!sameOrigin(request, url)) return err(403, "bad origin");
-    const ok = await hubFor(env, session.tid).revokeMachine(revoke[1]!);
-    return ok ? json({ ok: true }) : err(404, "no such machine");
+    const r = unwrap(await hubFor(env, session.tid).revokeMachine(revoke[1]!));
+    if (r instanceof Response) return r;
+    return r.value ? json({ ok: true }) : err(404, "no such machine");
   }
 
   if (path === "/api/state" && request.method === "GET") {
-    return json(await hubFor(env, session.tid).snapshot());
+    const r = unwrap(await hubFor(env, session.tid).snapshot());
+    return r instanceof Response ? r : json(r.value);
   }
 
   if (path === "/api/pair/approve" && request.method === "POST") {
@@ -272,14 +356,17 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     let body: { code: string; machine_name?: string | undefined };
     try {
       body = PairApproveRequest.parse(await readJson(request));
-    } catch {
-      return err(400, "expected {code, machine_name?}");
+    } catch (e) {
+      return e instanceof BodyError && e.status !== 400 ? bodyErr(e, "") : err(400, "expected {code, machine_name?}");
     }
     const code = normalizeCode(body.code);
     if (!code) return err(400, "that does not look like a pairing code");
+    // Per-tenant guess limit before any Pairing DO is woken (a wrong code wakes a fresh one).
+    const allowed = await hubFor(env, session.tid).allowPairApprove();
+    if (!allowed.ok) return tooMany(allowed.retryAfterMs, "too many pairing approvals on this account");
     const pairing = env.PAIRING.get(env.PAIRING.idFromName(`pair:${code}`));
-    const claim = await pairing.beginApprove();
-    if (!claim.ok) return err(404, claim.error);
+    const claim = await pairing.beginApprove(publicLimits(env as unknown as Record<string, unknown>).approve_attempts_per_code);
+    if (!claim.ok) return err(claim.status ?? 404, claim.error);
     const machineId = randomToken(12);
     let added = false;
     try {
