@@ -69,3 +69,11 @@
   Origin checks on cookie-authenticated writes + phone WS; daemon exit 3 = revoked/not allowed, 4 = token in use
   elsewhere; session id hand-over only from a revoked computer (resync frame on revoke/forget/evict); 50 stored /
   64 live sessions per machine; history capped at 1000 msgs/session (amortized trim, queued inbound never trimmed).
+- D22 (accepted, made during Phase 2 build) Launch details: launch.json (0600) allowlist with opaque project ids;
+  dedicated tmux server `-L mcp-remote -f /dev/null`, no `-c` (cwd via execFile only); launch id = session id =
+  tmux name `mr-<12hex>`; run-claude wrapper records exit status and forwards HUP/TERM; daemon auto-answers ONLY the
+  exact dev-channels warning naming server:mcp-remote, only on fresh spawns before shim link, else needs_attention;
+  shim dormant unless launched / session id / channels flag / MCP_REMOTE_ACTIVATE; own-shim = pane pid in ancestry +
+  remembered parent; fresh = --session-id, resume = --resume, "resume last" = --continue --fork-session --session-id
+  with fork_pending until transcript exists; launched env strips only nested-session markers; secrets in daemon-loaded
+  0600 service.env (limited syntax); exit codes 3 revoked / 4 duplicate token / 5 unusable settings.
