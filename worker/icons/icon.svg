@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Source of every app icon: `npm run icons -w worker` renders the PNG/ICO files from it.
+       Only what scripts/icons.mjs understands: rect (x y width height rx), circle, and stroked
+       paths of straight lines (M L H V Z, round caps/joins); fill/stroke as #rgb/#rrggbb or none.
+       #bg is the background (made full-bleed for maskable icons), #fg the glyph. -->
+  <rect id="bg" width="64" height="64" rx="14" fill="#1f6feb"/>
+  <g id="fg" fill="none" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="20" y="10" width="24" height="44" rx="5" stroke-width="4"/>
+    <circle cx="32" cy="47" r="2.5" fill="#ffffff" stroke="none"/>
+    <path d="M26 24l6 5-6 5M34 35h6" stroke-width="3"/>
+  </g>
+</svg>

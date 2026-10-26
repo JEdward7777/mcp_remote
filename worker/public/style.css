@@ -87,3 +87,17 @@ button:disabled { opacity: .45; cursor: default; }
 .launch-row.st-needs_attention, .launch-bar.st-needs_attention { border-left: 4px solid var(--attn); }
 .launch-row.st-needs_attention .launch-detail, .launch-bar.st-needs_attention .launch-detail { color: var(--fg); }
 .launch-row.st-failed, .launch-bar.st-failed { border-left: 4px solid var(--urgent); }
+/* Phase 4: banners (app update, location requests), settings, map links */
+#banners:empty { display: none; }
+.banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
+.banner span { flex: 1 1 200px; }
+.banner button.small { margin-left: 0; }
+.banner.loc { border-left: 4px solid var(--accent); }
+.settings { padding: 0 16px 24px; }
+.settings h2 { font-size: 16px; margin: 20px 0 8px; }
+.settings .row { margin: 8px 0; }
+.settings .small { font-size: 13px; }
+label.toggle { display: flex; gap: 10px; align-items: flex-start; margin: 10px 0; }
+label.toggle input { margin-top: 4px; flex: none; width: 18px; height: 18px; }
+a.maplink { color: inherit; text-decoration: underline; overflow-wrap: anywhere; }
+.msg.out a.maplink { color: var(--accent); }

@@ -6,6 +6,8 @@ import { generateVapidKeys } from "./scripts/vapid.mjs";
 const vapid = await generateVapidKeys();
 
 export default defineConfig({
+  // test-node/ holds node-side tests (vitest.node.config.ts), never run inside workerd.
+  test: { include: ["test/**/*.test.ts"] },
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },

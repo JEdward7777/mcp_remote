@@ -6,5 +6,6 @@ dist/
 !.dev.vars.example
 worker/public/app.js
 worker/public/app.js.map
+worker/public/sw.js
 *.log
 .e2e/

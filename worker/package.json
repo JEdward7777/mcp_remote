@@ -7,8 +7,9 @@
     "build": "node build-web.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "typecheck": "node build-web.mjs && tsc -p tsconfig.json && tsc -p web/tsconfig.json",
-    "test": "node build-web.mjs && vitest run"
+    "typecheck": "node build-web.mjs && tsc -p tsconfig.json && tsc -p web/tsconfig.json && tsc -p sw/tsconfig.json && tsc -p test-node/tsconfig.json",
+    "test": "node build-web.mjs && node scripts/icons.mjs --check && vitest run && vitest run -c vitest.node.config.ts",
+    "icons": "node scripts/icons.mjs"
   },
   "dependencies": {
     "@mcp-remote/shared": "*",
