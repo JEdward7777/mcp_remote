@@ -351,7 +351,7 @@ describe("daemon remote launch", () => {
     expect(lastLaunches()[0].state).toBe("running");
   });
 
-  it("refuses a nested shim that registers before the real one (e.g. right after a daemon restart) (round-2 finding)", async () => {
+  it("refuses a nested shim that registers before the real one after the real one was seen (round-3 finding)", async () => {
     const { tmux, alpha } = await setup();
     hub({ t: "launch", req_id: "q1", project_id: alpha, continue: false });
     await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "q1" && f.ok), "launch ok");
@@ -361,17 +361,63 @@ describe("daemon remote launch", () => {
     const connect = async (ancestors: number[]) => {
       const sock = createConnection(join(dir, "d.sock"));
       await new Promise<void>((r) => sock.once("connect", () => r()));
-      const c = { frames: [] as any[] };
-      const conn = new LineConn(sock, DaemonToShim, (f) => c.frames.push(f), () => {});
-      conn.send({ t: "register", v: 1, session: { session_id: id, project: "alpha" }, launch_token: token, ancestors });
+      const c = { frames: [] as any[], conn: null as unknown as LineConn<DaemonToShim> };
+      c.conn = new LineConn(sock, DaemonToShim, (f) => c.frames.push(f), () => {});
+      c.conn.send({ t: "register", v: 1, session: { session_id: id, project: "alpha" }, launch_token: token, ancestors });
       await waitFor(() => c.frames.find((f) => f.t === "registered" || f.t === "register_refused"), "reply");
       return c;
     };
-    const nested = await connect([7001, 7000, 6000, pane]);
-    expect(nested.frames[0]).toMatchObject({ t: "register_refused", error: expect.stringMatching(/tmux pane/) });
-    expect(lastLaunches()[0].state).toBe("starting");
-    const real = await connect([6000, pane]);
+    // claude behind a non-exec wrapper: shim -> claude(6000) -> sh(5500) -> pane
+    const real = await connect([6000, 5500, pane]);
     expect(real.frames[0]).toMatchObject({ t: "registered" });
     await waitFor(() => lastLaunches()[0]?.state === "running", "running");
+    real.conn.close(); // e.g. the daemon restarted and the real shim hasn't reconnected yet
+    await sleep(100);
+    const nested = await connect([7001, 7000, 6000, 5500, pane]);
+    expect(nested.frames[0]).toMatchObject({ t: "register_refused", error: expect.stringMatching(/tmux pane/) });
+    const stranger = await connect([8000, 1]);
+    expect(stranger.frames[0]).toMatchObject({ t: "register_refused" });
+    const back = await connect([6000, 5500, pane]);
+    expect(back.frames[0]).toMatchObject({ t: "registered" });
+  });
+
+  it("links a launched shim that connects the moment the daemon starts listening (round-3 finding)", async () => {
+    // State from a previous daemon: one running launch whose tmux session is still alive.
+    const code = join(realpathSync(dir), "code");
+    mkdirSync(join(code, "alpha"), { recursive: true });
+    const cfg = LaunchConfig.parse({ roots: [code], claude_path: "/opt/fake/claude" });
+    const tmux = new FakeTmux();
+    const first = new Daemon({
+      config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
+      socket: join(dir, "d.sock"),
+      launcher: { loadConfig: () => cfg, tmux, tickMs: 10, livenessMs: 20, stopWaitMs: 200, statePath: join(dir, "launches.json") },
+    });
+    await first.start();
+    const r = await first.launcher!.launch(projectIdFor(join(code, "alpha")), { continue: false });
+    const id = (r as { launch_id: string }).launch_id;
+    const token = tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN;
+    first.stop();
+    // A slow tmux makes init() take a while; the shim knocks as soon as the socket exists.
+    const realList = tmux.list.bind(tmux);
+    tmux.list = async () => {
+      await sleep(300);
+      return realList();
+    };
+    daemon = new Daemon({
+      config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
+      socket: join(dir, "d.sock"),
+      launcher: { loadConfig: () => cfg, tmux, tickMs: 10, livenessMs: 5000, stopWaitMs: 200, statePath: join(dir, "launches.json") },
+    });
+    const starting = daemon.start();
+    const { existsSync } = await import("node:fs");
+    await waitFor(() => existsSync(join(dir, "d.sock")), "socket", 5000);
+    const sock = createConnection(join(dir, "d.sock"));
+    await new Promise<void>((res) => sock.once("connect", () => res()));
+    const frames: any[] = [];
+    const conn = new LineConn(sock, DaemonToShim, (f) => frames.push(f), () => {});
+    conn.send({ t: "register", v: 1, session: { session_id: id, project: "alpha" }, launch_token: token, ancestors: [6000, tmux.sessions.get(id)!.pid] });
+    await waitFor(() => frames.find((f) => f.t === "registered"), "registered", 5000);
+    await starting;
+    expect(daemon.launcher!.records().find((x) => x.launch_id === id)?.state).toBe("running");
   });
 });

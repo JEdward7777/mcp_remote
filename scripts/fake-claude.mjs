@@ -6,7 +6,8 @@
 //   "crash"        -> exit 7 (simulates Claude Code dying)
 //   anything else  -> reply "echo: <text>" with send_message
 // With --continue it refuses ("No conversation found to continue", exit 1) unless a previous run in this
-// folder received a message, like the real CLI. Every start is logged as one JSON line to $FAKE_CLAUDE_LOG.
+// folder received a message; with --resume <id> it refuses ("No conversation found with session ID: <id>")
+// unless a run started with --session-id <id> received one, like the real CLI. Every start is logged as one JSON line to $FAKE_CLAUDE_LOG.
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -27,6 +28,13 @@ log("start", { has_token: !!process.env.MCP_REMOTE_LAUNCH_TOKEN, claudecode: pro
 
 if (argv.includes("--continue") && !existsSync(historyFile)) {
   process.stdout.write("No conversation found to continue\n");
+  process.exit(1);
+}
+const flagValue = (f) => (argv.indexOf(f) >= 0 ? argv[argv.indexOf(f) + 1] : null);
+const convId = flagValue("--resume") ?? flagValue("--session-id");
+const convFile = convId ? join(cwd, `.fake-claude-history-${convId}`) : null;
+if (argv.includes("--resume") && !existsSync(convFile)) {
+  process.stdout.write(`No conversation found with session ID: ${convId}\n`);
   process.exit(1);
 }
 
@@ -71,6 +79,7 @@ client.fallbackNotificationHandler = async (n) => {
   const text = String(n.params?.content ?? "");
   log("channel", { text });
   writeFileSync(historyFile, "1");
+  if (convFile) writeFileSync(convFile, "1");
   if (text === "crash") {
     process.stdout.write("fatal: simulated crash\n");
     process.exit(7);

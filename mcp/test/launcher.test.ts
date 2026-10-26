@@ -89,15 +89,17 @@ describe("launcher", () => {
     const spec = tmux.spawns[0]!;
     expect(spec.name).toBe(id);
     expect(spec.cwd).toBe(proj);
-    expect(spec.argv).toEqual([
+    expect(spec.argv.slice(0, 5)).toEqual([
       "/opt/fake/claude",
       "--dangerously-load-development-channels",
       "server:mcp-remote",
       "--permission-mode",
       "acceptEdits",
-      "--model",
-      "opus",
     ]);
+    // A fresh start gets its own conversation id (so resume never picks another session's conversation).
+    expect(spec.argv[5]).toBe("--session-id");
+    expect(spec.argv[6]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(spec.argv.slice(7)).toEqual(["--model", "opus"]);
     expect(spec.env).toMatchObject({ MCP_REMOTE_SESSION_ID: id, MCP_REMOTE_PROJECT_ID: alphaId(), MCP_REMOTE_SOCKET: "/tmp/d.sock" });
     expect(spec.env.MCP_REMOTE_LAUNCH_TOKEN).toMatch(/^[A-Za-z0-9_-]{20,}$/);
     expect(rec(l, id).state).toBe("starting");
@@ -183,10 +185,11 @@ describe("launcher", () => {
     const l = make();
     await l.init();
     const a = (await l.launch(alphaId(), { continue: true })) as { launch_id: string };
+    // "Resume last conversation" on a brand-new launch: the folder's last one (id unknown yet).
     expect(tmux.spawns[0]!.argv).toContain("--continue");
     tmux.die(a.launch_id, 1, "No conversation found to continue");
     await waitFor(() => rec(l, a.launch_id).state === "exited", "exited");
-    expect(rec(l, a.launch_id)).toMatchObject({ exit_code: 1, detail: expect.stringMatching(/restart without --continue/) });
+    expect(rec(l, a.launch_id)).toMatchObject({ exit_code: 1, detail: expect.stringMatching(/restart without resume/) });
     expect(tmux.sessions.has(a.launch_id)).toBe(false); // dead pane cleaned up
 
     const r = await l.restart(a.launch_id, false);
@@ -211,7 +214,11 @@ describe("launcher", () => {
     expect(r).toEqual({ ok: true, launch_id: a.launch_id });
     expect(tmux.spawns).toHaveLength(2);
     expect(tmux.spawns[1]!.name).toBe(a.launch_id);
-    expect(tmux.spawns[1]!.argv).toContain("--continue");
+    // Resume = this launch's own conversation, by id.
+    const sid = tmux.spawns[0]!.argv[tmux.spawns[0]!.argv.indexOf("--session-id") + 1];
+    expect(tmux.spawns[1]!.argv).toContain("--resume");
+    expect(tmux.spawns[1]!.argv[tmux.spawns[1]!.argv.indexOf("--resume") + 1]).toBe(sid);
+    expect(tmux.spawns[1]!.argv).not.toContain("--continue");
     expect(rec(l, a.launch_id)).toMatchObject({ state: "starting", continued: true });
     expect(l.shimRegister(a.launch_id, tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN)).toBe("reject");
   });
@@ -224,8 +231,9 @@ describe("launcher", () => {
     for (let i = 1; i <= MAX_AUTO_RESTARTS; i++) {
       tmux.die(a.launch_id, 137, "Killed");
       await waitFor(() => tmux.spawns.length === i + 1, `restart ${i}`, 5000);
-      // After the first successful run, auto-restart resumes the conversation.
-      expect(tmux.spawns[i]!.argv).toContain("--continue");
+      // After the first successful run, auto-restart resumes this launch's conversation by id.
+      expect(tmux.spawns[i]!.argv).toContain("--resume");
+      expect(tmux.spawns[i]!.argv).toContain(tmux.spawns[0]!.argv[tmux.spawns[0]!.argv.indexOf("--session-id") + 1]);
       expect(rec(l, a.launch_id).restarts).toBe(i);
     }
     tmux.die(a.launch_id, 137, "Killed");
@@ -388,17 +396,55 @@ describe("launcher", () => {
     expect(deadStatus("")).toBeNull();
   });
 
-  it("tells the session's own shim from a nested one by the pane pid (round-2 finding)", async () => {
+  it("accepts the session's shim behind non-exec wrappers, refuses nested ones by the remembered parent (round-3 finding)", async () => {
     const l = make();
     await l.init();
     const a = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
     const pane = tmux.sessions.get(a.launch_id)!.pid;
-    expect(l.isOwnShim(a.launch_id, [5000, pane, 1])).toBe(true); // shim -> claude -> wrapper(pane)
-    expect(l.isOwnShim(a.launch_id, [pane])).toBe(true); // no wrapper: shim -> claude(pane)
-    expect(l.isOwnShim(a.launch_id, [6000, 6001, 5000, pane])).toBe(false); // nested claude via a shell
-    expect(l.isOwnShim(a.launch_id, [6000, 5000, pane])).toBe(false); // nested claude exec'd directly
+    const token = tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN;
+    expect(l.isOwnShim(a.launch_id, [9000, 9001])).toBe(false); // not from this pane at all
+    // claude behind a non-exec wrapper (Volta / npm cli-wrapper / sh script): shim -> claude -> sh -> pane
+    expect(l.isOwnShim(a.launch_id, [5000, 4000, pane])).toBe(true);
+    expect(l.shimRegister(a.launch_id, token, [5000, 4000, pane])).toBe("linked");
+    // Its parent (5000) is remembered: a claude started inside the session is deeper than 5000.
+    expect(l.isOwnShim(a.launch_id, [7000, 6000, 5000, 4000, pane])).toBe(false);
+    expect(l.isOwnShim(a.launch_id, [5000, 4000, pane])).toBe(true);
     expect(l.isOwnShim(a.launch_id, undefined)).toBeNull();
     expect(l.isOwnShim("mr-ffffffffffff", [1])).toBeNull();
+    // Persisted: a new daemon still knows it (re-adopted, real shim may come second).
+    l.dispose();
+    const l2 = make();
+    await l2.init();
+    expect(l2.isOwnShim(a.launch_id, [7000, 6000, 5000, 4000, pane])).toBe(false);
+    expect(l2.isOwnShim(a.launch_id, [5000, 4000, pane])).toBe(true);
+  });
+
+  it("surfaces the daemon's refusal reason in the timeout message", async () => {
+    cfg = LaunchConfig.parse({ ...cfg, startup_timeout_s: 10 });
+    const l = make();
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: false })) as { launch_id: string };
+    l.noteRefusal(a.launch_id, "not that Claude Code's shim");
+    (l as unknown as { entries: { spawned_at: number }[] }).entries[0]!.spawned_at = Date.now() - 11_000;
+    await waitFor(() => rec(l, a.launch_id).state === "needs_attention", "timeout");
+    expect(rec(l, a.launch_id).detail).toMatch(/daemon refused it: not that Claude Code's shim/);
+  });
+
+  it("falls back to --continue for launches recorded before conversation ids existed", async () => {
+    const l1 = make();
+    await l1.init();
+    const a = (await l1.launch(alphaId(), { continue: false })) as { launch_id: string };
+    await l1.stop(a.launch_id);
+    l1.dispose();
+    const st = JSON.parse(readFileSync(l1.statePath, "utf8"));
+    delete st.launches[0].claude_session; // as written by the previous version
+    delete st.launches[0].shim_parent;
+    writeFileSync(l1.statePath, JSON.stringify(st));
+    const l2 = make();
+    await l2.init();
+    await l2.restart(a.launch_id, true);
+    expect(tmux.spawns.at(-1)!.argv).toContain("--continue");
+    expect(tmux.spawns.at(-1)!.argv).not.toContain("--resume");
   });
 
   it("presses the key again only after the screen changed or the retry delay passed (round-2 finding)", async () => {

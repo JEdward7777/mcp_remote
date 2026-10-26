@@ -85,6 +85,7 @@ function cleanup() {
     } catch {
       /* not running */
     }
+    rmSync(join(process.env.TMUX_TMPDIR || "/tmp", `tmux-${process.getuid()}`, TMUX_SOCKET), { force: true });
   }
   for (const c of children) {
     if (c.exitCode === null && c.signalCode === null) {
@@ -494,7 +495,8 @@ async function main() {
     check(
       "fake claude ran in the project dir with the channel flag and permission mode (argv, no shell)",
       st0 && st0.cwd === join(launchRoot, "gamma") &&
-        JSON.stringify(st0.argv) === JSON.stringify(["--dangerously-load-development-channels", "server:mcp-remote", "--permission-mode", "acceptEdits"]),
+        JSON.stringify(st0.argv.slice(0, 4)) === JSON.stringify(["--dangerously-load-development-channels", "server:mcp-remote", "--permission-mode", "acceptEdits"]) &&
+        st0.argv[4] === "--session-id",
       JSON.stringify(st0),
     );
     check("daemon answered the development-channels warning with '1'", ev.some((e) => e.event === "dialog_accepted" && e.key === "1" && e.session === lid));
@@ -513,7 +515,14 @@ async function main() {
     await waitFor(() => fakeEvents().filter((e) => e.event === "mcp_connected" && e.session === lid).length === 2, { timeout: 30_000, what: "second spawn" });
     await waitFor(() => launchOf(lid)?.state === "running" && sessionOf(pa, lid)?.online, { timeout: 30_000, what: "running after restart" });
     const starts = fakeEvents().filter((e) => e.event === "start" && e.session === lid);
-    check("restart re-spawned claude with --continue under the same session id", starts.length === 2 && starts[1].argv.includes("--continue") && launchOf(lid).continued, JSON.stringify(starts));
+    const conv = starts[0]?.argv[starts[0].argv.indexOf("--session-id") + 1];
+    check(
+      "fresh start got its own conversation id; resume re-spawned with --resume <that id> under the same session id",
+      starts.length === 2 && /^[0-9a-f-]{36}$/.test(conv ?? "") &&
+        starts[1].argv.includes("--resume") && starts[1].argv[starts[1].argv.indexOf("--resume") + 1] === conv &&
+        !starts[1].argv.includes("--continue") && launchOf(lid).continued,
+      JSON.stringify(starts.map((x) => x.argv)),
+    );
     check("the old process got SIGHUP from tmux", fakeEvents().some((e) => e.event === "signal" && e.sig === "SIGHUP" && e.pid === starts[0].pid));
     pa.send({ t: "history", session_id: lid });
     const h = await waitFor(() => pa.frames.find((f) => f.t === "history" && f.session_id === lid), { what: "history" });
@@ -547,6 +556,26 @@ async function main() {
     );
     await op({ t: "launch_stop", launch_id: lid }, "final stop");
     await waitFor(() => launchOf(lid)?.state === "exited", { timeout: 15_000, what: "final stop" });
+
+    logStep("remote launch: claude behind a non-exec wrapper script (like Volta / npm's cli-wrapper)");
+    const wrapper = join(tmp, "claude-wrapper.sh");
+    writeFileSync(wrapper, `#!/bin/sh\n# no exec: sh stays the parent of claude\n"${FAKE_CLAUDE}" "$@"\necho "wrapper: claude exited $?"\n`, { mode: 0o755 });
+    const setPath = spawnLogged("config", process.execPath, [CLI, "config", "set", "claude-path", wrapper], { env: daemonEnv });
+    await waitFor(() => setPath.exitCode !== null, { what: "config set claude-path" });
+    const w = await op({ t: "launch", project_id: gamma.id, continue: false }, "wrapped launch");
+    const wl = await waitFor(() => w.ok && mstate().launch.launches.find((l) => l.launch_id !== lid && l.project_id === gamma.id), { what: "wrapped launch record" });
+    await waitFor(() => launchOf(wl.launch_id)?.state === "running" && sessionOf(pa, wl.launch_id)?.online, { timeout: 30_000, what: "wrapped running" });
+    check("a shim behind a non-exec claude wrapper is accepted (launch running, session online)", true);
+    pa.send({ t: "send", session_id: wl.launch_id, text: "via wrapper" });
+    await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.text === "echo: via wrapper"), { what: "wrapped echo", timeout: 15_000 });
+    check("messaging works through the wrapper", true);
+    const ws = await op({ t: "launch_stop", launch_id: wl.launch_id }, "wrapped stop");
+    await waitFor(() => launchOf(wl.launch_id)?.state === "exited" && !sessionOf(pa, wl.launch_id)?.online, { timeout: 15_000, what: "wrapped stopped" });
+    const wPid = fakeEvents().filter((e) => e.event === "start" && e.session === wl.launch_id).at(-1)?.pid;
+    check(
+      "stop reaches claude behind the wrapper (SIGHUP via the process group) and ends its tmux session",
+      ws.ok && !tmuxHas(wl.launch_id) && fakeEvents().some((e) => e.event === "signal" && e.sig === "SIGHUP" && e.pid === wPid),
+    );
   }
 
   // --- revoke -----------------------------------------------------------------------------

@@ -245,15 +245,19 @@ Needs **tmux 3.2+** on the computer (`tmux -V`; `apt install tmux` / `brew insta
    - **Development channels warning**: shown on every start; the daemon answers it (it sends `1`) only when it is
      the expected warning listing exactly `server:mcp-remote`. Nothing else is ever answered automatically.
 
-On the phone, each computer has a **Start session** picker (with "resume last conversation" = `--continue` and
+On the phone, each computer has a **Start session** picker (with "resume last conversation" = `--continue`, the
+folder's most recent conversation, and
 "auto-restart on crash"). A launched session shows its state: *starting*, *running*, **needs you at the desk**
 (with what to do, e.g. a trust prompt), *exited* (with the exit code and Claude Code's last line) or *failed*.
-Buttons: **Stop**, **Restart**, **Restart + resume** (`--continue`), and **Remove** for ended ones. Launched sessions
+Buttons: **Stop**, **Restart** (new conversation), **Restart + resume** (this launch's own conversation:
+each fresh start passes `--session-id <uuid>` and resuming passes `--resume <uuid>`, so another session's
+conversation in the same folder is never picked; launches started with `--continue`, or recorded by an older
+version, resume with `--continue`), and **Remove** for ended ones. Launched sessions
 appear in the session list like any other (badge "launched") and keep their thread across restarts.
 
 At the desk, `mcp-remote attach mr-<id>` opens a launched session's terminal (detach with `Ctrl-b d`); they run on
 a dedicated tmux server: `tmux -L mcp-remote ls`. Each runs
-`claude --dangerously-load-development-channels server:mcp-remote [--permission-mode X] [--continue] [extra args]`
+`claude --dangerously-load-development-channels server:mcp-remote [--permission-mode X] [--session-id <uuid> | --resume <uuid> | --continue] [extra args]`
 in the project folder (under a small `mcp-remote run-claude` wrapper that records its exit code, which tmux
 sometimes loses), with `MCP_REMOTE_SESSION_ID` and a per-start `MCP_REMOTE_LAUNCH_TOKEN` in its environment
 so the shim it starts is linked to the launch. The daemon only reads a session's screen (and only answers the
@@ -272,7 +276,10 @@ exit) with growing delays, resuming the conversation, and gives up after 5 crash
   mr-<id>` to answer it; the session continues on its own once the shim registers. "did not start the mcp-remote
   shim within 90s" usually means the shim isn't registered (`mcp-remote setup-claude`), Claude Code isn't logged
   in, or a prompt this version doesn't recognize is showing (attach to see it).
-- "exited (1) No earlier conversation in this folder to continue": use **Restart** instead of **Restart + resume**.
+- "exited (1) No conversation to resume / No earlier conversation in this folder": nothing was said in that
+  conversation yet (Claude Code only saves it after the first message); use **Restart** instead of **Restart + resume**.
+- A launched session that never comes up although Claude Code runs: the detail line shows if the daemon refused
+  its shim (daemon log: `refused shim for mr-...`). `claude` behind wrappers (Volta, npm's wrapper, scripts) is fine.
 - "remote launch is not available": the phone shows why (no tmux, tmux older than 3.2, invalid launch.json, Windows).
 - Worker logs: `cd worker && npx wrangler tail`.
 

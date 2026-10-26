@@ -94,8 +94,10 @@ export class Daemon {
   }
 
   async start(): Promise<void> {
-    await this.listen();
+    // Load and re-adopt launches before shims can connect, so a launched shim reconnecting right after a
+    // daemon restart is linked to its launch instead of being taken for an ordinary session.
     if (this.launcher) await this.launcher.init();
+    await this.listen();
     this.connectHub();
   }
 
@@ -161,66 +163,50 @@ export class Daemon {
       (f) => {
         if (f.t === "register") {
           if (sessionId) return conn.send({ t: "error", error: "already registered" } satisfies DaemonToShim);
-          const prior = this.shims.get(f.session.session_id);
+          const sid = f.session.session_id;
+          const refuse = (error: string) => {
+            log(`refused shim for ${sid}: ${error}`);
+            if (f.launch_token) this.launcher?.noteRefusal(sid, error);
+            conn.send({ t: "register_refused", error } satisfies DaemonToShim);
+            conn.close();
+          };
+          const prior = this.shims.get(sid);
           if (prior && f.launch_token && prior.token === f.launch_token) {
             // Same spawn's token while its shim is connected: a second process inherited the session's
             // environment (e.g. `claude` run from a Bash tool or hook inside the launched session). The
             // connected shim stays; only a newer spawn (different, current token) may replace it.
-            conn.send({
-              t: "register_refused",
-              error:
-                `session "${f.session.session_id}" is already connected; this process inherited its MCP_REMOTE_SESSION_ID ` +
+            return refuse(
+              `session "${sid}" is already connected; this process inherited its MCP_REMOTE_SESSION_ID ` +
                 "and MCP_REMOTE_LAUNCH_TOKEN (a claude started inside a phone-launched session?)",
-            } satisfies DaemonToShim);
-            conn.close();
-            return;
+            );
           }
-          if (f.launch_token && this.launcher?.isOwnShim(f.session.session_id, f.ancestors) === false) {
-            // Right token, wrong process: not the shim of the Claude Code in the session's tmux pane but one
-            // further down (a claude started inside the session). Refused even when the real shim isn't
-            // connected yet (e.g. right after a daemon restart), so it can't win that race.
-            conn.send({
-              t: "register_refused",
-              error:
-                `session "${f.session.session_id}" belongs to the Claude Code in its tmux pane; this process inherited its ` +
-                "MCP_REMOTE_SESSION_ID and MCP_REMOTE_LAUNCH_TOKEN (a claude started inside a phone-launched session?)",
-            } satisfies DaemonToShim);
-            conn.close();
-            return;
+          if (f.launch_token && this.launcher?.isOwnShim(sid, f.ancestors) === false) {
+            // Right token, wrong process (see Launcher.isOwnShim): not from this session's tmux pane, or a
+            // claude started inside the session while its own shim is away (e.g. right after a daemon restart).
+            return refuse(
+              `session "${sid}" belongs to the Claude Code in its tmux pane; this process is not that Claude Code's ` +
+                "shim (a claude started inside a phone-launched session?)",
+            );
           }
-          const link = this.launcher?.shimRegister(f.session.session_id, f.launch_token) ?? "none";
+          const link = this.launcher?.shimRegister(sid, f.launch_token, f.ancestors) ?? "none";
           if (link === "reject") {
-            conn.send({
-              t: "register_refused",
-              error: `session id "${f.session.session_id}" belongs to a phone-launched session; only the shim that session starts can use it`,
-            } satisfies DaemonToShim);
-            conn.close();
-            return;
+            return refuse(`session id "${sid}" belongs to a phone-launched session; only the shim that session starts can use it`);
           }
-          const existing = this.shims.get(f.session.session_id);
+          const existing = this.shims.get(sid);
           if (existing && link === "linked") {
             // A previous spawn's shim that hasn't gone away yet: the current spawn wins.
             existing.conn.send({ t: "register_refused", error: "superseded by a restarted session" } satisfies DaemonToShim);
-            this.shims.delete(f.session.session_id);
+            this.shims.delete(sid);
             existing.conn.close();
           } else if (existing) {
-            conn.send({
-              t: "register_refused",
-              error:
-                `another live session on this computer already uses session id "${f.session.session_id}" ` +
+            return refuse(
+              `another live session on this computer already uses session id "${sid}" ` +
                 "(MCP_REMOTE_SESSION_ID?). Only one session can use an id at a time; give each project its own id or unset it",
-            } satisfies DaemonToShim);
-            conn.close();
-            return;
+            );
           }
           if (this.shims.size >= MAX_SESSIONS_PER_MACHINE) {
-            if (link === "linked") this.launcher?.shimDown(f.session.session_id);
-            conn.send({
-              t: "register_refused",
-              error: `too many live sessions on this computer (max ${MAX_SESSIONS_PER_MACHINE})`,
-            } satisfies DaemonToShim);
-            conn.close();
-            return;
+            if (link === "linked") this.launcher?.shimDown(sid);
+            return refuse(`too many live sessions on this computer (max ${MAX_SESSIONS_PER_MACHINE})`);
           }
           sessionId = f.session.session_id;
           this.shims.set(sessionId, { conn, session: f.session, refused: null, launched: link === "linked", token: f.launch_token });

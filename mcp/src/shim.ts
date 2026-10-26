@@ -69,15 +69,19 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   setLogPrefix(`mcp-remote shim ${project}/${sessionId.slice(0, 8)}`);
   const sockPath = opts.socket ?? socketPath();
 
+  // Dormant (see proc.ts): advertise nothing, so desk and `claude -p` sessions get no "the user is away,
+  // use send_message" instructions and no tool they can't use. An empty tool list is valid MCP.
   const server = new Server(
     { name: SERVER_NAME, version: "0.1.0" },
-    {
-      capabilities: {
-        experimental: { "claude/channel": {} },
-        tools: {},
-      },
-      instructions: INSTRUCTIONS,
-    },
+    act.active
+      ? {
+          capabilities: {
+            experimental: { "claude/channel": {} },
+            tools: {},
+          },
+          instructions: INSTRUCTIONS,
+        }
+      : { capabilities: { tools: {} } },
   );
 
   // --- daemon link -----------------------------------------------------------------------
@@ -259,7 +263,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
 
   // --- MCP surface -----------------------------------------------------------------------
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
+    tools: !act.active ? [] : [
       {
         name: "send_message",
         description:

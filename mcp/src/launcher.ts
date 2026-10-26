@@ -11,7 +11,7 @@
 //   - startup: capture-pane every second until the shim registers or startup_timeout_s passes, to spot
 //     dialogs (see dialogs.ts)
 //   - one `tmux list-panes` every LIVENESS_MS while any launch is active, to notice exits
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
@@ -43,6 +43,14 @@ const Entry = LaunchRecord.extend({
   ever_running: z.boolean(),
   /** When a pending auto-restart is due (persisted so a daemon restart doesn't lose it). */
   restart_at: z.number().int().nullable().default(null),
+  /**
+   * Claude Code conversation id of this launch (`--session-id` on a fresh start, `--resume` to resume), so
+   * resuming never picks another session's conversation in the same folder. null: started with --continue
+   * (id unknown) or from before this field existed; resuming then falls back to --continue.
+   */
+  claude_session: z.string().uuid().nullable().default(null),
+  /** pid of the process that started the first shim linked for the current spawn (the session's Claude Code). */
+  shim_parent: z.number().int().nullable().default(null),
 });
 type Entry = z.infer<typeof Entry> & {
   linked?: boolean;
@@ -63,6 +71,8 @@ type Entry = z.infer<typeof Entry> & {
   /** Screen on which the dev-channels keys were last sent, and when. */
   keysScreen?: string;
   keysAt?: number;
+  /** Why the daemon last refused a shim presenting this launch's token. */
+  lastRefusal?: string;
 };
 const StateFile = z.object({ v: z.literal(1), launches: z.array(Entry).max(MAX_LAUNCHES_PER_MACHINE) });
 
@@ -247,6 +257,8 @@ export class Launcher {
       spawned_at: now,
       ever_running: false,
       restart_at: null,
+      claude_session: null,
+      shim_parent: null,
     };
     this.entries.push(e);
     e.busy = true;
@@ -327,10 +339,12 @@ export class Launcher {
    * A shim registered with the daemon. "linked": it is the current spawn of a launch; "reject": it claims a
    * launch's session id without the current token; "none": not a launched session.
    */
-  shimRegister(sessionId: string, token: string | undefined): "linked" | "reject" | "none" {
+  shimRegister(sessionId: string, token: string | undefined, ancestors?: number[]): "linked" | "reject" | "none" {
     const e = this.get(sessionId);
     if (!e) return "none";
     if (!token || token !== e.token) return "reject";
+    if (!e.shim_parent && ancestors?.[0]) e.shim_parent = ancestors[0];
+    e.lastRefusal = undefined;
     e.linked = true;
     e.fresh = false;
     this.clearStartup(e);
@@ -366,16 +380,41 @@ export class Launcher {
   }
 
   /**
-   * Is a shim with these ancestor pids the one started by the Claude Code running in this launch's tmux
-   * pane? That shim's parent is that Claude Code, whose parent is the pane process (the run-claude wrapper),
-   * or the pane process itself without the wrapper. A `claude` started inside the session (Bash tool, hook)
-   * sits deeper. null: can't tell (no pid info), callers fall back to the token rules.
+   * Is a shim with these ancestor pids the one started by the Claude Code in this launch's tmux pane?
+   * - The pane process (run-claude wrapper, or claude itself) must be among its ancestors, at any depth:
+   *   claude may sit behind non-exec wrappers (Volta, npm's cli-wrapper, a claude-path script).
+   * - Once a shim linked, its parent (the session's Claude Code) is remembered (persisted); a later shim
+   *   whose chain contains that pid further up is a `claude` started inside the session (Bash tool, hook)
+   *   and is refused, also after a daemon restart when the real shim may reconnect second.
+   * null: can't tell (no pid info); callers fall back to the token rules.
    */
   isOwnShim(sessionId: string, ancestors: number[] | undefined): boolean | null {
     const e = this.get(sessionId);
-    if (!e || !e.panePid || !ancestors?.length) return null;
-    const i = ancestors.indexOf(e.panePid);
-    return i === 0 || i === 1;
+    if (!e || !ancestors?.length) return null;
+    if (e.panePid && !ancestors.includes(e.panePid)) return false;
+    if (e.shim_parent) {
+      if (ancestors[0] === e.shim_parent) return true;
+      if (ancestors.includes(e.shim_parent)) return false;
+    }
+    return e.panePid ? true : null;
+  }
+
+  /** The daemon refused a shim holding this launch's token; keep the reason for the phone. */
+  noteRefusal(sessionId: string, reason: string): void {
+    const e = this.get(sessionId);
+    if (!e) return;
+    e.lastRefusal = reason;
+    if (!e.linked && e.state === "needs_attention") this.set(e, { detail: this.timeoutText(e) });
+  }
+
+  private timeoutText(e: Entry): string {
+    if (e.lastRefusal) {
+      return `Claude Code started a shim for this session but the daemon refused it: ${e.lastRefusal}. Look at it at the desk: ${this.attachHint(e)}`;
+    }
+    return (
+      `Claude Code did not start the mcp-remote shim within ${this.cfg.startup_timeout_s}s. Is it registered ` +
+      `(mcp-remote setup-claude) and is Claude Code logged in? Look at it at the desk: ${this.attachHint(e)}`
+    );
   }
 
   private get(id: string): Entry | undefined {
@@ -413,7 +452,8 @@ export class Launcher {
     if (!bin) return "the claude command was not found on the daemon's PATH (set it: mcp-remote config set claude-path /path/to/claude)";
     const argv = [bin, "--dangerously-load-development-channels", `server:${this.cfg.server_name}`];
     if (this.cfg.permission_mode) argv.push("--permission-mode", this.cfg.permission_mode);
-    if (e.continued) argv.push("--continue");
+    if (e.continued) argv.push(...(e.claude_session ? ["--resume", e.claude_session] : ["--continue"]));
+    else if (e.claude_session) argv.push("--session-id", e.claude_session);
     argv.push(...this.cfg.extra_args);
     return argv;
   }
@@ -439,6 +479,10 @@ export class Launcher {
     const tmux = this.tmux!;
     // Count as active right away, so concurrent launch/restart requests see it against max_sessions.
     e.state = "starting";
+    // A fresh start gets its own conversation id; resuming keeps the one it has.
+    if (!e.continued) e.claude_session = randomUUID();
+    e.shim_parent = null;
+    e.lastRefusal = undefined;
     let argv = this.claudeArgv(e);
     if (this.o.wrapper && typeof argv !== "string") {
       const f = this.statusFile(e);
@@ -482,7 +526,7 @@ export class Launcher {
       return;
     }
     e.panePid = (await tmux.list().catch(() => [])).find((x) => x.name === e.launch_id)?.pid ?? null;
-    log(`launched ${e.project} as ${e.launch_id}${e.continued ? " (--continue)" : ""}`);
+    log(`launched ${e.project} as ${e.launch_id}${e.continued ? (e.claude_session ? ` (--resume ${e.claude_session})` : " (--continue)") : ""}`);
     this.set(e, { state: "starting", detail: null, exit_code: null });
     this.startStartup(e);
   }
@@ -501,9 +545,7 @@ export class Launcher {
         if (e.state === "starting") {
           this.set(e, {
             state: "needs_attention",
-            detail:
-              `Claude Code did not start the mcp-remote shim within ${this.cfg.startup_timeout_s}s. Is it registered ` +
-              `(mcp-remote setup-claude) and is Claude Code logged in? Look at it at the desk: ${this.attachHint(e)}`,
+            detail: this.timeoutText(e),
           });
         }
         return; // the shim registering later still flips it to running
@@ -647,7 +689,9 @@ export class Launcher {
     let detail: string | null;
     if (NO_CONVERSATION.test(screen)) {
       e.noConversation = true;
-      detail = "No earlier conversation in this folder to continue; restart without --continue";
+      detail = e.claude_session
+        ? "No conversation to resume for this session yet (nothing was said in it); restart without resume"
+        : "No earlier conversation in this folder to continue; restart without resume";
     } else if (/cannot be used with root\/sudo/.test(screen)) {
       detail = "Claude Code refuses bypassPermissions when running as root (mcp-remote config set permission-mode ...)";
     } else if (vanished) {
@@ -777,6 +821,8 @@ export class Launcher {
         spawned_at: now,
         ever_running: true,
         restart_at: null,
+        claude_session: null,
+        shim_parent: null,
         fresh: false,
         panePid: p.pid,
       };

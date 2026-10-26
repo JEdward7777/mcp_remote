@@ -112,6 +112,10 @@ describe("shim", () => {
 
   it("stays dormant without channel evidence: no session on the phone, clear send_message error (round-2 finding)", async () => {
     const c = await startShim(null, {}, ["mcp", "list"]);
+    // Round 3: a dormant shim advertises no instructions, no channel capability and no tools.
+    expect(c.getInstructions()).toBeUndefined();
+    expect(c.getServerCapabilities()?.experimental?.["claude/channel"]).toBeUndefined();
+    expect((await c.listTools()).tools).toEqual([]);
     await sleep(1500);
     expect(hubFrames.filter((f) => f.t === "session_up")).toEqual([]);
     const r = await c.callTool({ name: "send_message", arguments: { text: "hi" } });

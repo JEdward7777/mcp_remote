@@ -107,4 +107,5 @@ export function lastLine(screen: string, max = 200): string | null {
   return clean.length > max ? clean.slice(0, max - 1) + "…" : clean;
 }
 
-export const NO_CONVERSATION = /No conversation found to continue/;
+/** `--continue`: "No conversation found to continue"; `--resume <id>`: "No conversation found with session ID: <id>" (2.1.310). */
+export const NO_CONVERSATION = /No conversation found (to continue|with session ID)/;

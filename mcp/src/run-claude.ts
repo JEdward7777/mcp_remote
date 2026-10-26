@@ -34,14 +34,29 @@ export function runClaude(args: string[]): void {
     }
   };
   const child = spawn(cmd[0], cmd.slice(1), { stdio: "inherit" });
-  // `tmux kill-session` signals the pane's process (this wrapper), not the whole group: pass signals on to
-  // Claude Code and stay alive until it has exited, so its status is recorded.
+  // `tmux kill-session` signals the pane's process (this wrapper), not the whole group. Pass the signal on
+  // to our process group (we are its leader: tmux starts the pane with setsid), so claude gets it even when
+  // it sits behind a non-exec wrapper (Volta, npm's cli-wrapper, a shell script). We receive our own copy
+  // too and ignore it; stay alive until claude has exited so its status is recorded.
+  const echoes: Record<string, number> = {};
   for (const sig of ["SIGHUP", "SIGINT", "SIGTERM", "SIGQUIT"] as const) {
     process.on(sig, () => {
+      if (echoes[sig]) {
+        echoes[sig]--;
+        return;
+      }
       try {
-        child.kill(sig);
+        if (process.platform === "win32") throw new Error("no process groups");
+        // Succeeds only if a group with our pid as id exists, i.e. we lead it.
+        echoes[sig] = (echoes[sig] ?? 0) + 1;
+        process.kill(-process.pid, sig);
       } catch {
-        /* already gone */
+        if (echoes[sig]) echoes[sig]--;
+        try {
+          child.kill(sig);
+        } catch {
+          /* already gone */
+        }
       }
     });
   }

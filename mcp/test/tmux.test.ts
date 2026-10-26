@@ -65,6 +65,8 @@ afterAll(() => {
     } catch {
       /* not running */
     }
+    // kill-server can leave the socket file behind (round-3 nit).
+    rmSync(join(process.env.TMUX_TMPDIR || "/tmp", `tmux-${process.getuid?.() ?? 0}`, socket), { force: true });
   }
   rmSync(work, { recursive: true, force: true });
 });
