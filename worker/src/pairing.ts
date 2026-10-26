@@ -176,29 +176,29 @@ export class Pairing extends DurableObject<Env> {
   }
 
   /**
-   * The only frame a waiting daemon may send is one "claimed", after it got the approved token ("ping"
-   * is answered by the auto-response and never gets here). Anything else, a second "claimed", or a
-   * "claimed" before approval closes the socket (1008): an unauthenticated client must not be able to
-   * wake this object (a DO request + a storage read) in a loop.
+   * Only the Worker holds sockets to this object (see relayPairingWait in index.ts); it never sends
+   * anything, so any frame is unexpected and closes that link without reading storage.
    */
-  override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  override async webSocketMessage(ws: WebSocket, _message: string | ArrayBuffer): Promise<void> {
     this.framesHandled++;
-    const att = ws.deserializeAttachment() as { claimed?: boolean } | null;
-    if (message !== "claimed" || att?.claimed) {
-      this.closeSocket(ws, 1008, "unexpected frame");
-      return;
-    }
-    ws.serializeAttachment({ claimed: true });
+    this.closeSocket(ws, 1008, "unexpected frame");
+  }
+
+  /**
+   * The daemon saved its token (HTTP POST /api/pair/claim, authenticated by pairing id + poll secret):
+   * forget the pairing and close the wait links.
+   */
+  async claim(pairingId: string, pollSecret: string): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
     this.storageReads++;
     const s = await this.load();
-    if (s?.status !== "approved") {
-      this.closeSocket(ws, 1008, "not approved");
-      return;
+    if (!s || !timingSafeEqual(s.pairing_id, pairingId) || !timingSafeEqual(s.poll_hash, await sha256Hex(pollSecret))) {
+      return { ok: false, status: 404, error: "unknown or expired pairing" };
     }
-    // The daemon has saved the token: nothing is kept.
+    if (s.status !== "approved") return { ok: false, status: 409, error: "not approved yet" };
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
     for (const w of this.ctx.getWebSockets()) this.closeSocket(w, 1000, "done");
+    return { ok: true };
   }
 
   private closeSocket(ws: WebSocket, code: number, reason: string): void {

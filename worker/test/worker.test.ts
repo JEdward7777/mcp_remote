@@ -99,9 +99,12 @@ describe("pairing", () => {
     await waitFor(() => d.frames.find((f) => f.t === "welcome"), "welcome");
     expect(last(d, "welcome").name).toBe("Dave's laptop");
 
-    // Claiming wipes the pending pairing.
-    waiter.ws.send("claimed");
+    // Claiming (an authenticated POST) wipes the pending pairing and closes the wait socket.
+    const claimUrl = `${ORIGIN}/api/pair/claim${q}`;
+    expect((await SELF.fetch(claimUrl, { method: "POST", headers: { authorization: `Bearer ${"y".repeat(43)}` } })).status).toBe(404);
+    expect((await SELF.fetch(claimUrl, { method: "POST", headers: { authorization: `Bearer ${s.poll_secret}` } })).status).toBe(200);
     await waitFor(() => waiter.closed, "pairing socket closed");
+    expect(waiter.closed!.code).toBe(1000);
     expect(await connect(`/api/pair/wait${q}`, { authorization: `Bearer ${s.poll_secret}` })).toBe(404);
   });
 

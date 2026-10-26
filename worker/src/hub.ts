@@ -44,7 +44,7 @@ import { type PendingSnap, USAGE_ADDED_COLUMNS, USAGE_SCHEMA, type UsageDay, Usa
  */
 type HubSnap = { g: number; u?: PendingSnap; b?: LimiterSnapshot };
 
-type Attachment = ({ kind: "phone" } | { kind: "daemon"; machine_id: string }) & { s?: HubSnap };
+type Attachment = ({ kind: "phone" } | { kind: "daemon"; machine_id: string }) & { s?: HubSnap; closed?: boolean };
 
 /** Result of an HTTP-facing RPC that is rate limited per tenant. */
 export type Limited<T> =
@@ -92,6 +92,8 @@ type MessageRow = {
 
 /** History rows deleted per event for removed sessions (bounds what one frame can write). */
 export const GC_BATCH = 200;
+/** History cleanup stops once today's rows written reach this share of the daily budget. */
+export const GC_BUDGET_SHARE = 0.5;
 
 /** With no socket open, refused calls write their counts at most this often. */
 const NO_SOCKET_REFUSAL_FLUSH_MS = 10_000;
@@ -230,6 +232,10 @@ export class Hub extends DurableObject<Env> {
   private blockedSnapSaved = false;
   /** Some removed session still has history rows to delete (checked once per wake). */
   private gcPending = false;
+  /** Pending coalesced resync: daemons (machine ids) to skip; null = none pending. */
+  private resyncSkip: Set<string> | null = null;
+  /** Frames that arrived on sockets this Hub had already closed (tests). */
+  droppedFrames = 0;
   /** Set by upgrade() when it refused a daemon's credentials (401/403). */
   private credentialRefused = false;
   /** Last usage flush done for a refused call while no socket was open. */
@@ -407,6 +413,21 @@ export class Hub extends DurableObject<Env> {
     );
   }
 
+  /** Close a client socket and remember that we did (see webSocketMessage). */
+  private shut(ws: WebSocket, code: number, reason: string): void {
+    try {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att) ws.serializeAttachment({ ...att, closed: true } satisfies Attachment);
+    } catch {
+      /* closing */
+    }
+    try {
+      ws.close(code, reason);
+    } catch {
+      /* already closing */
+    }
+  }
+
   private openSockets(except?: WebSocket): WebSocket[] {
     return this.ctx.getWebSockets().filter((w) => w !== except && w.readyState === WebSocket.OPEN);
   }
@@ -417,6 +438,7 @@ export class Hub extends DurableObject<Env> {
    * flushed at the 50-event threshold; what an eviction loses then is bounded and accepted).
    */
   private saveSnap(ws: WebSocket | undefined, now: number, refusal = false): void {
+    this.flushResync();
     this.settleRows(now);
     const target = ws ?? this.openSockets()[0];
     if (!target) {
@@ -448,6 +470,7 @@ export class Hub extends DurableObject<Env> {
    * if none is left, write it down (usage row + non-full buckets in meta: at most 2 rows per last close).
    */
   private onSocketClosedState(ws: WebSocket, now: number): void {
+    this.flushResync();
     const other = this.openSockets(ws)[0];
     if (other) {
       this.saveSnap(other, now);
@@ -689,7 +712,7 @@ export class Hub extends DurableObject<Env> {
     this.sql.exec("UPDATE sessions SET online = 0, last_seen = ? WHERE machine_id = ? AND online = 1", now, machineId);
     for (const ws of this.ctx.getWebSockets(`m:${machineId}`)) {
       try {
-        ws.close(CLOSE_REVOKED, "machine revoked");
+        this.shut(ws, CLOSE_REVOKED, "machine revoked");
       } catch {
         /* already closing */
       }
@@ -784,7 +807,7 @@ export class Hub extends DurableObject<Env> {
       // One live socket per machine: a reconnecting daemon replaces a stale one.
       for (const old of this.ctx.getWebSockets(`m:${machineId}`)) {
         try {
-          old.close(CLOSE_REPLACED, "replaced by a newer connection");
+          this.shut(old, CLOSE_REPLACED, "replaced by a newer connection");
         } catch {
           /* ignore */
         }
@@ -809,9 +832,15 @@ export class Hub extends DurableObject<Env> {
       ws.close(CLOSE_POLICY, "unknown socket");
       return;
     }
+    // A socket this Hub already closed (4029, revoked, replaced, too big): a client that ignores the
+    // close frame keeps reaching us; do nothing for it at all (no wake-up work, no SQL, not counted).
+    if (att.closed) {
+      this.droppedFrames++;
+      return;
+    }
     const size = typeof message === "string" ? message.length : message.byteLength;
     if (size > MAX_FRAME_BYTES) {
-      ws.close(CLOSE_TOO_BIG, "frame too large");
+      this.shut(ws, CLOSE_TOO_BIG, "frame too large");
       return;
     }
     const now = Date.now();
@@ -829,14 +858,14 @@ export class Hub extends DurableObject<Env> {
     // after at least the hinted wait; see shared/link.ts).
     const flood = this.limited(att.kind === "phone" ? "phone_frames" : "daemon_frames", now);
     if (flood !== null) {
-      ws.close(CLOSE_RATE_LIMITED, `rate limited: too many requests; retry in ${Math.ceil(flood / 1000)}s`);
+      this.shut(ws, CLOSE_RATE_LIMITED, `rate limited: too many requests; retry in ${Math.ceil(flood / 1000)}s`);
       return;
     }
     const over = this.overBudget(now);
     if (att.kind === "phone") {
       const r = parseFrame(PhoneToHub, message);
       if (!r.ok) {
-        if (r.error === "frame too large") ws.close(CLOSE_TOO_BIG, r.error);
+        if (r.error === "frame too large") this.shut(ws, CLOSE_TOO_BIG, r.error);
         else this.sendPhone(ws, { t: "error", error: r.error });
         return;
       }
@@ -855,16 +884,16 @@ export class Hub extends DurableObject<Env> {
     } else {
       if (over) {
         // The daemon waits until the hinted time (shared/link.ts); its sessions show offline meanwhile.
-        ws.close(CLOSE_RATE_LIMITED, `daily budget used up; retry in ${Math.ceil(over.retryMs / 1000)}s`);
+        this.shut(ws, CLOSE_RATE_LIMITED, `daily budget used up; retry in ${Math.ceil(over.retryMs / 1000)}s`);
         return;
       }
       if (!this.machineActive(att.machine_id)) {
-        ws.close(CLOSE_REVOKED, "machine revoked");
+        this.shut(ws, CLOSE_REVOKED, "machine revoked");
         return;
       }
       const r = parseFrame(DaemonToHub, message);
       if (!r.ok) {
-        if (r.error === "frame too large") ws.close(CLOSE_TOO_BIG, r.error);
+        if (r.error === "frame too large") this.shut(ws, CLOSE_TOO_BIG, r.error);
         else this.sendDaemon(ws, { t: "error", error: r.error });
         return;
       }
@@ -1221,9 +1250,13 @@ export class Hub extends DurableObject<Env> {
       !existing &&
       this.gcPending &&
       // Someone wants this id back: make sure every daemon is told when it is free (clears except_machine).
-      this.sql.exec("UPDATE gc SET except_machine = '' WHERE session_id = ? RETURNING session_id", s.session_id).toArray().length
+      this.sql.exec("UPDATE gc SET except_machine = '' WHERE session_id = ? RETURNING session_id", s.session_id).toArray().length &&
+      !this.gcFinish(s.session_id, now)
     ) {
-      return `session id "${s.session_id}" was just removed and its history is still being deleted; it is retried automatically`;
+      return (
+        `session id "${s.session_id}" was just removed and deleting its history is paused for today ` +
+        "(daily budget); it is retried automatically"
+      );
     }
     if (!existing || existing.machine_id !== machineId) {
       // New to this machine (brand new, or taken over from a revoked one): apply the same limits.
@@ -1279,23 +1312,49 @@ export class Hub extends DurableObject<Env> {
    * daily budget is used up). When a session's history is gone its id is usable again: daemons re-announce.
    */
   private gcStep(now: number): void {
-    if (!this.gcPending) return;
-    this.settleRows(now);
-    if (this.overBudget(now)) return;
+    if (!this.gcPending || !this.gcAllowed(now)) return;
     const next = this.sql.exec<{ session_id: string; except_machine: string }>("SELECT session_id, except_machine FROM gc LIMIT 1").toArray()[0];
     if (!next) {
       this.gcPending = false;
       return;
     }
+    if (this.gcBatch(next.session_id)) this.resyncDaemons(next.except_machine || undefined); // id free again
+  }
+
+  /**
+   * History cleanup is charged to the account, so it only runs while today's rows written are below
+   * GC_BUDGET_SHARE of the daily budget: it can never be what blocks the account (real work keeps the rest).
+   */
+  private gcAllowed(now: number): boolean {
+    this.settleRows(now);
+    if (this.overBudget(now)) return false;
+    return this.meter.today(now).rows_written < this.limits.daily.rows_written * GC_BUDGET_SHARE;
+  }
+
+  /** Delete one batch of a removed session's history; true when nothing is left (gc row removed). */
+  private gcBatch(sessionId: string): boolean {
     const del = this.sql.exec(
       "DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE session_id = ? ORDER BY id LIMIT ?)",
-      next.session_id,
+      sessionId,
       GC_BATCH,
     );
-    if (del.rowsWritten < GC_BATCH) {
-      this.sql.exec("DELETE FROM gc WHERE session_id = ?", next.session_id);
-      this.resyncDaemons(next.except_machine || undefined); // the id is free now; a computer refused it may claim it
+    if (del.rowsWritten >= GC_BATCH) return false;
+    this.sql.exec("DELETE FROM gc WHERE session_id = ?", sessionId);
+    return true;
+  }
+
+  /**
+   * A removed id is announced again (e.g. a fixed MCP_REMOTE_SESSION_ID after Forget): finish its cleanup
+   * right now (at most a full history, ~6 batches), within the same GC budget rule. True when it is free.
+   */
+  private gcFinish(sessionId: string, now: number): boolean {
+    // A full history (MAX_HISTORY_PER_SESSION + slack) is at most this many batches.
+    const maxBatches = Math.ceil((MAX_HISTORY_PER_SESSION + HISTORY_TRIM_SLACK) / GC_BATCH) + 1;
+    for (let i = 0; i < maxBatches; i++) {
+      if (!this.gcAllowed(now)) return false;
+      if (this.gcBatch(sessionId)) return true;
     }
+    return false;
   }
 
   private evictOldSessions(machineId: string, keep: number): void {
@@ -1320,9 +1379,19 @@ export class Hub extends DurableObject<Env> {
    * become free. Only sent on revoke/forget/evict, never in reply to a hello, so it cannot loop.
    */
   private resyncDaemons(exceptMachine?: string): void {
+    // Coalesced: at most one resync per daemon per event (sent by flushResync at the end of the event).
+    // A daemon skipped by every request in this event stays skipped; one skipped by only some gets it.
+    const skip = new Set(exceptMachine ? [exceptMachine] : []);
+    this.resyncSkip = this.resyncSkip ? new Set([...this.resyncSkip].filter((m) => skip.has(m))) : skip;
+  }
+
+  private flushResync(): void {
+    const skip = this.resyncSkip;
+    if (!skip) return;
+    this.resyncSkip = null;
     for (const ws of this.ctx.getWebSockets("daemon")) {
       const a = ws.deserializeAttachment() as Attachment | null;
-      if (a?.kind === "daemon" && a.machine_id !== exceptMachine) this.sendDaemon(ws, { t: "resync" });
+      if (a?.kind === "daemon" && !a.closed && !skip.has(a.machine_id)) this.sendDaemon(ws, { t: "resync" });
     }
   }
 

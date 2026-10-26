@@ -486,9 +486,16 @@ named page and fix `worker/src/budget.ts` (and the defaults above) if it is wron
       <https://developers.cloudflare.com/durable-objects/reference/in-memory-state/>
 - [ ] Workers Rate Limiting binding: available and free on the free plan? `namespace_id` rules —
       <https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/>
-- [ ] After a Durable Object closes a WebSocket, are frames the client already sent still delivered to
-      `webSocketMessage` (local workerd delivers them; each costs a DO request)? —
+- [ ] After a Durable Object closes a WebSocket, are later frames from a client that ignores the close still
+      delivered to `webSocketMessage`? Locally they are (a raw client kept sending ~17,000 frames in 2 s after
+      a 4029); the Hub drops them before any work, but each would still be a billed DO request —
       <https://developers.cloudflare.com/durable-objects/best-practices/websockets/>
+- [ ] A WebSocket accepted by the Worker itself (the pairing wait socket): does each client frame count
+      against the invocation's CPU limit, so a flood ends the connection (wrangler dev doesn't enforce it),
+      and are its frames free of request billing? Also: may a Worker hold such a socket (and its link to a
+      Durable Object) for the full 10-minute pairing window? —
+      <https://developers.cloudflare.com/workers/runtime-apis/websockets/> and
+      <https://developers.cloudflare.com/workers/platform/limits/>
 - [ ] Close code / behavior clients see when a deploy restarts Durable Objects (we treat any close the same) —
       <https://developers.cloudflare.com/durable-objects/reference/durable-object-lifecycle/>
 
@@ -501,8 +508,16 @@ wrangler should say so.
   `/api/pair/start` from many networks can use it up and block new pairings for everyone until it refills.
   The planned one-line install for signed-in users (D12) should start pairing from the signed-in session
   (pre-approved, tied to the account) and so bypass this unauthenticated cap.
-- A pairing wait socket accepts exactly one `claimed` frame after approval and closes on anything else; frames
-  a client pipelined before that close still each cost a DO request (no storage), see the checklist above.
+- The pairing wait socket is accepted by the Worker, not by the Pairing Durable Object: the Worker answers at
+  most one `ping` per 5 s and closes the socket (1008) on any other frame; client frames never reach the DO
+  (tested: none arrive even when a raw client keeps sending after the close, and a late `claimed` frame does
+  nothing). The DO only sees the Worker's own link (a hibernatable socket on its side, so it sleeps while it
+  waits). "Token saved" is an HTTP POST `/api/pair/claim` authenticated by the pairing id and poll secret.
+- Hub sockets (phone, daemon) are accepted by the Hub so it can hibernate. They are authenticated, and every
+  frame is bucketed per minute and counted against the account's daily budget; a client that ignores the
+  4029 close and keeps sending is dropped before any work (no SQL, not counted), but each such frame may
+  still be a billed DO request if Cloudflare delivers it (see the checklist). That cost is attributable to a
+  signed-in account or a paired computer's token (revoke it); it is bounded only by the platform.
 
 ## Troubleshooting
 

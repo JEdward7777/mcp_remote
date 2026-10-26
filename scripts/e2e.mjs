@@ -4,7 +4,8 @@
 // and phone WebSockets. Run with `npm run e2e` (builds first).
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { connect as netConnect, createServer } from "node:net";
+import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,6 +105,68 @@ process.on("SIGINT", () => {
   process.exit(130);
 });
 
+
+/** Minimal raw WebSocket client that can ignore the server's close frame (abuse tests). */
+function rawFrame(text) {
+  const payload = Buffer.from(text);
+  const mask = randomBytes(4);
+  const hdr = payload.length < 126 ? Buffer.from([0x81, 0x80 | payload.length]) : Buffer.from([0x81, 0x80 | 126, payload.length >> 8, payload.length & 255]);
+  const masked = Buffer.alloc(payload.length);
+  for (let i = 0; i < payload.length; i++) masked[i] = payload[i] ^ mask[i % 4];
+  return Buffer.concat([hdr, mask, masked]);
+}
+
+function rawWs(base, path, headers) {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    const s = netConnect(Number(port), hostname);
+    const st = { s, buf: Buffer.alloc(0), upgraded: false, frames: [], closed: null, ended: false };
+    s.on("data", (d) => {
+      st.buf = Buffer.concat([st.buf, d]);
+      if (!st.upgraded) {
+        const i = st.buf.indexOf("\r\n\r\n");
+        if (i < 0) return;
+        st.status = Number(st.buf.subarray(0, i).toString().split(" ")[1]);
+        st.buf = st.buf.subarray(i + 4);
+        st.upgraded = true;
+        resolve(st);
+      }
+      while (st.buf.length >= 2) {
+        const op = st.buf[0] & 0x0f;
+        let len = st.buf[1] & 0x7f;
+        let off = 2;
+        if (len === 126) {
+          len = st.buf.readUInt16BE(2);
+          off = 4;
+        }
+        if (st.buf.length < off + len) break;
+        const p = st.buf.subarray(off, off + len);
+        st.buf = st.buf.subarray(off + len);
+        if (op === 8) st.closed = { code: p.length >= 2 ? p.readUInt16BE(0) : 0, reason: p.subarray(2).toString() };
+        else st.frames.push(p.toString());
+      }
+    });
+    const end = () => (st.ended = true);
+    s.on("end", end);
+    s.on("close", end);
+    s.on("error", end);
+    const h = Object.entries({ Host: `${hostname}:${port}`, Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": randomBytes(16).toString("base64"), "Sec-WebSocket-Version": "13", ...headers })
+      .map(([k, v]) => `${k}: ${v}`)
+      .join("\r\n");
+    s.write(`GET ${path} HTTP/1.1\r\n${h}\r\n\r\n`);
+    setTimeout(() => reject(new Error("upgrade timeout")), 5000);
+  });
+}
+
+async function floodAfterClose(st, ms) {
+  let sent = 0;
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms && !st.ended) {
+    st.s.write(rawFrame(`x${sent}`));
+    if (++sent % 50 === 0) await sleep(5);
+  }
+  return sent;
+}
 // ---------------------------------------------------------------------------
 
 async function devLogin(base, user) {
@@ -670,6 +733,51 @@ async function main() {
   });
   await waitFor(() => daemon2.exitCode !== null, { timeout: 15_000, what: "revoked daemon to give up" });
   check("a revoked token cannot reconnect", daemon2.exitCode === 3 && /revoked/.test(daemon2.output), daemon2.output.slice(-300));
+
+  // --- clients that ignore the server's close frame (Phase 3 review round 4) ----------------
+  logStep("raw clients ignoring close frames");
+  {
+    const st = await (await fetch(`${base}/api/pair/start`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json();
+    const waitPath = `/api/pair/wait?code=${st.code}&pairing_id=${st.pairing_id}`;
+    const auth = { Authorization: `Bearer ${st.poll_secret}` };
+    const a = await rawWs(base, waitPath, auth);
+    await waitFor(() => a.frames.some((f) => f.includes('"pending"')), { what: "pending on raw wait" });
+    a.s.write(rawFrame("junk"));
+    await waitFor(() => a.closed, { what: "worker closes the raw wait socket" });
+    check("the Worker closes a pairing wait socket on an unexpected frame (1008)", a.closed.code === 1008, JSON.stringify(a.closed));
+    const sent = await floodAfterClose(a, 2000);
+    logStep(`raw pairing client sent ${sent} frames after the close; its TCP connection ended: ${a.ended}`);
+    // A late frame "claimed" on that socket must do nothing: it never reaches the Pairing DO.
+    const frank = await devLogin(base, "frank");
+    const ap = await api(base, frank, "/api/pair/approve", { method: "POST", body: JSON.stringify({ code: st.code }) });
+    if (!a.ended) a.s.write(rawFrame("claimed"));
+    await sleep(500);
+    const b = await rawWs(base, waitPath, auth);
+    await waitFor(() => b.frames.length > 0 || b.closed, { what: "second wait answer" });
+    check(
+      "frames after the close (even 'claimed') never reach the Pairing DO: the approved token is still waiting",
+      ap.ok && b.status === 101 && b.frames.some((f) => f.includes('"approved"')),
+      JSON.stringify({ approve: ap.status, status: b.status, frames: b.frames.map((f) => f.slice(0, 30)) }),
+    );
+    const claimed = await fetch(`${base}/api/pair/claim?code=${st.code}&pairing_id=${st.pairing_id}`, { method: "POST", headers: auth });
+    await waitFor(() => b.closed || b.ended, { what: "wait socket closed after claim" });
+    check("claiming over HTTP (poll secret) ends the pairing and closes the wait socket", claimed.ok && (b.closed?.code ?? 1000) === 1000, String(claimed.status));
+    a.s.destroy();
+    b.s.destroy();
+
+    // Hub: a phone that floods into a 4029 close and keeps sending is ignored; the account keeps working.
+    const grace = await devLogin(base, "grace");
+    const ph = await rawWs(base, "/api/ws", { Cookie: grace, Origin: base });
+    await waitFor(() => ph.frames.some((f) => f.includes('"state"')), { what: "raw phone state" });
+    for (let i = 0; i < 80 && !ph.closed; i++) ph.s.write(rawFrame('{"t":"refresh"}'));
+    await waitFor(() => ph.closed, { what: "4029 for the flooding phone" });
+    check("a flooding phone is closed with 4029", ph.closed.code === 4029, JSON.stringify(ph.closed));
+    const sentHub = await floodAfterClose(ph, 2000);
+    logStep(`raw phone client sent ${sentHub} frames after the 4029; its TCP connection ended: ${ph.ended}`);
+    ph.s.destroy();
+    const ok = await (await api(base, grace, "/api/state")).json();
+    check("the flooded account still answers (frames after the close were dropped)", Array.isArray(ok.sessions), JSON.stringify(ok).slice(0, 200));
+  }
 
   // --- unauthenticated abuse protection (Phase 3) -------------------------------------------
   logStep("pairing-start throttle");

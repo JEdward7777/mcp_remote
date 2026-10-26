@@ -19,7 +19,8 @@ HTTP surface:
 | `GET /api/usage` | cookie | this account's usage per UTC day (last 35 days) |
 | `DELETE /api/machines/:id` | cookie + Origin | revoke a machine (closes its socket) |
 | `POST /api/pair/start` | - (throttled per IP) | daemon starts pairing: `{code, pairing_id, poll_secret, expires_at}` |
-| `GET /api/pair/wait` (WebSocket) | poll secret | daemon waits for approval |
+| `GET /api/pair/wait` (WebSocket) | poll secret | daemon waits for approval (socket held by the Worker; any frame but `ping` closes it) |
+| `POST /api/pair/claim` | poll secret | daemon saved its token: the pairing is forgotten |
 | `POST /api/pair/approve` | cookie + Origin | phone approves `{code, machine_name?}` |
 | `GET /api/ws` (WebSocket) | cookie + Origin | phone socket |
 | `GET /api/daemon/ws` (WebSocket) | machine token | daemon socket |

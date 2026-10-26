@@ -682,14 +682,16 @@ describe("per-tenant limits in the Hub (D10)", () => {
     expect(afterHello).toBeLessThan(1000);
     const left = () => withHub(u, (_h, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages").one().n);
     expect(await left()).toBeGreaterThan(9000);
-    // A removed id can't come back while its rows are still there; its history stays empty meanwhile.
-    d.send({ t: "session_up", session: { session_id: "old0", project: "p" } });
-    const refused = await waitFor(() => d.frames.find((f) => f.t === "error" && f.session_id === "old0"), "refused while cleaning");
-    expect(refused.error).toMatch(/was just removed and its history is still being deleted/);
+    // History of a removed session is empty while its rows wait for cleanup.
     const p = await phone(u);
-    p.send({ t: "history", session_id: "old0" });
-    const h = await waitFor(() => p.frames.find((f) => f.t === "history" && f.session_id === "old0"), "history");
+    p.send({ t: "history", session_id: "old7" });
+    const h = await waitFor(() => p.frames.find((f) => f.t === "history" && f.session_id === "old7"), "history");
     expect(h.messages).toEqual([]);
+    // Announcing a removed id again finishes its cleanup in that same event, then accepts it, empty.
+    d.send({ t: "session_up", session: { session_id: "old0", project: "p" } });
+    await waitFor(() => last(p, "state")?.sessions.some((x: { session_id: string; online: boolean }) => x.session_id === "old0" && x.online), "old0 back");
+    expect(d.frames.find((f) => f.t === "error" && f.session_id === "old0")).toBeUndefined();
+    expect(await withHub(u, (_h, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages WHERE session_id = 'old0'").one().n)).toBe(0);
     // Each further frame deletes at most GC_BATCH rows; eventually all are gone and daemons are told to resync.
     for (let i = 0; i < 150 && (await left()) > 0; i++) {
       const w0 = (await today(u)).rows_written;
@@ -698,8 +700,114 @@ describe("per-tenant limits in the Hub (D10)", () => {
       expect((await today(u)).rows_written - w0).toBeLessThanOrEqual(GC_BATCH + 20);
     }
     expect(await left()).toBe(0);
-    await waitFor(() => d.frames.some((f) => f.t === "resync"), "resync after cleanup");
+    // The ids were removed by this daemon's own eviction and nobody asked for them: no resync needed.
+    expect(d.frames.some((f) => f.t === "resync")).toBe(false);
   }, 30_000);
+
+  it("a fixed session id re-announced after Forget on an idle account is accepted at once (round 4)", async () => {
+    const u = "gc-stable";
+    const { machineId, token } = await newMachine(u);
+    await withHub(u, (_hub, st) => {
+      const sql = st.storage.sql;
+      sql.exec("INSERT INTO sessions (session_id, machine_id, project, online, last_seen, created_at, msg_count) VALUES ('laptop-proj', ?, 'p', 0, 1, 1, 1000)", machineId);
+      for (let i = 0; i < 1000; i++) sql.exec("INSERT INTO messages (session_id, direction, text, created_at, delivered) VALUES ('laptop-proj', 'out', 'x', ?, 1)", i);
+    });
+    const d = await daemon(token);
+    await waitFor(() => last(d, "welcome"), "welcome");
+    d.send({ t: "hello", v: 1, sessions: [] });
+    const p = await phone(u);
+    await waitFor(() => last(p, "state"), "state");
+    p.send({ t: "forget_session", session_id: "laptop-proj" });
+    await waitFor(() => !last(p, "state")?.sessions.some((x: { session_id: string }) => x.session_id === "laptop-proj"), "forgotten");
+    d.send({ t: "session_up", session: { session_id: "laptop-proj", project: "p" } });
+    await waitFor(() => last(p, "state")?.sessions.some((x: { session_id: string; online: boolean }) => x.session_id === "laptop-proj" && x.online), "back");
+    expect(d.frames.find((f) => f.t === "error" && f.session_id === "laptop-proj")).toBeUndefined();
+    expect(await withHub(u, (_h, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages").one().n)).toBe(0);
+  });
+
+  it("history cleanup stops at half of today's rows-written budget (it never blocks the account)", async () => {
+    const u = "gc-half";
+    const { machineId, token } = await newMachine(u);
+    await withHub(u, (_hub, st) => {
+      const sql = st.storage.sql;
+      sql.exec("INSERT INTO sessions (session_id, machine_id, project, online, last_seen, created_at, msg_count) VALUES ('big', ?, 'p', 0, 1, 1, 600)", machineId);
+      for (let i = 0; i < 600; i++) sql.exec("INSERT INTO messages (session_id, direction, text, created_at, delivered) VALUES ('big', 'out', 'x', ?, 1)", i);
+    });
+    const d = await daemon(token);
+    await waitFor(() => last(d, "welcome"), "welcome");
+    const p = await phone(u);
+    await waitFor(() => last(p, "state"), "state");
+    await withHub(u, (hub) => {
+      hub.settleRows(Date.now());
+      const w = hub.meter.today(Date.now()).rows_written;
+      // Half of the budget is reached once ~250 more rows are written.
+      hub.limits = { ...hub.limits, daily: { ...hub.limits.daily, rows_written: 2 * (w + 250) } };
+    });
+    p.send({ t: "forget_session", session_id: "big" });
+    for (let i = 0; i < 10; i++) {
+      d.send({ t: "launches", launches: [] });
+      await sleep(20);
+    }
+    const t = await withHub(u, (hub) => {
+      hub.settleRows(Date.now());
+      return { w: hub.meter.today(Date.now()).rows_written, budget: hub.limits.daily.rows_written, blocked: hub.overBudget(Date.now()) };
+    });
+    expect(t.blocked).toBeNull();
+    expect(t.w).toBeLessThan(t.budget / 2 + GC_BATCH + 20);
+    const left = await withHub(u, (_h, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM messages").one().n);
+    expect(left).toBeGreaterThan(0); // paused, not finished
+    d.send({ t: "session_up", session: { session_id: "big", project: "p" } });
+    const e = await waitFor(() => d.frames.find((f) => f.t === "error" && f.session_id === "big"), "refused while paused");
+    expect(e.error).toMatch(/deleting its history is paused for today \(daily budget\); it is retried automatically/);
+  });
+
+  it("sends at most one resync per daemon per event", async () => {
+    const u = "resync-once";
+    const a = await newMachine(u, "a");
+    const b = await newMachine(u, "b");
+    const da = await daemon(a.token);
+    const db = await daemon(b.token);
+    await waitFor(() => last(da, "welcome") && last(db, "welcome"), "welcome");
+    await sleep(50);
+    da.frames.length = 0;
+    db.frames.length = 0;
+    // Many "an id became free" moments in one event (K cleanups, revokes, ...): one resync each.
+    await withHub(u, (hub) => {
+      for (let i = 0; i < 5; i++) hub.resyncDaemons();
+      hub.resyncDaemons(a.machineId);
+      hub.saveSnap(undefined, Date.now()); // end of the event
+    });
+    await sleep(100);
+    expect(db.frames.filter((f) => f.t === "resync").length).toBe(1);
+    expect(da.frames.filter((f) => f.t === "resync").length).toBe(1); // only some requests skipped A
+    // A request that skips A in every call of an event leaves A out.
+    await withHub(u, (hub) => {
+      hub.resyncDaemons(a.machineId);
+      hub.resyncDaemons(a.machineId);
+      hub.saveSnap(undefined, Date.now());
+    });
+    await sleep(100);
+    expect(da.frames.filter((f) => f.t === "resync").length).toBe(1);
+    expect(db.frames.filter((f) => f.t === "resync").length).toBe(2);
+  });
+
+  it("frames on a socket the Hub already closed are dropped before any work (client ignoring 4029)", async () => {
+    const u = "ignore-close";
+    const { p } = await setup(u);
+    const r = await withHub(u, async (hub, st) => {
+      const ws = st.getWebSockets("phone")[0]!;
+      hub.shut(ws, 4029, "rate limited: too many requests; retry in 60s");
+      const stmts: string[] = [];
+      const real = hub.sql;
+      hub.sql = { exec: (q: string, ...a: unknown[]) => (stmts.push(q), real.exec(q, ...a)) };
+      const before = hub.meter.today(Date.now()).frames;
+      for (let i = 0; i < 100; i++) await hub.webSocketMessage(ws, JSON.stringify({ t: "refresh" }));
+      hub.sql = real;
+      return { stmts: stmts.length, dropped: hub.droppedFrames, frames: hub.meter.today(Date.now()).frames - before };
+    });
+    expect(r).toEqual({ stmts: 0, dropped: 100, frames: 0 });
+    void p;
+  });
 
   it("re-checks the daily budget between sessions of one hello", async () => {
     const { d } = await setup("hello-budget");
@@ -859,16 +967,20 @@ describe("pairing abuse protection", () => {
     expect(x.rowsWritten).toBeLessThanOrEqual(3);
   });
 
-  it("a 'claimed' flood on a pairing wait socket reads storage once and closes the socket (1008)", async () => {
+  it("client frames on a pairing wait socket never reach the Pairing DO (the Worker closes on the first)", async () => {
     const r0 = await SELF.fetch(`${ORIGIN}/api/pair/start`, {
       method: "POST",
       headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.77" },
       body: "{}",
     });
     const s0 = (await r0.json()) as { code: string; pairing_id: string; poll_secret: string };
-    const w = await connect(`/api/pair/wait?code=${s0.code}&pairing_id=${s0.pairing_id}`, { authorization: `Bearer ${s0.poll_secret}` });
-    if (typeof w === "number") throw new Error(`wait refused: ${w} ${JSON.stringify(s0)}`);
+    const q = `?code=${s0.code}&pairing_id=${s0.pairing_id}`;
+    const w = await connect(`/api/pair/wait${q}`, { authorization: `Bearer ${s0.poll_secret}` });
+    if (typeof w === "number") throw new Error(`wait refused: ${w}`);
     await waitFor(() => w.frames.find((f) => f.t === "pending"), "pending");
+    // Keepalive is answered by the Worker (at most one per 5 s), not by the DO.
+    w.ws.send("ping");
+    await sleep(100);
     for (let i = 0; i < 300; i++) {
       try {
         w.ws.send("claimed");
@@ -878,20 +990,21 @@ describe("pairing abuse protection", () => {
     }
     await waitFor(() => w.closed, "closed");
     expect(w.closed!.code).toBe(1008);
-    await sleep(500);
+    await sleep(300);
     const stub = E.PAIRING.get(E.PAIRING.idFromName(`pair:${s0.code.replace("-", "")}`));
-    const handled = await runInDurableObject(stub, (p: { framesHandled: number }) => p.framesHandled);
-    // The first frame closes the socket. Frames the client had already sent are still delivered by local
-    // workerd (each only reads the socket attachment: no storage read, no write); see SETUP "Verify at the desk".
-    expect(handled).toBeLessThanOrEqual(301);
-    expect(await runInDurableObject(stub, (p: { storageReads: number }) => p.storageReads)).toBeLessThanOrEqual(1);
-    // Any other frame closes too.
-    const w2 = await connect(`/api/pair/wait?code=${s0.code}&pairing_id=${s0.pairing_id}`, { authorization: `Bearer ${s0.poll_secret}` });
+    expect(await runInDurableObject(stub, (p: { framesHandled: number }) => p.framesHandled)).toBe(0);
+    expect(await runInDurableObject(stub, (p: { storageReads: number }) => p.storageReads)).toBe(0);
+    // A frame "claimed" never claims: the pairing is still there and can be approved and waited on.
+    const w2 = await connect(`/api/pair/wait${q}`, { authorization: `Bearer ${s0.poll_secret}` });
     if (typeof w2 === "number") throw new Error(String(w2));
     await waitFor(() => w2.frames.find((f) => f.t === "pending"), "pending 2");
+    // Claim before approval is refused (409), and still nothing reached webSocketMessage.
+    const early = await SELF.fetch(`${ORIGIN}/api/pair/claim${q}`, { method: "POST", headers: { authorization: `Bearer ${s0.poll_secret}` } });
+    expect(early.status).toBe(409);
     w2.ws.send("hello?");
-    await waitFor(() => w2.closed, "closed 2", 10_000);
+    await waitFor(() => w2.closed, "closed 2");
     expect(w2.closed!.code).toBe(1008);
+    expect(await runInDurableObject(stub, (p: { framesHandled: number }) => p.framesHandled)).toBe(0);
   });
 
   it("uses the optional Rate Limiting binding first when configured", async () => {

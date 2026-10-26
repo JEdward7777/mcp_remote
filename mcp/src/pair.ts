@@ -58,6 +58,11 @@ export async function pair(
       });
     };
     const result = await waitOnce(url, start, persist);
+    if (result !== "retry" && result.t === "approved" && saved) {
+      // Tell the server the token is saved (an authenticated POST, not a socket frame), so the pending
+      // pairing is forgotten. If this fails, nothing breaks: the machine is kept once the daemon connects.
+      await claim(url, start);
+    }
     if (result === "retry") {
       const d = backoffDelay(attempt++, { baseMs: 1000, capMs: 30_000 });
       await new Promise((res) => setTimeout(res, d));
@@ -68,6 +73,22 @@ export async function pair(
       return { configPath: saved, machine_id: result.machine_id, machine_name: result.machine_name, account: result.account };
     }
   }
+}
+
+async function claim(url: string, start: PairStartResponse): Promise<void> {
+  const u = new URL(`${url}/api/pair/claim`);
+  u.searchParams.set("code", start.code);
+  u.searchParams.set("pairing_id", start.pairing_id);
+  for (let i = 0; i < 3; i++) {
+    try {
+      const r = await fetch(u, { method: "POST", headers: { authorization: `Bearer ${start.poll_secret}` } });
+      if (r.ok || r.status === 404) return; // 404: already gone (expired or claimed)
+    } catch {
+      /* network: retry */
+    }
+    await new Promise((res) => setTimeout(res, 1000 * (i + 1)));
+  }
+  log("could not confirm the pairing to the server; it is cleaned up when it expires (the machine stays once the daemon connects)");
 }
 
 /** One WebSocket wait. Resolves with the final result, or "retry" if the socket dropped. */
@@ -111,7 +132,6 @@ function waitOnce(
           reject(new Error(`approved, but could not save the config (${e instanceof Error ? e.message : e}); run pair again`));
           return;
         }
-        ws.send("claimed");
       }
       setTimeout(() => ws.close(), 200);
       finish(r.value);

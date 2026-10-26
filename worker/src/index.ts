@@ -247,6 +247,89 @@ function signInError(message: string, cookie: string, status = 400): Response {
 }
 
 // ---------------------------------------------------------------------------
+// Pairing wait socket (Phase 3 review round 4)
+
+/** code / pairing_id from the query, poll secret from Authorization; validated without any DO. */
+function pairingParams(request: Request, url: URL): { code: string; pairingId: string; authz: string } | Response {
+  const code = normalizeCode(url.searchParams.get("code") ?? "");
+  if (!code) return err(400, "bad code");
+  const pairingId = url.searchParams.get("pairing_id") ?? "";
+  const authz = request.headers.get("authorization") ?? "";
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(pairingId) || !/^Bearer [A-Za-z0-9_-]{16,128}$/.test(authz)) {
+    return err(400, "bad pairing request");
+  }
+  return { code, pairingId, authz };
+}
+
+/** At most one keepalive "ping" per this interval is answered; anything else closes the socket. */
+const PAIR_PING_MIN_GAP_MS = 5_000;
+
+/**
+ * The daemon's wait socket is accepted by the Worker itself, never by the Pairing DO: client frames
+ * then cost only this invocation's CPU (and the CPU limit ends a flood), not a DO request each. The
+ * Worker holds its own link to the DO (a hibernatable WebSocket on the DO's side, so the DO sleeps
+ * while it waits) and only forwards what the DO sends: "pending", "approved" or "expired".
+ */
+export function relayPairingWait(link: WebSocket): Response {
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
+  link.accept();
+  let lastPing = 0;
+  let done = false;
+  const shut = (code: number, reason: string) => {
+    if (done) return;
+    done = true;
+    server.removeEventListener("message", onClient);
+    try {
+      server.close(code, reason);
+    } catch {
+      /* already closed */
+    }
+    try {
+      link.close(1000, "client gone");
+    } catch {
+      /* already closed */
+    }
+  };
+  const onClient = (ev: MessageEvent) => {
+    if (ev.data === "ping" && Date.now() - lastPing >= PAIR_PING_MIN_GAP_MS) {
+      lastPing = Date.now();
+      try {
+        server.send("pong");
+      } catch {
+        /* closing */
+      }
+      return;
+    }
+    // "claimed" is an HTTP POST now; nothing else is expected from the daemon.
+    shut(1008, "unexpected frame");
+  };
+  server.addEventListener("message", onClient);
+  server.addEventListener("close", () => shut(1000, "bye"));
+  server.addEventListener("error", () => shut(1011, "error"));
+  link.addEventListener("message", (ev) => {
+    try {
+      server.send(ev.data as string);
+    } catch {
+      /* client gone */
+    }
+  });
+  link.addEventListener("close", (ev) => {
+    if (done) return;
+    done = true;
+    server.removeEventListener("message", onClient);
+    try {
+      server.close(ev.code === 1005 || ev.code === 1006 ? 1000 : ev.code, ev.reason);
+    } catch {
+      /* already closed */
+    }
+  });
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+// ---------------------------------------------------------------------------
 
 async function handleApi(request: Request, env: Env, url: URL): Promise<Response> {
   const path = url.pathname;
@@ -280,23 +363,28 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   if (path === "/api/pair/wait") {
     // Everything that can be checked without the Pairing DO is checked first.
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return err(426, "expected websocket");
-    const code = normalizeCode(url.searchParams.get("code") ?? "");
-    if (!code) return err(400, "bad code");
-    const pid = url.searchParams.get("pairing_id") ?? "";
-    const authz = request.headers.get("authorization") ?? "";
-    if (!/^[A-Za-z0-9_-]{16,64}$/.test(pid) || !/^Bearer [A-Za-z0-9_-]{16,128}$/.test(authz)) {
-      return err(400, "bad pairing request");
-    }
+    const p = pairingParams(request, url);
+    if (p instanceof Response) return p;
     const w = localHit(`pw:${clientKey(request)}`, publicLimits(env as unknown as Record<string, unknown>).pair_wait_ip);
     if (!w.ok) return tooMany(w.retryAfterMs, "too many pairing requests from your network");
-    const stub = env.PAIRING.get(env.PAIRING.idFromName(`pair:${code}`));
-    const fwd = new Request(`https://pairing/wait?pairing_id=${encodeURIComponent(url.searchParams.get("pairing_id") ?? "")}`, {
-      headers: {
-        upgrade: request.headers.get("upgrade") ?? "",
-        authorization: request.headers.get("authorization") ?? "",
-      },
-    });
-    return stub.fetch(fwd);
+    const stub = env.PAIRING.get(env.PAIRING.idFromName(`pair:${p.code}`));
+    const upstream = await stub.fetch(
+      new Request(`https://pairing/wait?pairing_id=${encodeURIComponent(p.pairingId)}`, {
+        headers: { upgrade: "websocket", authorization: p.authz },
+      }),
+    );
+    if (!upstream.webSocket) return upstream; // 404 unknown/expired, wrong secret
+    return relayPairingWait(upstream.webSocket);
+  }
+
+  if (path === "/api/pair/claim" && request.method === "POST") {
+    // The daemon saved its token: the pairing can be forgotten (authenticated by the poll secret).
+    const p = pairingParams(request, url);
+    if (p instanceof Response) return p;
+    const w = localHit(`pw:${clientKey(request)}`, publicLimits(env as unknown as Record<string, unknown>).pair_wait_ip);
+    if (!w.ok) return tooMany(w.retryAfterMs, "too many pairing requests from your network");
+    const r = await env.PAIRING.get(env.PAIRING.idFromName(`pair:${p.code}`)).claim(p.pairingId, p.authz.slice(7));
+    return r.ok ? json({ ok: true }) : err(r.status, r.error);
   }
 
   if (path === "/api/daemon/ws") {
