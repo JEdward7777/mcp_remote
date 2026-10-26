@@ -112,7 +112,8 @@ export const SERVICE_ENV_TEMPLATE = `# Environment for the mcp-remote daemon and
 # Put secrets and shell-only settings here, not in the service unit/plist.
 # Syntax: KEY=value or export KEY=value, one per line; # starts a comment (also after an unquoted value).
 # 'single quotes' are literal; "double quotes" and unquoted values expand $VAR and \${VAR} from the daemon's
-# environment and earlier lines (e.g. PATH="$HOME/.local/bin:$PATH"). No other shell syntax ($(...), escapes).
+# environment and earlier lines (e.g. PATH="$HOME/.local/bin:$PATH"). Lines with other shell syntax ($(...),
+# backticks, backslashes, \${VAR:-default}) are skipped with a warning.
 # HOME, XDG_CONFIG_HOME, APPDATA, USERPROFILE, MCP_REMOTE_CONFIG_DIR and MCP_REMOTE_SOCKET are ignored here.
 # Examples:
 #   CLAUDE_CODE_OAUTH_TOKEN=...        (from \`claude setup-token\`)
@@ -136,12 +137,15 @@ export const SERVICE_ENV_BLOCKED = ["MCP_REMOTE_CONFIG_DIR", "MCP_REMOTE_SOCKET"
 /**
  * Parse one service.env value: 'single quotes' are literal; "double quotes" and unquoted values expand
  * $VAR / ${VAR} from `env`; an unquoted value ends at " #" (inline comment). Undefined variables expand
- * to "". Returns null for a value this small parser can't read (unterminated quote, trailing text).
+ * to "". Returns null for anything else that is shell syntax (command substitution, backticks, backslashes,
+ * ${VAR:-x} and other ${...} forms, an unterminated quote, trailing text), so the line is skipped with a warning.
  */
 export function parseEnvValue(raw: string, env: NodeJS.ProcessEnv): string | null {
   const expand = (t: string) =>
     t.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g, (_m, a: string | undefined, b: string | undefined) => env[a ?? b ?? ""] ?? "");
   const v = raw.trim();
+  // Any ${...} other than exactly ${NAME} (e.g. ${VAR:-x}) is shell syntax this parser doesn't implement.
+  const badBraces = (t: string) => /\$\{(?![A-Za-z_][A-Za-z0-9_]*\})/.test(t);
   if (v.startsWith("'")) {
     const end = v.indexOf("'", 1);
     if (end < 0 || !/^\s*(#.*)?$/.test(v.slice(end + 1))) return null;
@@ -150,10 +154,12 @@ export function parseEnvValue(raw: string, env: NodeJS.ProcessEnv): string | nul
   if (v.startsWith('"')) {
     const end = v.indexOf('"', 1);
     if (end < 0 || !/^\s*(#.*)?$/.test(v.slice(end + 1))) return null;
-    return expand(v.slice(1, end));
+    const inner = v.slice(1, end);
+    if (/[`\\]/.test(inner) || inner.includes("$(") || badBraces(inner)) return null;
+    return expand(inner);
   }
   const unquoted = v.replace(/\s+#.*$/, "");
-  if (/["'`\\]/.test(unquoted) || /\$\(/.test(unquoted)) return null; // shell syntax we don't support
+  if (/["'`\\]/.test(unquoted) || /\$\(/.test(unquoted) || badBraces(unquoted)) return null; // shell syntax we don't support
   return expand(unquoted);
 }
 

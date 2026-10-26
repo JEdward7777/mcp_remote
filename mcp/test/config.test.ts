@@ -110,6 +110,12 @@ describe("service.env syntax and safety (round-7 findings)", () => {
     expect(parseEnvValue("$UNSET_VAR_X", env)).toBe("");
     expect(parseEnvValue("tok-123", env)).toBe("tok-123");
     for (const bad of ['"unterminated', "'x' trailing", "$(whoami)", "a\\b", "`id`"]) expect(parseEnvValue(bad, env)).toBeNull();
+    // Round 8: inside double quotes too, and any ${...} that isn't exactly ${NAME}.
+    for (const bad of ['"$(cat ~/.tok)"', '"`cat ~/.tok`"', '"a\\nb"', '"${VAR:-x}"', "${PATH:-/bin}", "${PATH#/usr}", '"${}"', "${1}"]) {
+      expect(parseEnvValue(bad, env), bad).toBeNull();
+    }
+    expect(parseEnvValue('"${HOME}/$PATH"', env)).toBe("/home/you//usr/bin:/bin");
+    expect(parseEnvValue("'${VAR:-x} $(y) `z`'", env)).toBe("${VAR:-x} $(y) `z`"); // literal in single quotes
   });
 
   it("applies expansion when loading, line by line", () => {

@@ -649,4 +649,26 @@ describe("launcher", () => {
     await waitFor(() => rec(l, a.launch_id).state === "exited" && tmux.spawns.length === 3, "exited again");
     await waitFor(() => /restart without resume/.test(rec(l, a.launch_id).detail ?? ""), "recognized");
   });
+
+  it("reports a --continue that hit a background-session conversation clearly and does not auto-retry it (round-8 nit)", async () => {
+    const l = make({ restartBaseMs: 20 });
+    await l.init();
+    const a = (await l.launch(alphaId(), { continue: true, auto_restart: true })) as { launch_id: string };
+    tmux.die(
+      a.launch_id,
+      1,
+      "Your most recent conversation is running in the background (session 1234). Use `claude agents` to find and attach to it, or `claude --resume` to pick another session.",
+    );
+    await waitFor(() => rec(l, a.launch_id).state === "exited", "exited");
+    expect(rec(l, a.launch_id).detail).toMatch(/background session.*claude agents.*Restart for a new conversation/);
+    await sleep(200);
+    expect(tmux.spawns).toHaveLength(1);
+    // Same for the "moved to a background session" variant.
+    await l.restart(a.launch_id, true);
+    tmux.die(a.launch_id, 1, "Your most recent conversation moved to a background session (abcd) registered from another machine or container, so this one can't tell whether it is still running.");
+    await waitFor(() => rec(l, a.launch_id).state === "exited" && tmux.spawns.length === 2, "exited 2");
+    await sleep(200);
+    expect(tmux.spawns).toHaveLength(2);
+    expect(rec(l, a.launch_id).detail).toMatch(/background session/);
+  });
 });

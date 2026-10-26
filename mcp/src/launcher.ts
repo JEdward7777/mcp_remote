@@ -25,7 +25,7 @@ import {
   backoffDelay,
 } from "@mcp-remote/shared";
 import { configDir, ensureConfigDir } from "./config";
-import { DEV_CHANNELS_KEYS, NO_CONVERSATION, attentionText, autoAcceptable, detectDialog, lastLine } from "./dialogs";
+import { BACKGROUND_CONVERSATION, DEV_CHANNELS_KEYS, NO_CONVERSATION, attentionText, autoAcceptable, detectDialog, lastLine } from "./dialogs";
 import { type LaunchConfig, defaultLaunchConfig, findProject, resolveProjects } from "./launch-config";
 import { log } from "./log";
 import { type ExitRecord, exitCodeOf } from "./run-claude";
@@ -767,6 +767,7 @@ export class Launcher {
       return;
     }
     let detail: string | null;
+    let noRetry = false;
     // Startup failures can only come from a spawn that never got as far as its shim; a session that ran
     // could have printed these words itself (e.g. Claude quoting them).
     const startupExit = !e.spawnLinked;
@@ -779,6 +780,11 @@ export class Launcher {
       detail = !e.forking
         ? "No conversation to resume for this session yet (nothing was said in it); restart without resume"
         : "No earlier conversation in this folder to continue; restart without resume";
+    } else if (startupExit && e.continued && BACKGROUND_CONVERSATION.test(screen)) {
+      noRetry = true;
+      detail =
+        "The folder's most recent conversation is running in a Claude Code background session, so it can't be " +
+        "resumed here. Attach to it at the desk (`claude agents`), or use Restart for a new conversation";
     } else if (startupExit && /cannot be used with root\/sudo/.test(screen)) {
       detail = "Claude Code refuses bypassPermissions when running as root (mcp-remote config set permission-mode ...)";
     } else if (vanished) {
@@ -788,7 +794,7 @@ export class Launcher {
     }
     log(`${e.launch_id} (${e.project}) exited${status !== null ? ` with code ${status}` : ""}`);
     const crashed = !vanished && status !== 0;
-    if (e.auto_restart && crashed) {
+    if (e.auto_restart && crashed && !noRetry) {
       if (Date.now() - e.spawned_at > STABLE_RUN_MS) e.restarts = 0;
       if (e.restarts >= MAX_AUTO_RESTARTS) {
         this.set(e, {

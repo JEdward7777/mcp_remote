@@ -116,7 +116,7 @@ mcp-remote install-service          # --dry-run prints the file instead; --no-st
 
 - **Linux**: writes `~/.config/systemd/user/mcp-remote.service` with absolute paths to node and the CLI (systemd's
   minimal PATH can't find an nvm/fnm/volta node), your current `PATH` (so `claude` and `tmux` are found),
-  `Restart=on-failure`, `RestartPreventExitStatus=3 4` and `KillMode=process`, then runs
+  `Restart=on-failure`, `RestartPreventExitStatus=3 4 5` and `KillMode=process`, then runs
   `systemctl --user daemon-reload && systemctl --user enable --now mcp-remote`.
   Logs: `journalctl --user -u mcp-remote -f`. For an always-on desktop that you are not logged in to:
   `loginctl enable-linger $USER`. Re-run `install-service` after upgrading node (the path changes).
@@ -314,6 +314,9 @@ exit) with growing delays, resuming the conversation, and gives up after 5 crash
   folder": the folder has no conversation at all yet. A "resume last conversation" launch that was stopped before
   anything was said is handled for you: **Restart + resume** forks the folder's conversation again (if Claude
   Code had no record of it after all, the next **Restart + resume** does the same).
+- "The folder's most recent conversation is running in a Claude Code background session": "resume last
+  conversation" found it in `claude agents` (background sessions); attach to it at the desk, or use **Restart**.
+  This is never retried automatically.
 - A launched session that never comes up although Claude Code runs: the detail line shows if the daemon refused
   its shim (daemon log: `refused shim for mr-...`). `claude` behind wrappers (Volta, npm's wrapper, scripts) is fine.
   Register the shim with `mcp-remote setup-claude` (absolute node + CLI paths); an `npx`-style registration or a

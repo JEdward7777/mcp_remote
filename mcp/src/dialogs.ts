@@ -109,3 +109,10 @@ export function lastLine(screen: string, max = 200): string | null {
 
 /** `--continue`: "No conversation found to continue"; `--resume <id>`: "No conversation found with session ID: <id>" (2.1.310). */
 export const NO_CONVERSATION = /No conversation found (to continue|with session ID)/;
+
+/**
+ * `--continue` when the folder's most recent conversation lives in a background agent session (2.1.310):
+ * "Your most recent conversation is running in the background (session …)" or "… moved to a background
+ * session (…) registered from another machine or container …". Retrying can't help.
+ */
+export const BACKGROUND_CONVERSATION = /Your most recent conversation (is running in the background|moved to a background session)/;
