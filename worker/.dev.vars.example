@@ -5,3 +5,7 @@ SESSION_SECRET=change-me-change-me-change-me-change-me
 DEV_AUTH=1
 # Only needed to test real Google sign-in locally.
 GOOGLE_CLIENT_SECRET=
+# Web Push (optional locally): run `npm run vapid` and paste its two lines here.
+# VAPID_PUBLIC_KEY=
+# VAPID_PRIVATE_KEY=
+# VAPID_SUBJECT=mailto:you@example.com

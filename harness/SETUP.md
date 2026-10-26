@@ -61,6 +61,21 @@ npx wrangler secret put GOOGLE_CLIENT_SECRET                       # paste the c
 npx wrangler secret put ALLOWED_EMAILS                             # e.g. you@gmail.com,friend@gmail.com
 ```
 
+Web Push (phone notifications, Phase 4) needs a VAPID key pair. Generate it on your computer (WebCrypto,
+offline, nothing is written to disk) and store it as secrets:
+
+```sh
+npm run vapid                                    # from the repo root: prints VAPID_PUBLIC_KEY=... / VAPID_PRIVATE_KEY=...
+cd worker
+npx wrangler secret put VAPID_PUBLIC_KEY         # paste the public key
+npx wrangler secret put VAPID_PRIVATE_KEY        # paste the private key (keep it secret, never commit it)
+npx wrangler secret put VAPID_SUBJECT            # optional: mailto:you@example.com (default: the app's own URL)
+```
+
+Without these keys everything else works; the phone's Settings say "Notifications are not set up on the
+server". Replacing the keys later invalidates every phone's subscription: each phone re-registers by itself the
+next time the app is opened (until then it gets no notifications).
+
 Gating is re-checked on every request: removing an email from `ALLOWED_EMAILS` (or setting `OPEN_SIGNUP` back to
 `false`) signs that person out immediately and refuses their daemons the next time they connect (an already open
 daemon socket stays up until it reconnects; revoke the machine to cut it at once).
@@ -83,7 +98,22 @@ Open `$URL` on the desktop browser, sign in with Google; you should see an empty
 
 ## 8. Phone
 
-Open `$URL` in Chrome on Android, sign in, then menu -> **Add to Home screen** (installs the PWA).
+Open `$URL` in Chrome on Android and sign in. Then:
+
+1. **Install**: Chrome menu (⋮) -> **Install app** / **Add to Home screen** (or **Settings -> Install app**
+   in the app when Chrome offers it). The app gets its own icon (adaptive/maskable on Android 8+) and opens
+   full screen. It also opens offline (showing "You are offline"), from the service worker's cache; when a new
+   version is deployed, a banner says "A new version of the app is available" with **Reload**.
+2. **Notifications**: in the app, **Settings -> Notifications on this phone -> Turn on**, and allow
+   notifications when Chrome asks. Up to 5 phones/browsers per account can be registered (a 6th replaces the
+   oldest). "Show the first words of a message in notifications" (on by default) puts the project name and up to
+   100 characters of the message in the notification, which Android also shows on the lock screen; turn it off
+   to get just "New message from a session". If you blocked notifications earlier: Chrome -> site settings (lock
+   icon in the address bar, or Android Settings -> Apps -> Chrome -> Notifications) -> allow, then **Turn on**
+   again. Android's own per-app settings (Settings -> Apps -> mcp remote -> Notifications) can also silence them.
+3. **Location** (optional): nothing to set up. The first time a session asks and you tap **Share**, Chrome asks
+   for location permission for the site ("Allow only while using the app" is enough). To stop sessions from
+   asking at all: **Settings -> Location** off (this also deletes the stored last position).
 
 ## 9. Install the CLI on each computer
 
@@ -302,6 +332,54 @@ restart are never typed into. Auto-restart (off by default) restarts a crashed s
 exit) with growing delays, resuming the conversation, and gives up after 5 crashes in a row (a run longer than
 10 minutes resets the count); a clean exit or **Stop** is never restarted.
 
+## Notifications, location and map links (Phase 4)
+
+**When the phone is notified (D19).** A session's `send_message` urgency decides it:
+
+| urgency | in the app | notification (only while the app is not open) |
+| --- | --- | --- |
+| `silent` | shown | none (no push at all) |
+| `normal` | shown | yes; one per session (a newer message replaces it quietly) |
+| `urgent` | shown, vibrates | yes, high priority (`Urgency: high`), buzzes again and stays until dismissed |
+
+"The app is open" means a phone (or browser tab) is connected whose page is visible and showed a sign of life in
+the last 75 s (a message, or the keepalive ping that the runtime answers without waking the Hub). A hidden page
+tells the Hub so (one small frame), and so does a phone whose screen turns off; a phone that vanished without
+closing its socket stops counting after ~75 s. While no app is open, the Hub sends a Web Push to every
+registered phone itself (encrypted with the phone's keys, RFC 8291; signed with your VAPID key, RFC 8292;
+outbound `fetch` from the Hub, at most 5 s each, all phones in parallel, awaited inside the same event). Claude's
+tool result says what happened: "push notification sent to 1 phone", "the phone app is open, so it is shown
+there", "no notification: notifications are not enabled on any phone", or what the push service answered.
+
+Push services are only ever called for endpoints on the known Web Push hosts (FCM `fcm.googleapis.com` /
+`android.googleapis.com` for Chrome, Mozilla, Apple, Microsoft); other endpoints are refused when a phone
+registers. A `404`/`410` answer deletes that phone's registration (the app re-registers when next opened); `429`
+or `5xx` skips that phone for the `Retry-After` time (at least 1 min, at most 1 h) without retrying the message;
+other errors drop that notification (logged with the status, never the content). The payload holds only the
+session id, message id, urgency and, with the preview setting on, the project name and the first 100
+characters.
+
+**Location (D14).** `get_location` (in Claude) asks the phone; nothing is ever tracked in the background:
+
+- App open: a banner "*project* asks for your location: *reason*" with **Share** / **Not now**. Share reads the
+  position once (`navigator.geolocation`, high accuracy, 20 s) and sends it.
+- App not open: a high-priority notification "Claude wants your location" (the push service drops it if the phone
+  can't be reached within 2 min). Tapping it (or its **Share location** button) opens the app and shares once,
+  even later; **Not now** or ignoring it shares nothing.
+- Claude gets the position with its accuracy and age, or a clear reason: declined, location turned off,
+  no phone reachable, rate limited, or no answer within its timeout (default 60 s, at most 120 s; an answer that
+  comes later is kept as the last-known position for the next call).
+- A last-known position (at most `max_age_s` old, default 5 min) answers at once without asking again.
+- Storage: only the last position, only in your account's Hub, deleted after 6 hours or when you turn location
+  off; never written to any log. The phone list only learns *when* it was taken.
+- Calls that have to ask the phone are limited (free plan: 5 at once, 20 per hour, `LIMIT_LOCATION`).
+
+**Map links.** `map_link` builds a Google Maps link locally (no API key, no network): a pin, or directions
+(from a given origin, or from wherever the phone is when the link is opened). In messages, the app makes only
+Google Maps links (`https://www.google.com/maps/...`, `maps.google.com`, `maps.app.goo.gl`, `goo.gl/maps`) and
+`geo:` coordinates tappable; any other link stays plain text you can copy, so a session that read something
+malicious can't put a convincing tappable phishing link on your phone.
+
 ## Limits and the free plan (Phase 3)
 
 Everyone who signs up shares the deployer's free Cloudflare quota (D9), so every account gets its own limits,
@@ -380,8 +458,10 @@ bursts and loops; the daily budget above bounds the day.
 | Any phone frame | `60,60/min` | `LIMIT_PHONE_FRAMES` | socket closed with code 4029; the PWA waits the hinted time (at least 60 s) |
 | Any daemon frame (all computers together) | `200,120/min` | `LIMIT_DAEMON_FRAMES` | socket closed with 4029; the daemon waits the hinted time |
 | WebSocket connects (phones + daemons) | `20,10/min` | `LIMIT_CONNECTS` | phone: close 4029; daemon: HTTP 429 + `Retry-After` |
-| `/api/state`, `/api/machines`, `/api/usage`, revoke | `30,30/min` | `LIMIT_HTTP` | HTTP 429 + `Retry-After` |
+| `/api/state`, `/api/machines`, `/api/usage`, revoke, push (un)subscribe | `30,30/min` | `LIMIT_HTTP` | HTTP 429 + `Retry-After` |
 | Pairing approvals (right or wrong code) | `5,10/h` | `LIMIT_PAIR_APPROVE` | HTTP 429 "too many pairing approvals on this account; try again in N min" |
+| Web Push notifications per UTC day (each phone counts) | `200` | `DAILY_PUSH_CAP` | the message is still delivered in the app; Claude's result says "no notification: daily notification limit reached" |
+| `get_location` calls that ask the phone (cached answers are free) | `5,20/h` | `LIMIT_LOCATION` | result "Not asked: too many location requests ...; try again in ..." |
 
 Why 500 messages/day: a message costs about 1/20 of a request (inbound WebSocket frame), a few SQLite rows
 written (message row, its index entries, the session counter, the delivery ack) and a broadcast, so 500
@@ -503,8 +583,30 @@ named page and fix `worker/src/budget.ts` (and the defaults above) if it is wron
 - [ ] Close code / behavior clients see when a deploy restarts Durable Objects (we treat any close the same) —
       <https://developers.cloudflare.com/durable-objects/reference/durable-object-lifecycle/>
 
+Phase 4 (Web Push, PWA, location) adds these; `developers.cloudflare.com` was still unreachable:
+
+- [ ] Subrequests (outbound `fetch`) per invocation on the free plan: assumed 50 (a Hub event sends at most 5
+      pushes) — <https://developers.cloudflare.com/workers/platform/limits/#subrequests>
+- [ ] A Durable Object waiting on an outbound `fetch` is billed duration for that wall-clock time (we bound each
+      push at 5 s and cap pushes per day), and outbound fetches from a DO are not billed as DO requests —
+      <https://developers.cloudflare.com/durable-objects/platform/pricing/>
+- [ ] `ctx.getWebSocketAutoResponseTimestamp(ws)` is updated by every auto-answered `ping` in production (the
+      "app is open" check relies on it; verified in local workerd) —
+      <https://developers.cloudflare.com/durable-objects/api/state/>
+- [ ] Static asset requests (`/sw.js`, icons, the app shell) are free and don't count against the Workers request
+      limit on the free plan, and `_headers` applies to them (`Cache-Control: no-cache` on `/sw.js`) —
+      <https://developers.cloudflare.com/workers/static-assets/>
+- [ ] On a real Android phone (Chrome, installed PWA): install prompt and maskable icon crop; monochrome badge
+      in the status bar; a `normal` push shows a notification while the app is closed and none while it's open;
+      `urgent` buzzes again and stays (`requireInteraction`); tapping opens the right thread; the location
+      notification's tap shares once; offline start shows the cached app; the update banner appears after a
+      deploy.
+- [ ] FCM accepts our VAPID JWT + `aes128gcm` body (`201`), honors `Urgency: high` and `TTL`, and endpoints are
+      still on `fcm.googleapis.com` (the subscribe allowlist, `src/webpush.ts`). If Chrome hands out another
+      host, registration fails with "endpoint host ... is not a known Web Push service": add the host there.
+
 Also on the first `npx wrangler deploy` after Phase 3: it applies migration `v2` (new `Throttle` class);
-wrangler should say so.
+wrangler should say so. Phase 4 needs no migration (new tables are created by the Hub itself).
 
 ### Known gaps (for Phase 4b)
 
@@ -553,6 +655,14 @@ wrangler should say so.
   code": run `mcp-remote pair` again for a fresh code.
 - Daemon log "server is rate limiting this account's connections (HTTP 429 ...)": something reconnects in a
   loop (several daemons with one token, a phone tab reloading); it retries after the named time on its own.
+- No notifications: phone app -> Settings shows the state for this phone. "Not set up on the server": set the
+  VAPID secrets (step 5). "Blocked for this site": allow notifications in Chrome's site settings, then Turn on.
+  Claude's `send_message` result says why a message didn't notify (app open, silent, no phone registered, daily
+  limit, or the push service's answer). `wrangler tail` showing "push service rejected a notification (HTTP 403)"
+  usually means the VAPID keys changed: open the app on the phone once (it re-registers).
+- `get_location` keeps saying "No answer within ...": the phone didn't get or didn't tap the notification;
+  check notifications as above. "turned off": phone app -> Settings -> Location.
+- The app shows an old version: tap **Reload** on the "new version" banner (or close and reopen the app).
 - Worker logs: `cd worker && npx wrangler tail`.
 
 ## Local development (no Cloudflare/Google needed)

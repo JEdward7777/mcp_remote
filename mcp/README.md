@@ -7,7 +7,11 @@
   (`~/.config/mcp-remote/daemon.sock`, 0600; a per-user named pipe on Windows) for shims.
 - `mcp-remote shim` - stdio MCP server Claude Code spawns per session. Declares `claude/channel`; phone messages
   become `notifications/claude/channel` events (`meta`: `message_id`, `session_id`, `sent_at`); exposes
-  `send_message {text, urgency: silent|normal|urgent}`. Logs go to stderr only.
+  `send_message {text, urgency: silent|normal|urgent}` (silent = in the app only; normal = phone notification;
+  urgent = high-priority notification that stays), `get_location {reason, max_age_s?, timeout_s?}` (asks the
+  phone; the user confirms each time; returns position + accuracy + age or why not) and `map_link {destination |
+  lat+lon, directions?, origin? | origin_lat+origin_lon, mode?}` (a Google Maps URL, built locally). Logs go to
+  stderr only; positions are never logged.
 
 Remote launch (Phase 2, D6/D18):
 

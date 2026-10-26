@@ -2,10 +2,14 @@
 
 Cloudflare Worker (free plan): Google OAuth (D7), device pairing (D4), and one `Hub` Durable Object per user
 (D9) holding that user's machines, sessions, messages and WebSockets (Hibernation API, SQLite). Also serves the
-phone PWA from `public/` (bundled from `web/app.ts`).
+phone PWA from `public/` (bundled from `web/app.ts`; service worker from `sw/sw.ts`; icons rendered from
+`icons/icon.svg` by `scripts/icons.mjs`), and sends Web Push itself (`src/webpush.ts`, Phase 4).
+
+- `npm run icons -w worker` - re-render every icon from `icons/icon.svg` (`npm test` checks they match)
+- `npm run vapid` (repo root) - print a new VAPID key pair for Web Push
 
 - `npm run dev -w worker` - local dev on :8787 (needs `.dev.vars`, see `.dev.vars.example`)
-- `npm test -w worker` - tests inside workerd
+- `npm test -w worker` - tests inside workerd, plus node-side tests of the built service worker (`test-node/`)
 - Deploy: see `../harness/SETUP.md`
 
 HTTP surface:
@@ -22,6 +26,8 @@ HTTP surface:
 | `GET /api/pair/wait` (WebSocket) | poll secret | daemon waits for approval (socket held by the Worker; any frame but `ping` closes it) |
 | `POST /api/pair/claim` | poll secret | daemon saved its token: the pairing is forgotten |
 | `POST /api/pair/approve` | cookie + Origin | phone approves `{code, machine_name?}` |
+| `POST /api/push/subscribe` | cookie + Origin | register this phone's Web Push subscription (`PushSubscription.toJSON()`; known push services only; max 5 per account) |
+| `DELETE /api/push/subscribe` | cookie + Origin | `{endpoint}`: unregister it |
 | `GET /api/ws` (WebSocket) | cookie + Origin | phone socket |
 | `GET /api/daemon/ws` (WebSocket) | machine token | daemon socket |
 

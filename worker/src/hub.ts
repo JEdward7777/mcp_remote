@@ -45,6 +45,7 @@ import { type Bucket, Limiter, type LimiterSnapshot, take } from "./ratelimit";
 import { type PendingSnap, USAGE_ADDED_COLUMNS, USAGE_SCHEMA, type UsageDay, UsageMeter, msUntilUtcMidnight } from "./usage";
 import {
   type FetchLike,
+  type PushOutcome,
   type PushPayload,
   type VapidKeys,
   importVapidKeys,
@@ -77,6 +78,8 @@ interface PushJob {
   payload: PushPayload;
   ttl: number;
   urgency: "normal" | "high";
+  /** Called once with every device's outcome of this push (same callback for all its jobs). */
+  done?: (outcomes: PushOutcome[]) => void;
 }
 
 /** Result of an HTTP-facing RPC that is rate limited per tenant. */
@@ -122,6 +125,28 @@ type MessageRow = {
   created_at: number;
   delivered: number;
 };
+
+/** "push notification sent to 2 phones" / why not, from the push service's answers (tool results). */
+export function describePushOutcomes(outcomes: PushOutcome[]): string {
+  const ok = outcomes.filter((o) => o.kind === "ok").length;
+  const n = outcomes.length;
+  const phones = (k: number) => `${k} phone${k === 1 ? "" : "s"}`;
+  const why = outcomes
+    .filter((o) => o.kind !== "ok")
+    .map((o) =>
+      o.kind === "gone"
+        ? "a phone's subscription had expired and was removed"
+        : o.kind === "later"
+          ? `the push service is busy${o.status ? ` (HTTP ${o.status})` : " or unreachable"}`
+          : o.status === -1
+            ? "the server's VAPID keys are invalid"
+            : `the push service refused it (HTTP ${o.status})`,
+    );
+  const uniq = [...new Set(why)].join("; ");
+  if (ok === n) return `push notification sent to ${phones(n)}`;
+  if (ok === 0) return `no notification: ${uniq}`;
+  return `push notification sent to ${phones(ok)} of ${n} (${uniq})`;
+}
 
 /** History rows deleted per event for removed sessions (bounds what one frame can write). */
 export const GC_BATCH = 200;
@@ -914,7 +939,12 @@ export class Hub extends DurableObject<Env> {
    * Decide a push to every device of this account (sent at the end of the event, see drainPushes).
    * Returns a sentence for the tool result: whether / why not the user gets a notification.
    */
-  private queuePush(payload: PushPayload, opts: { ttl: number; urgency: "normal" | "high" }, now: number): { sent: number; text: string } {
+  private queuePush(
+    payload: PushPayload,
+    opts: { ttl: number; urgency: "normal" | "high" },
+    now: number,
+    done?: (outcomes: PushOutcome[]) => void,
+  ): { sent: number; text: string } {
     if (!pushConfigured(this.env)) return { sent: 0, text: "no notification: Web Push is not set up on the server (VAPID keys)" };
     const subs = this.pushSubs();
     if (!subs.length) return { sent: 0, text: "no notification: notifications are not enabled on any phone (phone app > Settings)" };
@@ -927,8 +957,8 @@ export class Hub extends DurableObject<Env> {
       };
     }
     this.meter.add("pushes", now, targets.length);
-    for (const sub of targets) this.pushQueue.push({ sub, payload, ...opts });
-    return { sent: targets.length, text: `notification sent to ${targets.length} phone${targets.length === 1 ? "" : "s"}` };
+    for (const sub of targets) this.pushQueue.push({ sub, payload, ...opts, ...(done ? { done } : {}) });
+    return { sent: targets.length, text: `notifying ${targets.length} phone${targets.length === 1 ? "" : "s"}` };
   }
 
   private vapidSubject(): string {
@@ -946,16 +976,32 @@ export class Hub extends DurableObject<Env> {
     const jobs = this.pushQueue.splice(0);
     if (!jobs.length) return;
     let keys: VapidKeys;
+    let results: PushOutcome[];
     try {
       keys = await importVapidKeys(this.env.VAPID_PUBLIC_KEY ?? "", this.env.VAPID_PRIVATE_KEY ?? "");
+      const subject = this.vapidSubject();
+      results = await Promise.all(
+        jobs.map((j) => sendPush(j.sub, j.payload, { keys, subject, ttl: j.ttl, urgency: j.urgency }, this.pushFetch)),
+      );
     } catch (e) {
       console.error(`Web Push disabled: ${e instanceof Error ? e.message : String(e)}`);
-      return;
+      results = jobs.map(() => ({ kind: "rejected", status: -1 }) as PushOutcome);
     }
-    const subject = this.vapidSubject();
-    const results = await Promise.all(
-      jobs.map((j) => sendPush(j.sub, j.payload, { keys, subject, ttl: j.ttl, urgency: j.urgency }, this.pushFetch)),
-    );
+    // Report each push's outcome to whoever queued it (e.g. the delayed "sent" of send_message).
+    const groups = new Map<(o: PushOutcome[]) => void, PushOutcome[]>();
+    jobs.forEach((j, i) => {
+      if (!j.done) return;
+      const g = groups.get(j.done) ?? [];
+      g.push(results[i]!);
+      groups.set(j.done, g);
+    });
+    for (const [done, outcomes] of groups) {
+      try {
+        done(outcomes);
+      } catch (e) {
+        console.error("push outcome callback failed", e);
+      }
+    }
     const now = Date.now();
     this.wake(now);
     this.settleRows(now);
@@ -1413,9 +1459,12 @@ export class Hub extends DurableObject<Env> {
         const row = this.insertMessage(f.session_id, "out", f.text, f.urgency, now, delivered).row;
         this.meter.add("messages", now);
         const msg = toMessage(row);
-        const notify = this.notifyMessage(msg, s.project, f.urgency, now);
-        this.sendDaemon(ws, { t: "sent", req_id: f.req_id, message_id: msg.id, notify });
         this.broadcastPhones({ t: "message", message: msg });
+        // The tool result says whether the user is notified; with a push, only once the push service
+        // answered (at the end of this event, at most PUSH_TIMEOUT_MS later).
+        const reply = (notify: string) => this.sendDaemon(ws, { t: "sent", req_id: f.req_id, message_id: msg.id, notify });
+        const n = this.notifyMessage(msg, s.project, f.urgency, now, (outcomes) => reply(describePushOutcomes(outcomes)));
+        if (n !== null) reply(n);
         return;
       }
       case "location_req": {
@@ -1470,12 +1519,20 @@ export class Hub extends DurableObject<Env> {
    * Urgency -> notification (D19): silent never notifies; normal/urgent show in the open app, else go
    * out as Web Push (urgent: high priority, stays until dismissed). Returns the tool-result sentence.
    */
-  private notifyMessage(msg: MessageRecord, project: string, urgency: Urgency, now: number): string {
+  /** Returns the sentence now, or null when `done` will be called with the push outcomes later. */
+  private notifyMessage(
+    msg: MessageRecord,
+    project: string,
+    urgency: Urgency,
+    now: number,
+    done: (outcomes: PushOutcome[]) => void,
+  ): string | null {
     const opts = pushOptionsFor(urgency);
     if (!opts || urgency === "silent") return "silent: shown in the phone app only, no notification";
     if (this.visiblePhone(now)) return "the phone app is open, so it is shown there (no notification)";
     const payload = messagePush({ session_id: msg.session_id, id: msg.id, text: msg.text, urgency, project }, this.pushPreview);
-    return this.queuePush(payload, opts, now).text;
+    const q = this.queuePush(payload, opts, now, done);
+    return q.sent > 0 ? null : q.text;
   }
 
   // -------------------------------------------------------------------------

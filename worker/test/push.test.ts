@@ -4,6 +4,7 @@ import { SELF, evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { tenantIdForDev } from "../src/auth";
 import { MAX_PUSH_DEVICES } from "../src/budget";
+import { describePushOutcomes } from "../src/hub";
 import { pushExtraOrigins } from "../src/env";
 import { E, ORIGIN, cookieFor, daemon, last, newMachine, phone, setLimits, sleep, waitFor, withHub } from "./helpers";
 import { decryptPush, fakePushService, fakeSubscription, type FakeSub } from "./push-helpers";
@@ -125,7 +126,7 @@ describe("when the Hub sends Web Push (D19)", () => {
     const text = `Done: ${"all tests pass. ".repeat(20)}`;
     d.send({ t: "send", req_id: "r1", session_id: sid, text, urgency: "normal" });
     const sent = await waitFor(() => last(d, "sent"), "sent");
-    expect(sent.notify).toBe("notification sent to 1 phone");
+    expect(sent.notify).toBe("push notification sent to 1 phone");
     await waitFor(() => calls.length === 1, "push");
     const c = calls[0]!;
     expect(c.url).toBe(sub!.endpoint);
@@ -144,7 +145,7 @@ describe("when the Hub sends Web Push (D19)", () => {
     d.send({ t: "send", req_id: "r1", session_id: sid, text: "silent fyi", urgency: "silent" });
     expect((await waitFor(() => d.frames.find((f) => f.t === "sent" && f.req_id === "r1"), "sent")).notify).toMatch(/^silent/);
     d.send({ t: "send", req_id: "r2", session_id: sid, text: "blocked, need you", urgency: "urgent" });
-    expect((await waitFor(() => d.frames.find((f) => f.t === "sent" && f.req_id === "r2"), "sent")).notify).toBe("notification sent to 2 phones");
+    expect((await waitFor(() => d.frames.find((f) => f.t === "sent" && f.req_id === "r2"), "sent")).notify).toBe("push notification sent to 2 phones");
     await waitFor(() => calls.length === 2, "2 pushes");
     await sleep(100);
     expect(calls.length).toBe(2);
@@ -160,7 +161,7 @@ describe("when the Hub sends Web Push (D19)", () => {
     p!.send({ t: "visibility", visible: false });
     await sleep(50);
     d.send({ t: "send", req_id: "r2", session_id: sid, text: "two", urgency: "normal" });
-    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r2"), "sent")).notify).toBe("notification sent to 1 phone");
+    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r2"), "sent")).notify).toBe("push notification sent to 1 phone");
     await waitFor(() => calls.length === 1, "push while hidden");
     p!.send({ t: "visibility", visible: true });
     await sleep(50);
@@ -171,7 +172,7 @@ describe("when the Hub sends Web Push (D19)", () => {
       for (const ws of state.getWebSockets("phone")) ws.serializeAttachment({ ...ws.deserializeAttachment(), seen: Date.now() - 80_000 });
     });
     d.send({ t: "send", req_id: "r4", session_id: sid, text: "four", urgency: "normal" });
-    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r4"), "sent")).notify).toBe("notification sent to 1 phone");
+    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r4"), "sent")).notify).toBe("push notification sent to 1 phone");
     // ...but a keepalive ping answered by the runtime (auto-response, no wake-up) is a sign of life.
     p!.ws.send("ping");
     await sleep(50);
@@ -201,12 +202,16 @@ describe("when the Hub sends Web Push (D19)", () => {
     );
     d.send({ t: "send", req_id: "r1", session_id: sid, text: "x", urgency: "normal" });
     await waitFor(() => calls.length === 3, "3 pushes");
+    // The tool result reports what the push services said (sent only after they answered).
+    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r1"), "sent")).notify).toBe(
+      "push notification sent to 1 phone of 3 (a phone's subscription had expired and was removed; the push service is busy (HTTP 429))",
+    );
     await sleep(100);
     expect(calls.length).toBe(3); // nothing retried
     const left = await withHub("wp-gone", (_h, state) => state.storage.sql.exec("SELECT endpoint FROM push_subs").toArray().map((r) => r.endpoint));
     expect(left.sort()).toEqual([b!.endpoint, c!.endpoint].sort());
     d.send({ t: "send", req_id: "r2", session_id: sid, text: "y", urgency: "normal" });
-    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r2"), "sent")).notify).toBe("notification sent to 1 phone");
+    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r2"), "sent")).notify).toBe("push notification sent to 1 phone");
     await waitFor(() => calls.length === 4, "4th push");
     expect(calls[3]!.url).toBe(c!.endpoint); // the 429 device is skipped while paused
   });
@@ -224,6 +229,13 @@ describe("when the Hub sends Web Push (D19)", () => {
     expect(s2.notify).toMatch(/^no notification: daily notification limit reached \(3 per day/);
     await sleep(100);
     expect(calls.length).toBe(2);
+  });
+
+  it("describes push outcomes for the tool result without overclaiming", () => {
+    expect(describePushOutcomes([{ kind: "ok", status: 201 }])).toBe("push notification sent to 1 phone");
+    expect(describePushOutcomes([{ kind: "rejected", status: 403 }])).toBe("no notification: the push service refused it (HTTP 403)");
+    expect(describePushOutcomes([{ kind: "later", status: 0, retryAfterMs: 1 }])).toBe("no notification: the push service is busy or unreachable");
+    expect(describePushOutcomes([{ kind: "rejected", status: -1 }])).toBe("no notification: the server's VAPID keys are invalid");
   });
 
   it("says why there is no notification when no phone has enabled them", async () => {

@@ -5,6 +5,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { connect as netConnect, createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -12,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { generateVapidKeys } from "../worker/scripts/vapid.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI = join(root, "mcp", "dist", "cli.js");
@@ -168,6 +170,44 @@ async function floodAfterClose(st, ms) {
   return sent;
 }
 // ---------------------------------------------------------------------------
+// Web Push (Phase 4): a local fake push service and the browser side of RFC 8291.
+
+const subtle = globalThis.crypto.subtle;
+const b64u = (b) => Buffer.from(b).toString("base64url");
+
+/** A browser-like push subscription for `endpoint` (real P-256 keys, so payloads can be decrypted). */
+async function makePushSub(endpoint) {
+  const ua = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const uaPublic = new Uint8Array(await subtle.exportKey("raw", ua.publicKey));
+  const auth = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  return { ua, uaPublic, auth, json: { endpoint, expirationTime: null, keys: { p256dh: b64u(uaPublic), auth: b64u(auth) } } };
+}
+
+async function decryptPush(sub, body) {
+  const hmac = async (k, d) => new Uint8Array(await subtle.sign("HMAC", await subtle.importKey("raw", k, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), d));
+  const cat = (...p) => Buffer.concat(p.map((x) => Buffer.from(x)));
+  const salt = body.subarray(0, 16);
+  const asPublic = body.subarray(21, 21 + body[20]);
+  const asKey = await subtle.importKey("raw", asPublic, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const secret = new Uint8Array(await subtle.deriveBits({ name: "ECDH", public: asKey }, sub.ua.privateKey, 256));
+  const one = Buffer.from([1]);
+  const ikm = await hmac(await hmac(sub.auth, secret), cat(Buffer.from("WebPush: info\0"), sub.uaPublic, asPublic, one));
+  const prk = await hmac(salt, ikm);
+  const cek = (await hmac(prk, cat(Buffer.from("Content-Encoding: aes128gcm\0"), one))).slice(0, 16);
+  const iv = (await hmac(prk, cat(Buffer.from("Content-Encoding: nonce\0"), one))).slice(0, 12);
+  const key = await subtle.importKey("raw", cek, "AES-GCM", false, ["decrypt"]);
+  const plain = Buffer.from(await subtle.decrypt({ name: "AES-GCM", iv }, key, body.subarray(21 + body[20])));
+  return JSON.parse(plain.subarray(0, plain.length - 1).toString());
+}
+
+async function verifyJwt(jwt, k) {
+  const [h, p, sig] = jwt.split(".");
+  const key = await subtle.importKey("raw", Buffer.from(k, "base64url"), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  const ok = await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, Buffer.from(sig, "base64url"), Buffer.from(`${h}.${p}`));
+  return ok ? JSON.parse(Buffer.from(p, "base64url").toString()) : null;
+}
+
+const toolText = (r) => r?.content?.[0]?.text ?? "";
 
 async function devLogin(base, user) {
   const r = await fetch(`${base}/auth/dev?user=${user}`, { redirect: "manual" });
@@ -239,6 +279,23 @@ function sessionOf(p, id) {
 async function main() {
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
+  // Fake push service (Phase 4): records every push; the answer per request is switchable.
+  const pushes = [];
+  let pushAnswer = () => 201;
+  const pushSrv = createHttpServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const p = { url: req.url, headers: req.headers, body: Buffer.concat(chunks) };
+      pushes.push(p);
+      res.writeHead(pushAnswer(p));
+      res.end();
+    });
+  });
+  await new Promise((r) => pushSrv.listen(0, "127.0.0.1", r));
+  const pushBase = `http://127.0.0.1:${pushSrv.address().port}`;
+  children.push({ exitCode: null, signalCode: null, kill: () => pushSrv.close(), pid: 0, output: "" });
+  const vapid = await generateVapidKeys();
   const secret = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
 
   console.log(`e2e: temp dir ${tmp}`);
@@ -259,6 +316,15 @@ async function main() {
       `SESSION_SECRET:${secret}`,
       "--var",
       "DEV_AUTH:1",
+      "--var",
+      `VAPID_PUBLIC_KEY:${vapid.publicKey}`,
+      "--var",
+      `VAPID_PRIVATE_KEY:${vapid.privateKey}`,
+      "--var",
+      "VAPID_SUBJECT:mailto:e2e@example.com",
+      // Only honored with DEV_AUTH=1: lets the Hub push to the local fake push service.
+      "--var",
+      `PUSH_EXTRA_ORIGINS:${pushBase}`,
       "--show-interactive-dev-session=false",
       "--log-level",
       "info",
@@ -266,7 +332,7 @@ async function main() {
     {
       cwd: join(root, "worker"),
       detached: true,
-      env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "1", NO_COLOR: "1" },
+      env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "1", NO_COLOR: "1", NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost" },
     },
   );
   wrangler.detachedGroup = true;
@@ -513,6 +579,117 @@ async function main() {
     { what: "silent message at phone" },
   );
   check("send_message works again after reconnect (urgency silent)", !again.isError && outSilent.message.urgency === "silent");
+
+  // --- Phase 4: installable PWA, Web Push, on-demand location, map links ---------------------
+  logStep("PWA install assets");
+  const man = await (await fetch(`${base}/manifest.webmanifest`)).json();
+  const purposes = new Set(man.icons.map((i) => i.purpose));
+  check(
+    "manifest: standalone, start_url/scope '/', theme colors, icons any + maskable + monochrome",
+    man.display === "standalone" && man.start_url === "/" && man.scope === "/" && man.theme_color && man.background_color &&
+      ["any", "maskable", "monochrome"].every((x) => purposes.has(x)),
+    JSON.stringify(man),
+  );
+  let badIcon = null;
+  for (const i of [...man.icons, { src: "/favicon.ico", type: "image/" }, { src: "/apple-touch-icon.png", type: "image/png" }, { src: "/icons/badge-96.png", type: "image/png" }]) {
+    const r = await fetch(`${base}${i.src}`);
+    const ct = r.headers.get("content-type") ?? "";
+    await r.arrayBuffer();
+    if (!r.ok || !ct.startsWith(i.type.split("+")[0])) badIcon = `${i.src}: ${r.status} ${ct}`;
+  }
+  check("every icon (manifest, favicon.ico, apple-touch-icon, badge) is served with an image type", !badIcon, String(badIcon));
+  const swr = await fetch(`${base}/sw.js`);
+  const swText = await swr.text();
+  check(
+    "service worker is served uncached and the CSP allows it (worker-src) and the manifest",
+    swr.ok && /no-cache/.test(swr.headers.get("cache-control") ?? "") && /mr-shell-/.test(swText) &&
+      /worker-src 'self'/.test(home.headers.get("content-security-policy") ?? "") && /manifest-src 'self'/.test(home.headers.get("content-security-policy") ?? ""),
+    `${swr.status} ${swr.headers.get("cache-control")} ${home.headers.get("content-security-policy")}`,
+  );
+
+  logStep("Web Push to a local fake push service");
+  const me2 = await (await api(base, alice, "/api/me")).json();
+  check("/api/me hands the phone the VAPID public key", me2.push_key === vapid.publicKey, JSON.stringify(me2));
+  const phoneSub = await makePushSub(`${pushBase}/push/alice-phone`);
+  const subR = await api(base, alice, "/api/push/subscribe", { method: "POST", body: JSON.stringify(phoneSub.json) });
+  check("the phone registers its push subscription", subR.ok, String(subR.status));
+  const ssrf = await api(base, alice, "/api/push/subscribe", { method: "POST", body: JSON.stringify({ ...phoneSub.json, endpoint: "https://evil.example/x" }) });
+  check("a subscription for an unknown push service is refused (no SSRF)", ssrf.status === 400, String(ssrf.status));
+  const visibleSend = await shimB.client.callTool({ name: "send_message", arguments: { text: "seen in the app", urgency: "normal" } });
+  await sleep(300);
+  check("while the app is open and visible: no push, and the tool result says why", /app is open/.test(toolText(visibleSend)) && pushes.length === 0, toolText(visibleSend));
+  pa.send({ t: "visibility", visible: false });
+  await sleep(200);
+  const urgentSend = await shimB.client.callTool({
+    name: "send_message",
+    arguments: { text: "Blocked on the deploy: approve? Directions: https://www.google.com/maps/search/?api=1&query=1%2C2", urgency: "urgent" },
+  });
+  check("app hidden: send_message reports a push notification to 1 phone", /notification sent to 1 phone/.test(toolText(urgentSend)), toolText(urgentSend));
+  const p1 = await waitFor(() => pushes[0], { what: "push at the fake push service" });
+  const auth1 = /^vapid t=([^,]+), k=(.+)$/.exec(p1.headers.authorization ?? "");
+  const claims = auth1 ? await verifyJwt(auth1[1], auth1[2]) : null;
+  check(
+    "push request: aes128gcm, Urgency high + TTL for urgent, VAPID JWT for the push service origin signed by our key",
+    p1.headers["content-encoding"] === "aes128gcm" && p1.headers.urgency === "high" && p1.headers.ttl === "86400" &&
+      auth1?.[2] === vapid.publicKey && claims?.aud === pushBase && claims?.sub === "mailto:e2e@example.com" && claims.exp > Date.now() / 1000,
+    JSON.stringify({ h: p1.headers, claims }),
+  );
+  const pay1 = await decryptPush(phoneSub, p1.body);
+  check(
+    "the phone can decrypt the payload (RFC 8291): session, urgency, project and a <=100-char preview",
+    pay1.k === "m" && pay1.s === "sess-b" && pay1.u === "urgent" && pay1.p === "beta" && pay1.b.startsWith("Blocked on the deploy") && [...pay1.b].length <= 100,
+    JSON.stringify(pay1),
+  );
+  const goneSub = await makePushSub(`${pushBase}/push/gone-phone`);
+  await api(base, alice, "/api/push/subscribe", { method: "POST", body: JSON.stringify(goneSub.json) });
+  pushAnswer = (p) => (p.url.endsWith("/gone-phone") ? 410 : 201);
+  await shimB.client.callTool({ name: "send_message", arguments: { text: "second", urgency: "normal" } });
+  const settings1 = await waitFor(() => [...pa.frames].reverse().find((f) => f.t === "settings" && f.settings.push_devices.length === 1), {
+    what: "410 subscription removed",
+  });
+  check("a 410 from the push service deletes that subscription (the phone's list shows 1 device)", pushes.length === 3 && !!settings1, String(pushes.length));
+  pushAnswer = () => 201;
+
+  logStep("on-demand location");
+  const pushesBefore = pushes.length;
+  const locViaPush = shimB.client.callTool({ name: "get_location", arguments: { reason: "e2e: walking directions", max_age_s: 0, timeout_s: 5 } });
+  const lp = await waitFor(() => pushes[pushesBefore], { what: "location push" });
+  const locPay = await decryptPush(phoneSub, lp.body);
+  check(
+    "no app open: get_location sends a high-priority 'Claude wants your location' push (kind l, request routing inside)",
+    lp.headers.urgency === "high" && lp.headers.ttl === "120" && locPay.k === "l" && locPay.s === "sess-b" && locPay.m === machineId && locPay.b === "e2e: walking directions",
+    JSON.stringify({ h: lp.headers, locPay }),
+  );
+  const lt = toolText(await locViaPush);
+  check("unanswered within timeout_s: a clear result that says a notification was sent", /^No answer within 5 s: the phone was sent a notification/.test(lt), lt);
+  // The user taps the notification later: the app opens and shares (the tap is the consent).
+  pa.send({ t: "visibility", visible: true });
+  pa.send({ t: "location", rid: locPay.r, machine_id: locPay.m, session_id: locPay.s, status: "ok", position: { lat: 48.8584, lon: 2.2945, accuracy_m: 9, at: Date.now() } });
+  await waitFor(() => [...pa.frames].reverse().find((f) => f.t === "settings" && f.settings.location_at), { what: "location stored" });
+  const cached = toolText(await shimB.client.callTool({ name: "get_location", arguments: { reason: "e2e again", max_age_s: 600 } }));
+  check("a later get_location gets that position as last-known, with its age, without asking again", /^Last-known location .*48\.8584,2\.2945 \(accuracy about 9 m\)/.test(cached), cached);
+  const locInApp = shimB.client.callTool({ name: "get_location", arguments: { reason: "e2e: where am I", max_age_s: 0, timeout_s: 30 } });
+  const prompt = await waitFor(() => pa.frames.find((f) => f.t === "location_request" && f.reason === "e2e: where am I"), { what: "in-app location prompt" });
+  check("app open: the phone gets an in-app prompt naming the project and reason", prompt.project === "beta" && prompt.session_id === "sess-b", JSON.stringify(prompt));
+  pa.send({ t: "location", rid: prompt.rid, machine_id: prompt.machine_id, session_id: prompt.session_id, status: "ok", position: { lat: 52.3731, lon: 4.8922, accuracy_m: 15, at: Date.now() } });
+  const fresh = toolText(await locInApp);
+  check("the user's Share reaches Claude: fresh position, accuracy, age, map link", /^Location shared by the user just now: 52\.3731,4\.8922 \(accuracy about 15 m\).*\nGoogle Maps: https:\/\/www\.google\.com\/maps\/search\//s.test(fresh), fresh);
+  check("the prompt is closed on every phone once answered", pa.frames.some((f) => f.t === "location_done" && f.rid === prompt.rid));
+  const ml = toolText(await shimB.client.callTool({ name: "map_link", arguments: { destination: "Amsterdam Centraal", mode: "walking", origin_lat: 52.3731, origin_lon: 4.8922 } }));
+  check(
+    "map_link builds a Google Maps directions link locally",
+    ml.startsWith("https://www.google.com/maps/dir/?api=1&destination=Amsterdam%20Centraal&origin=52.3731%2C4.8922&travelmode=walking"),
+    ml,
+  );
+  pa.send({ t: "settings", location: false });
+  await waitFor(() => [...pa.frames].reverse().find((f) => f.t === "settings" && f.settings.location === false), { what: "location off" });
+  const off = toolText(await shimB.client.callTool({ name: "get_location", arguments: { reason: "e2e off", max_age_s: 86400 } }));
+  check("location turned off in Settings: get_location is refused, last-known forgotten", /turned off/.test(off) && !/52\.37/.test(off), off);
+  pa.send({ t: "settings", location: true });
+  check(
+    "positions are never logged (worker and daemon output)",
+    !/48\.858|52\.373/.test(wrangler.output + daemon.output + daemonR.output),
+  );
 
 
   // --- remote launch (Phase 2) ----------------------------------------------------------
