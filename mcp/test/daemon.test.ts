@@ -598,4 +598,41 @@ describe("daemon tells shims why the server refused (phase 3 review round 2)", (
     const late = await shim("sy");
     expect(late.frames[0]).toMatchObject({ t: "registered", hub_connected: false, reason: st.reason });
   });
+
+  it("routes get_location to the Hub under its own random id and the answer back, across a reconnect (Phase 4)", async () => {
+    await startDaemon().start();
+    await waitFor(() => hubFrames.find((f) => f.t === "hello"), "hello");
+    const a = await shim("sloc");
+    a.conn.send({ t: "location_req", req_id: "g1", max_age_s: 60, reason: "nearby food" });
+    const req = await waitFor(() => hubFrames.find((f) => f.t === "location_req"), "location_req");
+    expect(req).toMatchObject({ session_id: "sloc", max_age_s: 60, reason: "nearby food" });
+    expect(req.req_id).toMatch(/^l[0-9a-f]{16}$/);
+    hubSockets[0]!.send(JSON.stringify({ t: "location_wait", req_id: req.req_id, via: "app", last: null }));
+    await waitFor(() => a.frames.find((f) => f.t === "location_wait"), "wait at shim");
+    expect(a.frames.find((f) => f.t === "location_wait")).toEqual({ t: "location_wait", req_id: "g1", via: "app", last: null });
+    // The Hub connection drops and comes back; the phone's answer arrives on the new one.
+    hubSockets[0]!.terminate();
+    await waitFor(() => hubSockets.length === 2 && hubFrames.filter((f) => f.t === "hello").length === 2, "reconnect");
+    const position = { lat: 1, lon: 2, accuracy_m: null, at: 5 };
+    hubSockets[1]!.send(JSON.stringify({ t: "location", req_id: req.req_id, result: { status: "ok", position, fresh: true } }));
+    const ans = await waitFor(() => a.frames.find((f) => f.t === "location"), "answer at shim");
+    expect(ans).toEqual({ t: "location", req_id: "g1", result: { status: "ok", position, fresh: true } });
+    // A second answer for the same request (another phone) is dropped.
+    hubSockets[1]!.send(JSON.stringify({ t: "location", req_id: req.req_id, result: { status: "denied", position: null, fresh: false } }));
+    await sleep(50);
+    expect(a.frames.filter((f) => f.t === "location").length).toBe(1);
+  });
+
+  it("answers get_location at once when the Hub is not connected", async () => {
+    await startDaemon().start();
+    await waitFor(() => hubFrames.find((f) => f.t === "hello"), "hello");
+    const a = await shim("sloc2");
+    wss.close();
+    for (const s of hubSockets) s.terminate();
+    await waitFor(() => a.frames.find((f) => f.t === "hub_status" && !f.connected), "offline");
+    a.conn.send({ t: "location_req", req_id: "g9", max_age_s: 0 });
+    const r = await waitFor(() => a.frames.find((f) => f.t === "location"), "fail");
+    expect(r.result).toMatchObject({ status: "unavailable", position: null, message: expect.stringMatching(/not connected to the server/) });
+  });
 });
+

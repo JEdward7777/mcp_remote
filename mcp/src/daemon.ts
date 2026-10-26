@@ -1,5 +1,6 @@
 // One daemon per computer (D6): a single outbound WebSocket to the tenant's Hub, plus a local
 // IPC server that per-session shims connect to. Routes Hub -> shim by session_id.
+import { randomBytes } from "node:crypto";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import WebSocket from "ws";
@@ -9,6 +10,8 @@ import {
   DaemonToHub,
   Heartbeat,
   HubToDaemon,
+  type LocationResult,
+  MAX_LOCATION_TIMEOUT_S,
   MAX_SESSIONS_PER_MACHINE,
   PING_INTERVAL_MS,
   PONG_TIMEOUT_MS,
@@ -59,6 +62,13 @@ interface PendingSend {
   timer: NodeJS.Timeout;
 }
 
+/** A get_location call waiting for the phone (kept across Hub reconnects: the answer is routed by machine). */
+interface PendingLocation {
+  shim: LineConn<ShimToDaemon>;
+  shimReqId: string;
+  timer: NodeJS.Timeout;
+}
+
 export interface DaemonOptions {
   config: Config;
   socket?: string;
@@ -83,6 +93,7 @@ export interface DaemonOptions {
 export class Daemon {
   private readonly shims = new Map<string, ShimEntry>();
   private readonly pending = new Map<string, PendingSend>();
+  private readonly locPending = new Map<string, PendingLocation>();
   private ws: WebSocket | null = null;
   private hubReady = false;
   private attempt = 0;
@@ -134,6 +145,8 @@ export class Daemon {
     // Launched tmux sessions keep running; the next daemon re-adopts them from launches.json.
     this.launcher?.dispose();
     clearTimeout(this.reconnectTimer);
+    for (const p of this.locPending.values()) clearTimeout(p.timer);
+    this.locPending.clear();
     this.heartbeat?.stop();
     this.ws?.close(1000, "daemon stopping");
     for (const s of this.shims.values()) s.conn.close();
@@ -284,6 +297,35 @@ export class Daemon {
       }
       if (f.t === "ack") {
         this.toHub({ t: "ack", session_id: sessionId, ids: f.ids });
+        return;
+      }
+      if (f.t === "location_req") {
+        const fail = (message: string) =>
+          conn.send({
+            t: "location",
+            req_id: f.req_id,
+            result: { status: "unavailable", position: null, fresh: false, message } satisfies LocationResult,
+          } satisfies DaemonToShim);
+        if (!this.hubReady) {
+          fail(`the mcp-remote daemon is not connected to the server right now${this.offlineReason ? `: ${this.offlineReason}` : ""}`);
+          return;
+        }
+        const refused = this.shims.get(sessionId)?.refused;
+        if (refused) {
+          fail(`the server refused this session: ${refused}`);
+          return;
+        }
+        // Random ids: a late answer for a request from before a daemon restart can't match a new one.
+        const hubReq = `l${randomBytes(8).toString("hex")}`;
+        const timer = setTimeout(() => this.locPending.delete(hubReq), (MAX_LOCATION_TIMEOUT_S + 15) * 1000);
+        this.locPending.set(hubReq, { shim: conn, shimReqId: f.req_id, timer });
+        this.toHub({
+          t: "location_req",
+          req_id: hubReq,
+          session_id: sessionId,
+          max_age_s: f.max_age_s,
+          ...(f.reason ? { reason: f.reason } : {}),
+        });
       }
     };
     sock.on("error", () => {});
@@ -292,6 +334,12 @@ export class Daemon {
         if (p.shim === conn) {
           clearTimeout(p.timer);
           this.pending.delete(k);
+        }
+      }
+      for (const [k, p] of this.locPending) {
+        if (p.shim === conn) {
+          clearTimeout(p.timer);
+          this.locPending.delete(k);
         }
       }
       if (sessionId && this.shims.get(sessionId)?.conn === conn) {
@@ -478,7 +526,26 @@ export class Daemon {
           if (!p) return;
           clearTimeout(p.timer);
           this.pending.delete(f.req_id);
-          p.shim.send({ t: "sent", req_id: p.shimReqId, message_id: f.message_id } satisfies DaemonToShim);
+          p.shim.send({
+            t: "sent",
+            req_id: p.shimReqId,
+            message_id: f.message_id,
+            ...(f.notify ? { notify: f.notify } : {}),
+          } satisfies DaemonToShim);
+          return;
+        }
+        case "location_wait": {
+          const p = this.locPending.get(f.req_id);
+          if (p) p.shim.send({ t: "location_wait", req_id: p.shimReqId, via: f.via, last: f.last } satisfies DaemonToShim);
+          return;
+        }
+        case "location": {
+          // Never logged: positions stay between the phone, the Hub and the asking session.
+          const p = this.locPending.get(f.req_id);
+          if (!p) return; // answered after the session stopped waiting
+          clearTimeout(p.timer);
+          this.locPending.delete(f.req_id);
+          p.shim.send({ t: "location", req_id: p.shimReqId, result: f.result } satisfies DaemonToShim);
           return;
         }
         case "error": {

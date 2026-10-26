@@ -30,7 +30,15 @@ beforeEach(async () => {
       if (s === "ping") return;
       const f = JSON.parse(s);
       hubFrames.push(f);
-      if (f.t === "send") ws.send(JSON.stringify({ t: "sent", req_id: f.req_id, message_id: 1 }));
+      if (f.t === "send") ws.send(JSON.stringify({ t: "sent", req_id: f.req_id, message_id: 1, notify: "notification sent to 1 phone" }));
+      // Phase 4: a fake phone that answers location requests whose reason contains "answer".
+      if (f.t === "location_req") {
+        ws.send(JSON.stringify({ t: "location_wait", req_id: f.req_id, via: "push", last: null }));
+        if (/answer/.test(f.reason ?? "")) {
+          const position = { lat: 48.8584, lon: 2.2945, accuracy_m: 8, at: Date.now() - 1000 };
+          setTimeout(() => ws.send(JSON.stringify({ t: "location", req_id: f.req_id, result: { status: "ok", position, fresh: true } })), 200);
+        }
+      }
     });
   });
   const port = (wss.address() as { port: number }).port;
@@ -145,4 +153,30 @@ describe("shim", () => {
     for (let i = 0; i < 50 && hubFrames.filter((f) => f.t === "session_up").length < 2; i++) await sleep(100);
     expect(hubFrames.filter((f) => f.t === "session_up").map((f) => f.session.project)).toEqual(["flagged", "forced"]);
   }, 20_000);
+
+  it("get_location waits for the phone's answer; times out with a clear text; map_link needs no network (Phase 4)", async () => {
+    const c = await startShim("loc-id");
+    const ready = async () => !(await c.callTool({ name: "send_message", arguments: { text: "hi" } })).isError;
+    for (let i = 0; i < 50 && !(await ready()); i++) await sleep(100);
+    const sent = await c.callTool({ name: "send_message", arguments: { text: "done", urgency: "normal" } });
+    expect((sent.content as { text: string }[])[0]!.text).toBe("Sent to the user's phone (urgency normal, id 1; notification sent to 1 phone).");
+
+    const r = await c.callTool({ name: "get_location", arguments: { reason: "please answer", max_age_s: 0 } });
+    expect(r.isError).toBeFalsy();
+    expect((r.content as { text: string }[])[0]!.text).toMatch(/^Location shared by the user just now: 48\.8584,2\.2945 \(accuracy about 8 m\)/);
+    const req = hubFrames.find((f) => f.t === "location_req");
+    expect(req).toMatchObject({ session_id: "loc-id", max_age_s: 0, reason: "please answer" });
+    expect(req.req_id).toMatch(/^l[0-9a-f]{16}$/); // the daemon's own random id
+
+    const t0 = Date.now();
+    const to = await c.callTool({ name: "get_location", arguments: { reason: "ignored", timeout_s: 5 } });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(4900);
+    expect((to.content as { text: string }[])[0]!.text).toMatch(/^No answer within 5 s: the phone was sent a notification asking for the location/);
+
+    const m = await c.callTool({ name: "map_link", arguments: { destination: "Eiffel Tower", directions: true, mode: "transit" } });
+    expect((m.content as { text: string }[])[0]!.text).toMatch(/^https:\/\/www\.google\.com\/maps\/dir\/\?api=1&destination=Eiffel%20Tower&travelmode=transit/);
+    const bad = await c.callTool({ name: "get_location", arguments: {} });
+    expect(bad.isError).toBe(true);
+    expect((await c.listTools()).tools.map((t) => t.name)).toEqual(["send_message", "get_location", "map_link"]);
+  }, 30_000);
 });

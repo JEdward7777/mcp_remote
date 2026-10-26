@@ -7,43 +7,25 @@ import { basename } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
 import {
   DaemonToShim,
-  MAX_TEXT_CHARS,
+  type LocationResult,
+  type LocationVia,
   type MessageRecord,
   PROTOCOL_VERSION,
+  type Position,
   SessionId,
   type ShimToDaemon,
-  URGENCIES,
-  Urgency,
+  type Urgency,
   backoffDelay,
-  MessageText,
 } from "@mcp-remote/shared";
 import { socketPath } from "./config";
 import { LineConn } from "./ipc";
 import { log, setLogPrefix } from "./log";
 import { activation, ancestors, cmdlineOf } from "./proc";
+import { GetLocationArgs, INSTRUCTIONS, SERVER_NAME, SendArgs, TOOLS, formatLocation, mapLinkTool } from "./tools";
 
-export const SERVER_NAME = "mcp-remote";
-
-export const INSTRUCTIONS = `This Claude Code session is connected to the user's phone through mcp-remote.
-
-Inbound: messages the user types on their phone arrive as <channel source="${SERVER_NAME}" message_id="..." session_id="..." sent_at="..."> events. Treat each one as a direct message from the user (an instruction or a question). The user is away from the terminal and cannot see your terminal output.
-
-Outbound: the only way to reach the user is the send_message tool. Messaging is discrete and intentional: do NOT narrate progress, do NOT send a message for every step, and do not repeat yourself. Only send a message when it matters to the user: you finished what they asked, you have the answer to their question, or you are blocked.
-
-Pick the urgency deliberately:
-- silent: FYI only; the user does not need to look now (e.g. a minor note or an intermediate result they may want later).
-- normal: you finished something the user asked for, or you are answering their message. This is the default.
-- urgent: you are blocked or need a decision from the user right now to make progress. Use it sparingly.
-
-When a phone message asks you something, reply with send_message (normal urgency unless you are blocked). Keep messages short and self-contained; they are read on a phone.`;
-
-const SendArgs = z.object({
-  text: MessageText,
-  urgency: Urgency.default("normal"),
-});
+export { INSTRUCTIONS, SERVER_NAME } from "./tools";
 
 export interface ShimOptions {
   socket?: string;
@@ -96,7 +78,13 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   let registerRefused: string | null = null;
   let reqSeq = 0;
   let stopping = false;
-  const waiting = new Map<string, { resolve: (r: { ok: true; id: number } | { ok: false; error: string }) => void; timer: NodeJS.Timeout }>();
+  type SendResult = { ok: true; id: number; notify?: string } | { ok: false; error: string };
+  const waiting = new Map<string, { resolve: (r: SendResult) => void; timer: NodeJS.Timeout }>();
+  /** get_location calls waiting for the phone. */
+  const locWaiting = new Map<
+    string,
+    { resolve: (r: LocationResult) => void; timer: NodeJS.Timeout; via: LocationVia | null; last: Position | null }
+  >();
   let deliverChain: Promise<void> = Promise.resolve();
   const seen = new Set<number>();
   const seenOrder: number[] = [];
@@ -106,6 +94,11 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
       clearTimeout(w.timer);
       waiting.delete(k);
       w.resolve({ ok: false, error });
+    }
+    for (const [k, w] of locWaiting) {
+      clearTimeout(w.timer);
+      locWaiting.delete(k);
+      w.resolve({ status: "unavailable", position: w.last, fresh: false, message: error });
     }
   }
 
@@ -175,7 +168,24 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
             if (w) {
               clearTimeout(w.timer);
               waiting.delete(f.req_id);
-              w.resolve({ ok: true, id: f.message_id });
+              w.resolve({ ok: true, id: f.message_id, ...(f.notify ? { notify: f.notify } : {}) });
+            }
+            return;
+          }
+          case "location_wait": {
+            const w = locWaiting.get(f.req_id);
+            if (w) {
+              w.via = f.via;
+              w.last = f.last;
+            }
+            return;
+          }
+          case "location": {
+            const w = locWaiting.get(f.req_id);
+            if (w) {
+              clearTimeout(w.timer);
+              locWaiting.delete(f.req_id);
+              w.resolve(f.result);
             }
             return;
           }
@@ -232,31 +242,24 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
     });
   }
 
-  function sendToPhone(text: string, urgency: Urgency): Promise<{ ok: true; id: number } | { ok: false; error: string }> {
+  /** Why the phone can't be reached from this shim right now, or null. */
+  function unreachable(): string | null {
     if (!act.active) {
-      return Promise.resolve({
-        ok: false,
-        error:
-          "mcp-remote is inactive in this Claude Code process: it was not started with " +
-          "`--dangerously-load-development-channels server:mcp-remote` (or MCP_REMOTE_SESSION_ID / MCP_REMOTE_ACTIVATE=1), " +
-          "so it is not connected to the phone",
-      });
+      return (
+        "mcp-remote is inactive in this Claude Code process: it was not started with " +
+        "`--dangerously-load-development-channels server:mcp-remote` (or MCP_REMOTE_SESSION_ID / MCP_REMOTE_ACTIVATE=1), " +
+        "so it is not connected to the phone"
+      );
     }
-    if (!registered && registerRefused) {
-      return Promise.resolve({ ok: false, error: `the mcp-remote daemon refused this session: ${registerRefused}` });
-    }
-    if (!conn || !registered) {
-      return Promise.resolve({
-        ok: false,
-        error: "the local mcp-remote daemon is not running or not reachable (start it with `mcp-remote daemon`)",
-      });
-    }
-    if (!hubConnected) {
-      return Promise.resolve({
-        ok: false,
-        error: `the mcp-remote daemon is not connected to the server right now${hubReason ? `: ${hubReason}` : ""}`,
-      });
-    }
+    if (!registered && registerRefused) return `the mcp-remote daemon refused this session: ${registerRefused}`;
+    if (!conn || !registered) return "the local mcp-remote daemon is not running or not reachable (start it with `mcp-remote daemon`)";
+    if (!hubConnected) return `the mcp-remote daemon is not connected to the server right now${hubReason ? `: ${hubReason}` : ""}`;
+    return null;
+  }
+
+  function sendToPhone(text: string, urgency: Urgency): Promise<SendResult> {
+    const why = unreachable();
+    if (why) return Promise.resolve({ ok: false, error: why });
     const reqId = `s${++reqSeq}`;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -268,46 +271,53 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
     });
   }
 
+  /** get_location: resolves with the phone's answer, or a "timeout" result after timeoutS. */
+  function askLocation(reason: string, maxAgeS: number, timeoutS: number): Promise<{ result: LocationResult; via: LocationVia | null }> {
+    const why = unreachable();
+    if (why) return Promise.resolve({ result: { status: "unavailable", position: null, fresh: false, message: why }, via: null });
+    const reqId = `g${++reqSeq}`;
+    return new Promise((resolve) => {
+      const entry = {
+        via: null as LocationVia | null,
+        last: null as Position | null,
+        timer: setTimeout(() => {
+          locWaiting.delete(reqId);
+          resolve({ result: { status: "timeout", position: entry.last, fresh: false }, via: entry.via });
+        }, timeoutS * 1000),
+        resolve: (result: LocationResult) => resolve({ result, via: entry.via }),
+      };
+      locWaiting.set(reqId, entry);
+      conn!.send({ t: "location_req", req_id: reqId, max_age_s: maxAgeS, reason } satisfies ShimToDaemon);
+    });
+  }
+
   // --- MCP surface -----------------------------------------------------------------------
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: !act.active ? [] : [
-      {
-        name: "send_message",
-        description:
-          "Send a message to the user's phone. Use only when it matters (finished a task, answering the user, or blocked). " +
-          "urgency: silent = FYI, normal = finished/answer (default), urgent = blocked or need a decision now.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            text: { type: "string", description: "Message text, short and self-contained.", maxLength: MAX_TEXT_CHARS },
-            urgency: {
-              type: "string",
-              enum: [...URGENCIES],
-              default: "normal",
-              description: "silent = FYI; normal = finished something / answer; urgent = blocked or needs a decision now.",
-            },
-          },
-          required: ["text"],
-          additionalProperties: false,
-        },
-      },
-    ],
-  }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: act.active ? TOOLS : [] }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    if (req.params.name !== "send_message") {
-      return { isError: true, content: [{ type: "text", text: `unknown tool: ${req.params.name}` }] };
+    const err = (text: string) => ({ isError: true, content: [{ type: "text", text }] });
+    const name = req.params.name;
+    if (name === "map_link") {
+      // Pure URL building (no network); works even when the phone is unreachable.
+      const r = mapLinkTool(req.params.arguments);
+      return r.ok ? { content: [{ type: "text", text: r.text }] } : err(`No link: ${r.error}`);
     }
+    if (name === "get_location") {
+      const a = GetLocationArgs.safeParse(req.params.arguments ?? {});
+      if (!a.success) return err(`invalid arguments: ${a.error.issues.map((i) => i.message).join("; ")}`);
+      const { result, via } = await askLocation(a.data.reason, a.data.max_age_s, a.data.timeout_s);
+      const text = formatLocation(result, Date.now(), { via, timeoutS: a.data.timeout_s });
+      // Transport problems are errors; the user's choices (declined, turned off, no answer) are answers.
+      return result.status === "unavailable" && !result.position && via === null ? err(text) : { content: [{ type: "text", text }] };
+    }
+    if (name !== "send_message") return err(`unknown tool: ${name}`);
     const args = SendArgs.safeParse(req.params.arguments ?? {});
-    if (!args.success) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `invalid arguments: ${args.error.issues.map((i) => i.message).join("; ")}` }],
-      };
-    }
+    if (!args.success) return err(`invalid arguments: ${args.error.issues.map((i) => i.message).join("; ")}`);
     const r = await sendToPhone(args.data.text, args.data.urgency);
-    if (!r.ok) return { isError: true, content: [{ type: "text", text: `Message NOT sent: ${r.error}` }] };
-    return { content: [{ type: "text", text: `Sent to the user's phone (urgency ${args.data.urgency}, id ${r.id}).` }] };
+    if (!r.ok) return err(`Message NOT sent: ${r.error}`);
+    return {
+      content: [{ type: "text", text: `Sent to the user's phone (urgency ${args.data.urgency}, id ${r.id}${r.notify ? `; ${r.notify}` : ""}).` }],
+    };
   });
 
   // Register with the daemon only after Claude Code has initialized us, so no channel
