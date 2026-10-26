@@ -536,7 +536,7 @@ export class Daemon {
         }
         case "location_wait": {
           const p = this.locPending.get(f.req_id);
-          if (p) p.shim.send({ t: "location_wait", req_id: p.shimReqId, via: f.via, last: f.last } satisfies DaemonToShim);
+          if (p) p.shim.send({ t: "location_wait", req_id: p.shimReqId, via: f.via } satisfies DaemonToShim);
           return;
         }
         case "location": {

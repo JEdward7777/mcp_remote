@@ -227,7 +227,8 @@ function api(base, cookie, path, init = {}) {
 /** A fake phone: WebSocket with the session cookie, recording every frame. */
 function phone(base, cookie) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${base.replace("http", "ws")}/api/ws`, { headers: { cookie, origin: base } });
+    // ?vis=1: like the PWA, whose page is visible when it connects (Phase 4 push decisions).
+    const ws = new WebSocket(`${base.replace("http", "ws")}/api/ws?vis=1`, { headers: { cookie, origin: base } });
     const p = { ws, frames: [], state: null };
     ws.on("message", (d) => {
       const s = d.toString();
@@ -615,6 +616,10 @@ async function main() {
   check("the phone registers its push subscription", subR.ok, String(subR.status));
   const ssrf = await api(base, alice, "/api/push/subscribe", { method: "POST", body: JSON.stringify({ ...phoneSub.json, endpoint: "https://evil.example/x" }) });
   check("a subscription for an unknown push service is refused (no SSRF)", ssrf.status === 400, String(ssrf.status));
+  // The app tells the Hub which push subscription is its own (no push to it while it is visible).
+  const devId = (await subtle.digest("SHA-256", Buffer.from(phoneSub.json.endpoint))).slice(0, 8);
+  pa.send({ t: "visibility", visible: true, dev: Buffer.from(devId).toString("hex") });
+  await sleep(200);
   const visibleSend = await shimB.client.callTool({ name: "send_message", arguments: { text: "seen in the app", urgency: "normal" } });
   await sleep(300);
   check("while the app is open and visible: no push, and the tool result says why", /app is open/.test(toolText(visibleSend)) && pushes.length === 0, toolText(visibleSend));
@@ -656,22 +661,35 @@ async function main() {
   const lp = await waitFor(() => pushes[pushesBefore], { what: "location push" });
   const locPay = await decryptPush(phoneSub, lp.body);
   check(
-    "no app open: get_location sends a high-priority 'Claude wants your location' push (kind l, request routing inside)",
-    lp.headers.urgency === "high" && lp.headers.ttl === "120" && locPay.k === "l" && locPay.s === "sess-b" && locPay.m === machineId && locPay.b === "e2e: walking directions",
+    "no app open: get_location sends a high-priority 'Claude wants your location' push carrying the request's token",
+    lp.headers.urgency === "high" && lp.headers.ttl === "120" && locPay.k === "l" && locPay.s === "sess-b" && /^[\w-]{22}$/.test(locPay.t) && locPay.b === "e2e: walking directions",
     JSON.stringify({ h: lp.headers, locPay }),
   );
   const lt = toolText(await locViaPush);
-  check("unanswered within timeout_s: a clear result that says a notification was sent", /^No answer within 5 s: the phone was sent a notification/.test(lt), lt);
-  // The user taps the notification later: the app opens and shares (the tap is the consent).
+  check("unanswered within timeout_s: a clear result, no position", /^No answer within 5 s: the phone was sent a notification/.test(lt) && !/\d+\.\d+,\d+\.\d+/.test(lt), lt);
+  // The user taps the notification later: the app opens, the Hub lists the request (same token), the app shares once.
   pa.send({ t: "visibility", visible: true });
-  pa.send({ t: "location", rid: locPay.r, machine_id: locPay.m, session_id: locPay.s, status: "ok", position: { lat: 48.8584, lon: 2.2945, accuracy_m: 9, at: Date.now() } });
-  await waitFor(() => [...pa.frames].reverse().find((f) => f.t === "settings" && f.settings.location_at), { what: "location stored" });
+  pa.send({ t: "location_list" });
+  const listed = await waitFor(() => [...pa.frames].reverse().find((f) => f.t === "location_pending" && f.requests.some((r) => r.rid === locPay.r)), { what: "pending list" });
+  check("the app's pending list has the tapped request with the notification's token", listed.requests.find((r) => r.rid === locPay.r).tok === locPay.t);
+  pa.send({ t: "location", rid: locPay.r, tok: locPay.t, status: "ok", position: { lat: 48.8584, lon: 2.2945, accuracy_m: 9, at: Date.now() } });
+  await waitFor(() => pa.frames.find((f) => f.t === "location_done" && f.rid === locPay.r && f.status === "ok"), { what: "location_done" });
   const cached = toolText(await shimB.client.callTool({ name: "get_location", arguments: { reason: "e2e again", max_age_s: 600 } }));
-  check("a later get_location gets that position as last-known, with its age, without asking again", /^Last-known location .*48\.8584,2\.2945 \(accuracy about 9 m\)/.test(cached), cached);
+  check("the session that was answered may reuse that position within max_age_s, with its age", /^Location the user shared with this session earlier .*48\.8584,2\.2945 \(accuracy about 9 m\)/.test(cached), cached);
+  // Another session never gets it: the user is asked, and "Not now" gives that session nothing.
+  const otherSess = shimA2.client.callTool({ name: "get_location", arguments: { reason: "e2e: other session", max_age_s: 86400, timeout_s: 30 } });
+  const otherPrompt = await waitFor(() => pa.frames.find((f) => f.t === "location_request" && f.request.reason === "e2e: other session")?.request, { what: "prompt for the other session" });
+  pa.send({ t: "location", rid: otherPrompt.rid, tok: otherPrompt.tok, status: "denied" });
+  const otherText = toolText(await otherSess);
+  check("another session must ask; declined -> no position at all (not the one shared with sess-b)", otherText === "The user declined to share their location.", otherText);
+  const nFrames = pa.frames.length;
+  pa.send({ t: "location", rid: "made-up", tok: "x".repeat(22), status: "ok", position: { lat: 1, lon: 1, accuracy_m: 1, at: Date.now() } });
+  await waitFor(() => pa.frames.slice(nFrames).some((f) => f.t === "error" && /expired or was already answered/.test(f.error)), { what: "unmatched answer refused" });
+  check("an answer for an unknown request is refused (nothing stored)", true);
   const locInApp = shimB.client.callTool({ name: "get_location", arguments: { reason: "e2e: where am I", max_age_s: 0, timeout_s: 30 } });
-  const prompt = await waitFor(() => pa.frames.find((f) => f.t === "location_request" && f.reason === "e2e: where am I"), { what: "in-app location prompt" });
+  const prompt = await waitFor(() => pa.frames.find((f) => f.t === "location_request" && f.request.reason === "e2e: where am I")?.request, { what: "in-app location prompt" });
   check("app open: the phone gets an in-app prompt naming the project and reason", prompt.project === "beta" && prompt.session_id === "sess-b", JSON.stringify(prompt));
-  pa.send({ t: "location", rid: prompt.rid, machine_id: prompt.machine_id, session_id: prompt.session_id, status: "ok", position: { lat: 52.3731, lon: 4.8922, accuracy_m: 15, at: Date.now() } });
+  pa.send({ t: "location", rid: prompt.rid, tok: prompt.tok, status: "ok", position: { lat: 52.3731, lon: 4.8922, accuracy_m: 15, at: Date.now() } });
   const fresh = toolText(await locInApp);
   check("the user's Share reaches Claude: fresh position, accuracy, age, map link", /^Location shared by the user just now: 52\.3731,4\.8922 \(accuracy about 15 m\).*\nGoogle Maps: https:\/\/www\.google\.com\/maps\/search\//s.test(fresh), fresh);
   check("the prompt is closed on every phone once answered", pa.frames.some((f) => f.t === "location_done" && f.rid === prompt.rid));

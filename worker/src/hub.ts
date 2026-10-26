@@ -9,7 +9,9 @@ import {
   HubToDaemon,
   HubToPhone,
   LaunchInfo,
+  type LocationRequestInfo,
   type LocationResult,
+  type LocationVia,
   type Position,
   type Settings,
   LaunchRecord,
@@ -39,7 +41,7 @@ import {
   resolvePlan,
 } from "./budget";
 import { timingSafeEqual } from "./crypto";
-import { Env, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH, pushConfigured } from "./env";
+import { Env, H_DEV, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH, H_VIS, pushConfigured } from "./env";
 import { accountAllowed } from "./oauth";
 import { type Bucket, Limiter, type LimiterSnapshot, take } from "./ratelimit";
 import { type PendingSnap, USAGE_ADDED_COLUMNS, USAGE_SCHEMA, type UsageDay, UsageMeter, msUntilUtcMidnight } from "./usage";
@@ -62,16 +64,36 @@ import {
 type HubSnap = { g: number; u?: PendingSnap; b?: LimiterSnapshot };
 
 /**
- * Phone sockets also carry `vis` (the page said it is visible / hidden; absent = visible, since the PWA
+ * Phone sockets also carry `vis` (the page said it is visible; absent = hidden, so a socket opened by a
+ * background page never suppresses pushes), `dev` (that browser's push subscription id, if any) and
  * only connects while visible) and `seen` (last frame), used to decide "app open, or Web Push?".
  */
-type Attachment = ({ kind: "phone"; vis?: boolean; seen?: number } | { kind: "daemon"; machine_id: string }) & {
+type Attachment = ({ kind: "phone"; vis?: boolean; seen?: number; dev?: string } | { kind: "daemon"; machine_id: string }) & {
   s?: HubSnap;
   closed?: boolean;
 };
 
 /** A stored Web Push subscription (Phase 4). `id` = first 16 hex chars of sha256(endpoint). */
-export type PushSubRow = { id: string; endpoint: string; p256dh: string; auth: string; created_at: number };
+export type PushSubRow = { id: string; endpoint: string; p256dh: string; auth: string; created_at: number; label: string };
+
+/** Last-known position, scoped to the session it was shared with (`s`, project `p`): D14 consent. */
+type StoredPosition = Position & { s: string; p: string };
+
+/** A location request waiting for the user (table loc_req). */
+type LocReqRow = {
+  rid: string;
+  machine_id: string;
+  session_id: string;
+  project: string;
+  reason: string | null;
+  tok: string;
+  expires_at: number;
+};
+
+/** How long a location request can still be answered (e.g. by tapping its notification later). */
+export const LOCATION_REQUEST_TTL_MS = 10 * 60_000;
+/** Pending location requests kept per account (oldest dropped). */
+const MAX_PENDING_LOCATION = 20;
 
 interface PushJob {
   sub: PushSubRow;
@@ -125,6 +147,12 @@ type MessageRow = {
   created_at: number;
   delivered: number;
 };
+
+/** 22 random base64url characters (128 bits): the token that ties an answer to its location request. */
+function randomTok(): string {
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  return btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
 
 /** "push notification sent to 2 phones" / why not, from the push service's answers (tool results). */
 export function describePushOutcomes(outcomes: PushOutcome[]): string {
@@ -207,7 +235,19 @@ CREATE TABLE IF NOT EXISTS push_subs (
   endpoint TEXT NOT NULL,
   p256dh TEXT NOT NULL,
   auth TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  label TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+-- Location requests waiting for the user's answer (Phase 4, D14). An answer is only accepted for a row
+-- here (rid + its random tok), and only that row's session gets the position.
+CREATE TABLE IF NOT EXISTS loc_req (
+  rid TEXT PRIMARY KEY,
+  machine_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  project TEXT NOT NULL,
+  reason TEXT,
+  tok TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
 ) WITHOUT ROWID;
 ${USAGE_SCHEMA}`;
 
@@ -318,7 +358,9 @@ export class Hub extends DurableObject<Env> {
   private pushPreview = true;
   private locationEnabled = true;
   /** Last-known position (meta 'loc'); expires after LOCATION_KEEP_MS. Never logged. */
-  private lastLoc: Position | null = null;
+  private lastLoc: StoredPosition | null = null;
+  /** loc_req may have rows (null = unknown until checked once). */
+  private locPending: boolean | null = null;
   /** The app's origin (meta 'origin', recorded at push subscribe): default VAPID subject. */
   private origin: string | null = null;
 
@@ -372,7 +414,9 @@ export class Hub extends DurableObject<Env> {
     this.origin = meta.get("origin") ?? null;
     try {
       const loc = meta.get("loc");
-      this.lastLoc = loc ? (JSON.parse(loc) as Position) : null;
+      const v = loc ? (JSON.parse(loc) as StoredPosition) : null;
+      // A position stored without its session (older format) is never reused.
+      this.lastLoc = v && typeof v.s === "string" ? v : null;
     } catch {
       this.lastLoc = null;
     }
@@ -719,6 +763,11 @@ export class Hub extends DurableObject<Env> {
         /* column already exists */
       }
     }
+    try {
+      this.sql.exec("ALTER TABLE push_subs ADD COLUMN label TEXT NOT NULL DEFAULT ''");
+    } catch {
+      /* column already exists */
+    }
     for (const col of USAGE_ADDED_COLUMNS) {
       try {
         this.sql.exec(`ALTER TABLE usage ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
@@ -836,21 +885,22 @@ export class Hub extends DurableObject<Env> {
   // keys on the curve) and computed its id; here it is only stored, charged like any API call.
 
   async pushSubscribe(
-    sub: { id: string; endpoint: string; p256dh: string; auth: string },
+    sub: { id: string; endpoint: string; p256dh: string; auth: string; label: string },
     origin: string,
   ): Promise<Limited<{ devices: string[] }>> {
     const now = Date.now();
     const refused = this.httpGate(now);
     if (refused) return refused;
     this.sql.exec(
-      `INSERT INTO push_subs (id, endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO push_subs (id, endpoint, p256dh, auth, created_at, label) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET endpoint = excluded.endpoint, p256dh = excluded.p256dh, auth = excluded.auth,
-         created_at = excluded.created_at`,
+         created_at = excluded.created_at, label = excluded.label`,
       sub.id,
       sub.endpoint,
       sub.p256dh,
       sub.auth,
       now,
+      sub.label.slice(0, 64),
     );
     // At most MAX_PUSH_DEVICES: a new device replaces the one registered longest ago (old phones,
     // reinstalled browsers whose subscription the push service will 410 anyway).
@@ -870,11 +920,13 @@ export class Hub extends DurableObject<Env> {
     return { ok: true, value: { devices } };
   }
 
-  async pushUnsubscribe(id: string): Promise<Limited<{ removed: boolean; devices: string[] }>> {
+  /** Remove one device (by id: also from another phone, e.g. a lost one) or "all" of them. */
+  async pushUnsubscribe(id: string | "all"): Promise<Limited<{ removed: boolean; devices: string[] }>> {
     const now = Date.now();
     const refused = this.httpGate(now);
     if (refused) return refused;
-    const removed = this.sql.exec("DELETE FROM push_subs WHERE id = ?", id).rowsWritten > 0;
+    const removed =
+      (id === "all" ? this.sql.exec("DELETE FROM push_subs") : this.sql.exec("DELETE FROM push_subs WHERE id = ?", id)).rowsWritten > 0;
     if (removed) {
       this.subs = null;
       this.broadcastSettings();
@@ -885,12 +937,14 @@ export class Hub extends DurableObject<Env> {
   }
 
   private pushSubs(): PushSubRow[] {
-    this.subs ??= this.sql.exec<PushSubRow>("SELECT id, endpoint, p256dh, auth, created_at FROM push_subs ORDER BY created_at").toArray();
+    this.subs ??= this.sql
+      .exec<PushSubRow>("SELECT id, endpoint, p256dh, auth, created_at, label FROM push_subs ORDER BY created_at")
+      .toArray();
     return this.subs;
   }
 
   /** Last-known position, or null (expired ones are deleted: D14 keeps no history). */
-  private lastPosition(now: number): Position | null {
+  private lastPosition(now: number): StoredPosition | null {
     if (this.lastLoc && now - this.lastLoc.at > LOCATION_KEEP_MS) {
       this.sql.exec("DELETE FROM meta WHERE k = 'loc'");
       this.lastLoc = null;
@@ -903,7 +957,10 @@ export class Hub extends DurableObject<Env> {
       push_preview: this.pushPreview,
       location: this.locationEnabled,
       location_at: this.lastPosition(now)?.at ?? null,
-      push_devices: pushConfigured(this.env) ? this.pushSubs().map((x) => x.id) : [],
+      location_project: this.lastPosition(now)?.p ?? null,
+      push_devices: pushConfigured(this.env)
+        ? this.pushSubs().map((x) => ({ id: x.id, label: x.label || "browser", added_at: x.created_at }))
+        : [],
       push_available: pushConfigured(this.env),
     };
   }
@@ -919,34 +976,40 @@ export class Hub extends DurableObject<Env> {
    * (getWebSocketAutoResponseTimestamp; pings don't wake the Hub). A half-open socket of a phone that
    * went away therefore stops counting after ~75 s, and pushes resume.
    */
-  private visiblePhone(now: number): boolean {
+  private appOpen(now: number): { any: boolean; devs: Set<string> } {
+    const devs = new Set<string>();
+    let any = false;
     for (const ws of this.ctx.getWebSockets("phone")) {
       if (ws.readyState !== WebSocket.OPEN) continue;
       const a = ws.deserializeAttachment() as Attachment | null;
-      if (!a || a.kind !== "phone" || a.closed || a.vis === false) continue;
+      // A socket whose page never said it is visible counts as hidden (e.g. opened in the background).
+      if (!a || a.kind !== "phone" || a.closed || a.vis !== true) continue;
       let pinged = 0;
       try {
         pinged = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0;
       } catch {
         /* not available */
       }
-      if (now - Math.max(a.seen ?? 0, pinged) <= PHONE_ALIVE_MS) return true;
+      if (now - Math.max(a.seen ?? 0, pinged) > PHONE_ALIVE_MS) continue;
+      any = true;
+      if (a.dev) devs.add(a.dev);
     }
-    return false;
+    return { any, devs };
   }
 
   /**
-   * Decide a push to every device of this account (sent at the end of the event, see drainPushes).
-   * Returns a sentence for the tool result: whether / why not the user gets a notification.
+   * Decide a push to every device of this account except `skip` (devices showing the app right now);
+   * sent at the end of the event (drainPushes). Returns a sentence for the tool result.
    */
   private queuePush(
     payload: PushPayload,
     opts: { ttl: number; urgency: "normal" | "high" },
     now: number,
     done?: (outcomes: PushOutcome[]) => void,
+    skip: Set<string> = new Set(),
   ): { sent: number; text: string } {
     if (!pushConfigured(this.env)) return { sent: 0, text: "no notification: Web Push is not set up on the server (VAPID keys)" };
-    const subs = this.pushSubs();
+    const subs = this.pushSubs().filter((x) => !skip.has(x.id));
     if (!subs.length) return { sent: 0, text: "no notification: notifications are not enabled on any phone (phone app > Settings)" };
     const targets = subs.filter((x) => (this.pushPaused.get(x.id) ?? 0) <= now);
     if (!targets.length) return { sent: 0, text: "no notification: the push service asked us to wait (rate limited)" };
@@ -1068,9 +1131,18 @@ export class Hub extends DurableObject<Env> {
       const pair = new WebSocketPair();
       const server = pair[1];
       this.ctx.acceptWebSocket(server, ["phone"]);
-      server.serializeAttachment({ kind: "phone", seen: now } satisfies Attachment);
+      const dev = request.headers.get(H_DEV);
+      server.serializeAttachment({
+        kind: "phone",
+        seen: now,
+        vis: request.headers.get(H_VIS) === "1",
+        ...(dev && /^[0-9a-f]{16}$/.test(dev) ? { dev } : {}),
+      } satisfies Attachment);
       // Over budget: no machine/session reads at all, only the reason (from memory).
-      this.sendPhone(server, this.overBudget(now) ? { t: "state", machines: [], sessions: [], usage: this.usageInfo(now) } : this.stateFrame());
+      const blocked = this.overBudget(now) !== null;
+      this.sendPhone(server, blocked ? { t: "state", machines: [], sessions: [], usage: this.usageInfo(now) } : this.stateFrame());
+      // Pending location requests (the complete list; a page opened from a notification waits for it).
+      if (!blocked) this.sendPhone(server, { t: "location_pending", requests: this.pendingLocations(now) });
       this.saveSnap(server, now);
       this.accepted = true;
       return new Response(null, { status: 101, webSocket: pair[0] });
@@ -1138,23 +1210,32 @@ export class Hub extends DurableObject<Env> {
     }
     const now = Date.now();
     this.begin("frames", now);
+    let threw = true;
     try {
       this.onFrame(ws, att, message, now);
       this.gcStep(now);
+      threw = false;
     } finally {
       if (att.kind === "phone") this.touchPhone(ws, now);
       this.saveSnap(ws, now);
+      // A frame that failed half-way must not leave pushes behind for some later event to send.
+      if (threw) this.pushQueue.length = 0;
     }
     // Web Push decided by this frame: sent now, within the event (no work left once it returns).
     if (this.pushQueue.length) await this.drainPushes();
   }
 
   /** Record a phone's last frame (and visibility) in its attachment: no storage I/O. */
-  private touchPhone(ws: WebSocket, now: number, vis?: boolean): void {
+  private touchPhone(ws: WebSocket, now: number, vis?: boolean, dev?: string): void {
     try {
       const a = ws.deserializeAttachment() as Attachment | null;
       if (!a || a.kind !== "phone" || a.closed) return;
-      ws.serializeAttachment({ ...a, seen: now, ...(vis === undefined ? {} : { vis }) } satisfies Attachment);
+      const next: Attachment = { ...a, seen: now, ...(vis === undefined ? {} : { vis }) };
+      if (vis !== undefined) {
+        if (dev) next.dev = dev;
+        else delete next.dev;
+      }
+      ws.serializeAttachment(next satisfies Attachment);
     } catch {
       /* closing */
     }
@@ -1178,7 +1259,7 @@ export class Hub extends DurableObject<Env> {
       }
       if (r.value.t === "visibility") {
         // Only the socket's attachment changes (no SQL), so this works even over budget.
-        this.touchPhone(ws, now, r.value.visible);
+        this.touchPhone(ws, now, r.value.visible, r.value.dev);
         return;
       }
       if (over) {
@@ -1351,7 +1432,10 @@ export class Hub extends DurableObject<Env> {
         return;
       }
       case "visibility":
-        this.touchPhone(ws, now, f.visible);
+        this.touchPhone(ws, now, f.visible, f.dev);
+        return;
+      case "location_list":
+        this.sendPhone(ws, { t: "location_pending", requests: this.pendingLocations(now) });
         return;
       case "settings": {
         if (f.push_preview !== undefined && f.push_preview !== this.pushPreview) {
@@ -1361,10 +1445,17 @@ export class Hub extends DurableObject<Env> {
         if (f.location !== undefined && f.location !== this.locationEnabled) {
           this.setMeta("loc_enabled", f.location ? "1" : "0");
           this.locationEnabled = f.location;
-          if (!f.location && this.lastLoc) {
-            // Turning location off also forgets the last-known position.
-            this.sql.exec("DELETE FROM meta WHERE k = 'loc'");
-            this.lastLoc = null;
+          if (!f.location) {
+            // Turning location off also forgets the last-known position and every pending request.
+            if (this.lastLoc) {
+              this.sql.exec("DELETE FROM meta WHERE k = 'loc'");
+              this.lastLoc = null;
+            }
+            if (this.locPending !== false) {
+              this.sql.exec("DELETE FROM loc_req");
+              this.locPending = false;
+              this.broadcastPhones({ t: "location_pending", requests: [] });
+            }
           }
         }
         this.broadcastSettings();
@@ -1463,7 +1554,7 @@ export class Hub extends DurableObject<Env> {
         // The tool result says whether the user is notified; with a push, only once the push service
         // answered (at the end of this event, at most PUSH_TIMEOUT_MS later).
         const reply = (notify: string) => this.sendDaemon(ws, { t: "sent", req_id: f.req_id, message_id: msg.id, notify });
-        const n = this.notifyMessage(msg, s.project, f.urgency, now, (outcomes) => reply(describePushOutcomes(outcomes)));
+        const n = this.notifyMessage(msg, s.project, f.urgency, now, reply);
         if (n !== null) reply(n);
         return;
       }
@@ -1525,20 +1616,38 @@ export class Hub extends DurableObject<Env> {
     project: string,
     urgency: Urgency,
     now: number,
-    done: (outcomes: PushOutcome[]) => void,
+    done: (text: string) => void,
   ): string | null {
     const opts = pushOptionsFor(urgency);
     if (!opts || urgency === "silent") return "silent: shown in the phone app only, no notification";
-    if (this.visiblePhone(now)) return "the phone app is open, so it is shown there (no notification)";
+    // Per device: a browser showing the app gets no push; every other registered device does.
+    const open = this.appOpen(now);
     const payload = messagePush({ session_id: msg.session_id, id: msg.id, text: msg.text, urgency, project }, this.pushPreview);
-    const q = this.queuePush(payload, opts, now, done);
-    return q.sent > 0 ? null : q.text;
+    const also = open.any ? "; also shown in the app that is open" : "";
+    const q = this.queuePush(payload, opts, now, (o) => done(describePushOutcomes(o) + also), open.devs);
+    if (q.sent > 0) return null;
+    return open.any ? "the phone app is open, so it is shown there (no notification)" : q.text;
   }
 
   // -------------------------------------------------------------------------
-  // On-demand location (D14): Claude asks (get_location) -> the open app prompts the user, or a push
-  // "Claude wants your location" opens it. Stateless in the Hub: the request's routing (rid, machine,
-  // session) travels to the phone and back, so nothing is lost when the Hub hibernates meanwhile.
+  // On-demand location (D14). Consent rules:
+  //  - A position only ever goes to the session whose request the user answered (rid + random tok in
+  //    loc_req); it is kept as that session's last-known position for LOCATION_KEEP_MS.
+  //  - A session may reuse ONLY its own last-known position, and only within its max_age_s; any other
+  //    session's request asks the user again. Declined / unanswered requests return no position at all.
+  //  - An answer for an unknown, expired or mismatched request is refused and never stored.
+
+  /** Unexpired pending requests (expired rows are deleted); no SQL when known to be empty. */
+  private pendingLocations(now: number): LocationRequestInfo[] {
+    if (this.locPending === false) return [];
+    const expired = this.sql.exec("DELETE FROM loc_req WHERE expires_at <= ?", now).rowsWritten > 0;
+    const rows = this.sql.exec<LocReqRow>("SELECT * FROM loc_req ORDER BY expires_at").toArray();
+    this.locPending = rows.length > 0;
+    const list = rows.map((r) => ({ rid: r.rid, session_id: r.session_id, project: r.project, reason: r.reason, tok: r.tok, expires_at: r.expires_at }));
+    // Some just expired: every open app gets the corrected list (their prompts for those close).
+    if (expired) this.broadcastPhones({ t: "location_pending", requests: list });
+    return list;
+  }
 
   private onLocationRequest(
     ws: WebSocket,
@@ -1553,105 +1662,110 @@ export class Hub extends DurableObject<Env> {
       return;
     }
     if (!this.locationEnabled) {
-      reply({
-        status: "disabled",
-        position: null,
-        fresh: false,
-        message: "the user turned location sharing off (phone app > Settings)",
-      });
+      reply({ status: "disabled", position: null, fresh: false, message: "the user turned location sharing off (phone app > Settings)" });
       return;
     }
     const last = this.lastPosition(now);
-    if (last && now - last.at <= f.max_age_s * 1000) {
-      reply({ status: "ok", position: last, fresh: false });
+    if (last && last.s === s.session_id && f.max_age_s > 0 && now - last.at <= f.max_age_s * 1000) {
+      const { s: _s, p: _p, ...position } = last;
+      reply({ status: "ok", position, fresh: false });
       return;
     }
     const wait = this.limited("location", now);
     if (wait !== null) {
       reply({
         status: "rate_limited",
-        position: last,
+        position: null,
         fresh: false,
         message: `too many location requests (${this.rateText("location")}); try again in ${humanWait(wait)}`,
       });
       return;
     }
-    const reason = f.reason ? previewText(f.reason, 200) : null;
-    // Every open app gets the prompt (a hidden one shows it when it comes back to the foreground).
+    const request: LocationRequestInfo = {
+      rid: f.req_id,
+      session_id: s.session_id,
+      project: s.project.slice(0, 128),
+      reason: f.reason ? previewText(f.reason, 200) : null,
+      tok: randomTok(),
+      expires_at: now + LOCATION_REQUEST_TTL_MS,
+    };
     const phones = this.ctx.getWebSockets("phone").filter((p) => {
       const a = p.deserializeAttachment() as Attachment | null;
       return p.readyState === WebSocket.OPEN && !!a && !a.closed;
     });
-    for (const p of phones) {
-      this.sendPhone(p, { t: "location_request", rid: f.req_id, machine_id: machineId, session_id: s.session_id, project: s.project, reason });
+    let via: LocationVia;
+    if (this.appOpen(now).any) {
+      via = "app";
+    } else {
+      const payload: PushPayload = { k: "l", r: request.rid, t: request.tok, s: s.session_id };
+      if (this.pushPreview) {
+        payload.p = Array.from(s.project).slice(0, 64).join("");
+        if (request.reason) payload.b = previewText(request.reason);
+      }
+      // High priority, and pointless after the longest a get_location call waits.
+      const pushed = this.queuePush(payload, { ttl: 120, urgency: "high" }, now);
+      if (pushed.sent > 0) via = "push";
+      else if (phones.length) via = "app"; // only hidden apps: they show the prompt when brought back
+      else {
+        reply({
+          status: "no_device",
+          position: null,
+          fresh: false,
+          message: `the phone app is not open and the phone can't be notified (${pushed.text})`,
+        });
+        return;
+      }
     }
-    if (this.visiblePhone(now)) {
-      this.sendDaemon(ws, { t: "location_wait", req_id: f.req_id, via: "app", last });
-      return;
-    }
-    const payload: PushPayload = { k: "l", r: f.req_id, m: machineId, s: s.session_id };
-    if (this.pushPreview) {
-      payload.p = Array.from(s.project).slice(0, 64).join("");
-      if (reason) payload.b = previewText(reason);
-    }
-    // High priority, and pointless after the longest a get_location call waits.
-    const pushed = this.queuePush(payload, { ttl: 120, urgency: "high" }, now);
-    if (pushed.sent > 0) {
-      this.sendDaemon(ws, { t: "location_wait", req_id: f.req_id, via: "push", last });
-      return;
-    }
-    if (phones.length) {
-      // Only hidden apps: they show the prompt when the user returns to them.
-      this.sendDaemon(ws, { t: "location_wait", req_id: f.req_id, via: "app", last });
-      return;
-    }
-    reply({
-      status: "no_device",
-      position: last,
-      fresh: false,
-      message: `the phone app is not open and the phone can't be notified (${pushed.text})`,
-    });
+    this.sql.exec(
+      "INSERT OR REPLACE INTO loc_req (rid, machine_id, session_id, project, reason, tok, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      request.rid,
+      machineId,
+      request.session_id,
+      request.project,
+      request.reason,
+      request.tok,
+      request.expires_at,
+    );
+    this.sql.exec(
+      "DELETE FROM loc_req WHERE rid IN (SELECT rid FROM loc_req ORDER BY expires_at DESC LIMIT -1 OFFSET ?)",
+      MAX_PENDING_LOCATION,
+    );
+    this.locPending = true;
+    for (const p of phones) this.sendPhone(p, { t: "location_request", request });
+    this.sendDaemon(ws, { t: "location_wait", req_id: f.req_id, via });
   }
 
-  /** The user's answer (or a position they shared): store it as last-known and route it to the asker. */
+  /** The user's answer to a pending request: only then is a position stored, for that request's session. */
   private onPhoneLocation(ws: WebSocket, f: Extract<PhoneToHub, { t: "location" }>, now: number): void {
-    if (!this.locationEnabled) {
-      this.sendPhone(ws, { t: "error", error: "Location sharing is turned off in Settings." });
-      if (f.rid && f.machine_id) {
-        const d = this.daemonSocket(f.machine_id);
-        if (d) {
-          this.sendDaemon(d, {
-            t: "location",
-            req_id: f.rid,
-            result: { status: "disabled", position: null, fresh: false, message: "the user turned location sharing off" },
-          });
-        }
-      }
+    const row =
+      this.locPending === false ? undefined : this.sql.exec<LocReqRow>("SELECT * FROM loc_req WHERE rid = ?", f.rid).toArray()[0];
+    if (!row || row.expires_at <= now || !timingSafeEqual(row.tok, f.tok)) {
+      if (row && row.expires_at <= now) this.sql.exec("DELETE FROM loc_req WHERE rid = ?", f.rid);
+      this.sendPhone(ws, { t: "location_done", rid: f.rid, status: "expired" });
+      this.sendPhone(ws, { t: "error", error: "This location request has expired or was already answered; nothing was shared." });
       return;
     }
-    let pos: Position | null = null;
+    this.sql.exec("DELETE FROM loc_req WHERE rid = ?", f.rid);
+    let result: LocationResult;
     if (f.status === "ok" && f.position) {
       // A clock running ahead must not make a position look newer than it is.
-      pos = { ...f.position, at: Math.min(f.position.at, now) };
-      this.setMeta("loc", JSON.stringify(pos));
-      this.lastLoc = pos;
-      this.broadcastSettings();
+      const position: Position = { ...f.position, at: Math.min(f.position.at, now) };
+      const stored: StoredPosition = { ...position, s: row.session_id, p: row.project };
+      this.setMeta("loc", JSON.stringify(stored));
+      this.lastLoc = stored;
+      result = { status: "ok", position, fresh: true };
+    } else {
+      result = {
+        status: f.status === "ok" ? "unavailable" : f.status,
+        position: null,
+        fresh: false,
+        message: f.status === "denied" ? "the user declined to share their location" : "the phone could not get a position",
+      };
     }
-    if (f.rid && f.machine_id) {
-      const d = this.daemonSocket(f.machine_id);
-      if (d) {
-        const result: LocationResult = pos
-          ? { status: "ok", position: pos, fresh: true }
-          : {
-              status: f.status === "ok" ? "unavailable" : f.status,
-              position: this.lastPosition(now),
-              fresh: false,
-              message: f.status === "denied" ? "the user declined to share their location" : "the phone could not get a position",
-            };
-        this.sendDaemon(d, { t: "location", req_id: f.rid, result });
-      }
-      this.broadcastPhones({ t: "location_done", rid: f.rid });
-    }
+    const d = this.daemonSocket(row.machine_id);
+    if (d) this.sendDaemon(d, { t: "location", req_id: row.rid, result });
+    this.broadcastPhones({ t: "location_done", rid: row.rid, status: result.status === "ok" ? "ok" : f.status === "denied" ? "denied" : "unavailable" });
+    if (result.status === "ok") this.broadcastSettings();
   }
 
   private setMeta(k: string, v: string): void {

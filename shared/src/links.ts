@@ -8,6 +8,18 @@
  * the only kind the agent is told to send (map_link tool).
  */
 
+/** The WHATWG URL parser (browser, node, workerd); declared here because shared/ has no DOM/node types. */
+interface ParsedUrl {
+  protocol: string;
+  username: string;
+  password: string;
+  port: string;
+  hostname: string;
+  pathname: string;
+  href: string;
+}
+declare const URL: { new (url: string): ParsedUrl };
+
 export type Segment = { text: string; href?: undefined } | { text: string; href: string; kind: "map" | "geo" };
 
 /** Hosts whose links open as maps; `paths` restricts the path prefix (lower case). */
@@ -44,19 +56,26 @@ export function allowedMapHref(url: string): { href: string; kind: "map" | "geo"
     if (!(lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180)) return null;
     return { href: `geo:${m[1]},${m[2]}${m[3] ?? ""}`, kind: "geo" };
   }
+  // Dot segments (also percent-encoded) and backslashes would let the URL resolve to a path outside the
+  // allowlisted prefix (e.g. /maps/../amp/s/evil.example): refuse them outright, before parsing.
+  if (/\.\.|%2e|%5c|\\/i.test(url)) return null;
   // https only; host = letters/digits/dots/dashes followed by "/", "?", "#" or the end (so no
-  // "user@", ":port" or "\" tricks), and nothing that browsers would reinterpret.
-  const m = /^https:\/\/([A-Za-z0-9.-]+)([/?#][^\s\\]*)?$/.exec(url);
-  if (!m) return null;
-  const host = m[1]!.toLowerCase();
-  const rest = m[2] ?? "";
+  // "user@", ":port" or "\" tricks).
+  if (!/^https:\/\/[A-Za-z0-9.-]+(?:[/?#][^\s]*)?$/.test(url)) return null;
+  let u: ParsedUrl;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:" || u.username || u.password || u.port) return null;
+  const host = u.hostname.toLowerCase();
   if (!Object.prototype.hasOwnProperty.call(MAP_HOSTS, host)) return null;
   const paths = MAP_HOSTS[host];
-  if (paths) {
-    const path = rest.toLowerCase();
-    if (!paths.some((p) => path === p || path.startsWith(`${p}/`) || path.startsWith(`${p}?`))) return null;
-  }
-  return { href: `https://${host}${rest}`, kind: "map" };
+  // The prefix is checked on the parsed (normalized) path, and the parsed URL is what the link opens.
+  const path = u.pathname.toLowerCase();
+  if (paths && !paths.some((p) => path === p || path.startsWith(`${p}/`))) return null;
+  return { href: u.href, kind: "map" };
 }
 
 /** Split a message into plain text and allowed map links, in order. */

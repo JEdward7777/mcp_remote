@@ -211,14 +211,16 @@ export type Position = z.infer<typeof Position>;
 
 /**
  * Outcome of a location request:
- *   ok           position is set (fresh = answered this request, else last-known within max_age_s)
+ *   ok           position is set (fresh = the user shared it for this request; otherwise it is the position
+ *                the user shared with THIS session earlier, at most max_age_s old)
  *   denied       the user declined (or the browser permission is denied)
  *   unavailable  the phone could not get a fix
  *   disabled     location is turned off for this account (Settings on the phone)
  *   no_device    no open app and no push-enabled phone to ask
  *   rate_limited too many location requests that needed the phone
  *   timeout      nobody answered in time (set by the shim)
- * `position` may carry the last-known position (with its age) for every status except disabled.
+ * `position` is null for every status except ok (consent, D14: a declined or unanswered request
+ * never hands out an older position, and a position shared with one session never reaches another).
  */
 export const LOCATION_STATUSES = ["ok", "denied", "unavailable", "disabled", "no_device", "rate_limited", "timeout"] as const;
 export const LocationStatus = z.enum(LOCATION_STATUSES);
@@ -235,6 +237,27 @@ export type LocationResult = z.infer<typeof LocationResult>;
 export const LocationVia = z.enum(["app", "push"]);
 export type LocationVia = z.infer<typeof LocationVia>;
 
+/** A registered push subscription, as listed on the phone (Settings -> devices). */
+export const PushDevice = z.object({
+  /** First 16 hex chars of sha256(endpoint). */
+  id: z.string().max(32),
+  /** "Chrome on Android", from the User-Agent at registration. */
+  label: z.string().max(64),
+  added_at: z.number().int(),
+});
+export type PushDevice = z.infer<typeof PushDevice>;
+
+/** A pending location request as the phone sees it. `tok` lets a notification tap share without a second prompt. */
+export const LocationRequestInfo = z.object({
+  rid: ReqId,
+  session_id: SessionId,
+  project: z.string().max(128),
+  reason: z.string().max(MAX_LOCATION_REASON_CHARS).nullable(),
+  tok: z.string().min(16).max(64),
+  expires_at: z.number().int(),
+});
+export type LocationRequestInfo = z.infer<typeof LocationRequestInfo>;
+
 /** Per-account settings the phone can change (stored in the account's Hub). */
 export const Settings = z.object({
   /** Show the first ~100 characters of a message in the notification (lock screen). */
@@ -243,8 +266,10 @@ export const Settings = z.object({
   location: z.boolean(),
   /** When the last-known position was measured (no coordinates are sent to the phone list). */
   location_at: z.number().int().nullable(),
-  /** Short ids of the push subscriptions stored for this account (a phone checks that its own is listed). */
-  push_devices: z.array(z.string().max(32)).max(16),
+  /** Project of the session that position was shared with (only that session may reuse it). */
+  location_project: z.string().max(128).nullable(),
+  /** Push subscriptions stored for this account (a phone finds its own by id). */
+  push_devices: z.array(PushDevice).max(16),
   /** Web Push is configured on the server (VAPID keys set). */
   push_available: z.boolean(),
 });
@@ -284,23 +309,27 @@ export const PhoneToHub = z.discriminatedUnion("t", [
   }),
   /** Remove an ended launch from the list. */
   z.object({ t: z.literal("launch_dismiss"), machine_id: MachineId, launch_id: LaunchId, client_id: ReqId }),
-  /** The page became visible / hidden: while no visible page is connected, the Hub sends Web Push instead. */
-  z.object({ t: z.literal("visibility"), visible: z.boolean() }),
+  /**
+   * The page became visible / hidden. `dev` = this browser's push subscription id: while its page is
+   * visible, that device gets no push (the others still do).
+   */
+  z.object({ t: z.literal("visibility"), visible: z.boolean(), dev: z.string().regex(/^[0-9a-f]{16}$/).optional() }),
   z.object({ t: z.literal("settings"), push_preview: z.boolean().optional(), location: z.boolean().optional() }),
   /**
-   * The user's answer to a location request (rid/machine_id/session_id echo the request), or a position
-   * shared on the user's own initiative (no rid). `position` is required when status is "ok".
+   * The user's answer to a pending location request (rid + tok from location_request / location_pending).
+   * Anything else is refused: no position is ever stored without a request. `position` required when ok.
    */
   z
     .object({
       t: z.literal("location"),
-      rid: ReqId.optional(),
-      machine_id: MachineId.optional(),
-      session_id: SessionId.optional(),
+      rid: ReqId,
+      tok: z.string().min(16).max(64),
       status: z.enum(["ok", "denied", "unavailable"]),
       position: Position.optional(),
     })
     .refine((f) => f.status !== "ok" || !!f.position, "position is required when status is ok"),
+  /** Ask for the list of pending location requests (answered with location_pending). */
+  z.object({ t: z.literal("location_list") }),
 ]);
 export type PhoneToHub = z.infer<typeof PhoneToHub>;
 
@@ -312,17 +341,12 @@ export const HubToPhone = z.discriminatedUnion("t", [
     usage: UsageInfo.optional(),
     settings: Settings.optional(),
   }),
-  /** Claude (in session_id) asks for the phone's location; answer with a PhoneToHub "location" frame. */
-  z.object({
-    t: z.literal("location_request"),
-    rid: ReqId,
-    machine_id: MachineId,
-    session_id: SessionId,
-    project: z.string(),
-    reason: z.string().max(MAX_LOCATION_REASON_CHARS).nullable(),
-  }),
-  /** A location request was answered (by this or another phone): close its prompt. */
-  z.object({ t: z.literal("location_done"), rid: ReqId }),
+  /** Claude asks for the phone's location; answer with a PhoneToHub "location" frame (rid + tok). */
+  z.object({ t: z.literal("location_request"), request: LocationRequestInfo }),
+  /** Every pending location request (sent on connect and on location_list): the complete list. */
+  z.object({ t: z.literal("location_pending"), requests: z.array(LocationRequestInfo).max(32) }),
+  /** A location request was answered (by this or another phone) or expired: close its prompt. */
+  z.object({ t: z.literal("location_done"), rid: ReqId, status: z.enum(["ok", "denied", "unavailable", "expired"]) }),
   /** Settings changed (cheaper than a full state frame). */
   z.object({ t: z.literal("settings"), settings: Settings }),
   z.object({ t: z.literal("message"), message: MessageRecord, client_id: ReqId.optional() }),
@@ -391,7 +415,8 @@ export const HubToDaemon = z.discriminatedUnion("t", [
   /** `notify`: how the user is told (app open / push to N devices / why not), for the tool result. */
   z.object({ t: z.literal("sent"), req_id: ReqId, message_id: z.number().int(), notify: z.string().max(MAX_DETAIL_CHARS).optional() }),
   /** The phone is being asked (open app or push); `last` = last-known position, if any (any age). */
-  z.object({ t: z.literal("location_wait"), req_id: ReqId, via: LocationVia, last: Position.nullable() }),
+  /** The phone is being asked (no position is handed out until the user answers). */
+  z.object({ t: z.literal("location_wait"), req_id: ReqId, via: LocationVia }),
   z.object({ t: z.literal("location"), req_id: ReqId, result: LocationResult }),
   /** Re-send hello (e.g. a session id this daemon was refused may be free now). */
   z.object({ t: z.literal("resync") }),
@@ -452,7 +477,8 @@ export const DaemonToShim = z.discriminatedUnion("t", [
   z.object({ t: z.literal("deliver"), messages: z.array(MessageRecord) }),
   z.object({ t: z.literal("sent"), req_id: ReqId, message_id: z.number().int(), notify: z.string().max(MAX_DETAIL_CHARS).optional() }),
   z.object({ t: z.literal("send_error"), req_id: ReqId, error: z.string() }),
-  z.object({ t: z.literal("location_wait"), req_id: ReqId, via: LocationVia, last: Position.nullable() }),
+  /** The phone is being asked (no position is handed out until the user answers). */
+  z.object({ t: z.literal("location_wait"), req_id: ReqId, via: LocationVia }),
   z.object({ t: z.literal("location"), req_id: ReqId, result: LocationResult }),
   z.object({ t: z.literal("error"), error: z.string() }),
   z.object({ t: z.literal("reloaded"), ok: z.boolean(), error: z.string().optional() }),

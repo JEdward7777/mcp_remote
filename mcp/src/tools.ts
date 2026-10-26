@@ -31,7 +31,7 @@ Pick the urgency deliberately; it decides how the phone notifies the user:
 
 When a phone message asks you something, reply with send_message (normal urgency unless you are blocked). Keep messages short and self-contained; they are read on a phone.
 
-Location: get_location asks the user's phone where it is (the user has to agree each time: they tap Share in the app, or open a notification). Only ask when the answer really depends on where the user is (directions, "where am I", something nearby), never routinely and never to track them. Prefer a recent last-known position (max_age_s) over asking again. If the user turned location off or declines, accept it.
+Location: get_location asks the user's phone where it is (the user has to agree each time: they tap Share in the app, or open a notification). Only ask when the answer really depends on where the user is (directions, "where am I", something nearby), never routinely and never to track them. A position the user shared with this session in the last max_age_s seconds is returned without asking again, so prefer a sensible max_age_s over asking twice. If the user turned location off or declines, accept it.
 
 Map links: map_link builds a Google Maps link (a pin, or directions; without an origin, Maps starts from wherever the phone is). Put the link in send_message: the phone makes Google Maps links tappable. Other links are shown as plain text, so don't rely on them being clickable.`;
 
@@ -65,7 +65,8 @@ export const TOOLS = [
     description:
       "Ask the user's phone for its current location (on demand; the user must agree each time). Only when the answer " +
       "depends on where the user is. Returns coordinates with accuracy and age, or why there is none (declined, " +
-      "turned off, no answer in time). A last-known position at most max_age_s old is returned at once without asking.",
+      "turned off, no answer in time). A position the user shared with THIS session at most max_age_s ago is returned " +
+      "at once without asking.",
     inputSchema: {
       type: "object",
       properties: {
@@ -79,7 +80,7 @@ export const TOOLS = [
           minimum: 0,
           maximum: 86400,
           default: 300,
-          description: "Accept a last-known position up to this old (seconds) instead of asking. 0 = always ask.",
+          description: "Reuse a position the user shared with this session up to this old (seconds) instead of asking. 0 = always ask.",
         },
         timeout_s: {
           type: "integer",
@@ -186,22 +187,22 @@ function describe(p: Position, now: number): string {
 
 /** The tool result for get_location. `via` = how the phone was asked (if it was). */
 export function formatLocation(r: LocationResult, now: number, ctx: { via?: LocationVia | null; timeoutS?: number } = {}): string {
-  const lastLine = r.position && r.status !== "ok" ? `\nLast-known location (may be out of date): ${describe(r.position, now)}` : "";
+  // Only "ok" ever carries a position (consent, D14); every other outcome is reported without one.
   switch (r.status) {
     case "ok":
       return r.fresh
         ? `Location shared by the user just now: ${describe(r.position!, now)}`
-        : `Last-known location (recent enough for max_age_s, the phone was not asked): ${describe(r.position!, now)}`;
+        : `Location the user shared with this session earlier (within max_age_s, so the phone was not asked again): ${describe(r.position!, now)}`;
     case "denied":
-      return `The user declined to share their location.${lastLine}`;
+      return "The user declined to share their location.";
     case "unavailable":
-      return `No location: ${r.message ?? "the phone could not get a position"}.${lastLine}`;
+      return `No location: ${r.message ?? "the phone could not get a position"}.`;
     case "disabled":
       return "Location sharing is turned off for this account (phone app > Settings). Don't ask again unless the user brings it up.";
     case "no_device":
-      return `Could not ask the phone: ${r.message ?? "no phone can be reached"}.${lastLine}`;
+      return `Could not ask the phone: ${r.message ?? "no phone can be reached"}.`;
     case "rate_limited":
-      return `Not asked: ${r.message ?? "too many location requests"}.${lastLine}`;
+      return `Not asked: ${r.message ?? "too many location requests"}.`;
     case "timeout": {
       const how =
         ctx.via === "push"
@@ -211,7 +212,7 @@ export function formatLocation(r: LocationResult, now: number, ctx: { via?: Loca
             : "the server did not answer";
       return (
         `No answer within ${ctx.timeoutS ?? "the"} s: ${how}. If the user shares it later, get_location with a large enough ` +
-        `max_age_s returns it without asking again.${lastLine}`
+        `max_age_s returns it without asking again.`
       );
     }
   }

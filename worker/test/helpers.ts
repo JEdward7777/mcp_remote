@@ -46,8 +46,9 @@ export async function connect(path: string, headers: Record<string, string>): Pr
   return s;
 }
 
-export async function phone(user: string): Promise<Sock> {
-  const s = await connect("/api/ws", { cookie: await cookieFor(user), origin: ORIGIN });
+/** A phone socket; by default its page is visible (`?vis=1`), as the PWA says when it connects. */
+export async function phone(user: string, query = "?vis=1"): Promise<Sock> {
+  const s = await connect(`/api/ws${query}`, { cookie: await cookieFor(user), origin: ORIGIN });
   if (typeof s === "number") throw new Error(`phone connect failed: ${s}`);
   return s;
 }

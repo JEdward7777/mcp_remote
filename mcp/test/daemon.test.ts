@@ -607,9 +607,9 @@ describe("daemon tells shims why the server refused (phase 3 review round 2)", (
     const req = await waitFor(() => hubFrames.find((f) => f.t === "location_req"), "location_req");
     expect(req).toMatchObject({ session_id: "sloc", max_age_s: 60, reason: "nearby food" });
     expect(req.req_id).toMatch(/^l[0-9a-f]{16}$/);
-    hubSockets[0]!.send(JSON.stringify({ t: "location_wait", req_id: req.req_id, via: "app", last: null }));
+    hubSockets[0]!.send(JSON.stringify({ t: "location_wait", req_id: req.req_id, via: "app" }));
     await waitFor(() => a.frames.find((f) => f.t === "location_wait"), "wait at shim");
-    expect(a.frames.find((f) => f.t === "location_wait")).toEqual({ t: "location_wait", req_id: "g1", via: "app", last: null });
+    expect(a.frames.find((f) => f.t === "location_wait")).toEqual({ t: "location_wait", req_id: "g1", via: "app" });
     // The Hub connection drops and comes back; the phone's answer arrives on the new one.
     hubSockets[0]!.terminate();
     await waitFor(() => hubSockets.length === 2 && hubFrames.filter((f) => f.t === "hello").length === 2, "reconnect");

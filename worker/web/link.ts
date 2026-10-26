@@ -227,6 +227,9 @@ export class PhoneLink {
       this.schedule(auth);
       return;
     }
+    // The page may have gone to the background while /api/me was in flight: don't open a socket
+    // there (wake() reconnects when it is visible again).
+    if (!this.d.isVisible()) return;
     this.connect();
   }
 

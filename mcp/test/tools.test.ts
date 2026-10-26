@@ -42,11 +42,11 @@ describe("shim tools", () => {
     const fresh = formatLocation({ status: "ok", position: pos(4000), fresh: true }, now);
     expect(fresh).toMatch(/^Location shared by the user just now: 52\.37,4\.89 \(accuracy about 12 m\), measured 2026-10-26T11:59:56\.000Z \(4 s ago\)\./);
     expect(fresh).toMatch(/Google Maps: https:\/\/www\.google\.com\/maps\/search\/\?api=1&query=52\.37%2C4\.89/);
-    expect(formatLocation({ status: "ok", position: pos(120_000), fresh: false }, now)).toMatch(/^Last-known location .*\(2 min ago\)/);
-    const t = formatLocation({ status: "timeout", position: pos(2 * 3600_000), fresh: false }, now, { via: "push", timeoutS: 60 });
+    expect(formatLocation({ status: "ok", position: pos(120_000), fresh: false }, now)).toMatch(/^Location the user shared with this session earlier .*\(2 min ago\)/);
+    const t = formatLocation({ status: "timeout", position: null, fresh: false }, now, { via: "push", timeoutS: 60 });
     expect(t).toMatch(/^No answer within 60 s: the phone was sent a notification/);
-    expect(t).toMatch(/Last-known location \(may be out of date\): .*\(2 h ago\)/);
-    expect(formatLocation({ status: "timeout", position: null, fresh: false }, now, { via: "app", timeoutS: 30 })).not.toMatch(/Last-known/);
+    // Consent (review round 1): a non-ok outcome never shows coordinates, even if one were passed in.
+    expect(formatLocation({ status: "denied", position: pos(1000), fresh: false }, now)).not.toMatch(/52\.37/);
     expect(formatLocation({ status: "denied", position: null, fresh: false }, now)).toBe("The user declined to share their location.");
     expect(formatLocation({ status: "disabled", position: null, fresh: false }, now)).toMatch(/turned off .*Don't ask again/);
     expect(formatLocation({ status: "no_device", position: null, fresh: false, message: "the phone app is not open" }, now)).toBe(

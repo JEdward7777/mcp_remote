@@ -6,7 +6,8 @@ import { tenantIdForDev } from "../src/auth";
 import { MAX_PUSH_DEVICES, limitsFor } from "../src/budget";
 import { describePushOutcomes } from "../src/hub";
 import { pushExtraOrigins } from "../src/env";
-import { E, ORIGIN, cookieFor, daemon, last, newMachine, phone, setLimits, sleep, waitFor, withHub } from "./helpers";
+import { E, ORIGIN, type Sock, cookieFor, daemon, last, newMachine, phone, setLimits, sleep, waitFor, withHub } from "./helpers";
+import { subscriptionId } from "../src/webpush";
 import { decryptPush, fakePushService, fakeSubscription, type FakeSub } from "./push-helpers";
 
 async function subscribe(user: string, sub: { endpoint: string; keys: unknown }, headers: Record<string, string> = {}): Promise<Response> {
@@ -78,6 +79,31 @@ describe("push subscriptions (/api/push/subscribe)", () => {
     expect(((await (await subscribe("ps-auth", s)).json()) as { devices: string[] }).devices).toEqual([body.id]);
     const del = await unsubscribe("ps-auth", s.endpoint);
     expect(await del.json()).toMatchObject({ ok: true, removed: true, devices: [] });
+  });
+
+  it("lists devices with a label and removes one by id (e.g. a lost phone) or all of them", async () => {
+    const [a, b] = await subscribed("ps-rm", 2);
+    const p = await phone("ps-rm");
+    const st = await waitFor(() => last(p, "state"), "state");
+    expect(st.settings.push_devices).toEqual([
+      expect.objectContaining({ id: await subscriptionId(a!.endpoint), label: expect.any(String) }),
+      expect.objectContaining({ id: await subscriptionId(b!.endpoint) }),
+    ]);
+    const del = (body: unknown) =>
+      cookieFor("ps-rm").then((cookie) =>
+        SELF.fetch(`${ORIGIN}/api/push/subscribe`, { method: "DELETE", headers: { cookie, origin: ORIGIN, "content-type": "application/json" }, body: JSON.stringify(body) }),
+      );
+    expect(await (await del({ id: await subscriptionId(a!.endpoint) })).json()).toMatchObject({ removed: true, devices: [await subscriptionId(b!.endpoint)] });
+    expect((await del({ id: "not-an-id" })).status).toBe(400);
+    expect(await (await del({ all: true })).json()).toMatchObject({ removed: true, devices: [] });
+    await waitFor(() => last(p, "settings")?.settings.push_devices.length === 0, "list empty");
+  });
+
+  it("labels devices from the User-Agent", async () => {
+    const { deviceLabel } = await import("../src/index");
+    expect(deviceLabel("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36")).toBe("Chrome on Android");
+    expect(deviceLabel("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0")).toBe("Firefox on Windows");
+    expect(deviceLabel(null)).toBe("Browser");
   });
 
   it(`keeps at most ${MAX_PUSH_DEVICES} devices per account (a new one replaces the oldest)`, async () => {
@@ -163,17 +189,20 @@ describe("when the Hub sends Web Push (D19)", () => {
   });
 
   it("no push while a visible app is connected; pushes again when it is hidden or has gone quiet", async () => {
-    const { d, p, sid } = await setup("wp-vis", true);
-    await subscribed("wp-vis");
+    const { d, sid } = await setup("wp-vis");
+    const [sub] = await subscribed("wp-vis");
+    // This browser's page is visible and says which push subscription is its own.
+    const p = await phone("wp-vis", `?vis=1&dev=${await subscriptionId(sub!.endpoint)}`);
+    await waitFor(() => last(p, "state"), "state");
     const calls = await fakePushService("wp-vis");
     d.send({ t: "send", req_id: "r1", session_id: sid, text: "one", urgency: "normal" });
     expect((await waitFor(() => d.frames.find((f) => f.req_id === "r1"), "sent")).notify).toMatch(/app is open/);
-    p!.send({ t: "visibility", visible: false });
+    p.send({ t: "visibility", visible: false });
     await sleep(50);
     d.send({ t: "send", req_id: "r2", session_id: sid, text: "two", urgency: "normal" });
     expect((await waitFor(() => d.frames.find((f) => f.req_id === "r2"), "sent")).notify).toBe("push notification sent to 1 phone");
     await waitFor(() => calls.length === 1, "push while hidden");
-    p!.send({ t: "visibility", visible: true });
+    p.send({ t: "visibility", visible: true, dev: await subscriptionId(sub!.endpoint) });
     await sleep(50);
     d.send({ t: "send", req_id: "r3", session_id: sid, text: "three", urgency: "urgent" });
     expect((await waitFor(() => d.frames.find((f) => f.req_id === "r3"), "sent")).notify).toMatch(/app is open/);
@@ -184,11 +213,31 @@ describe("when the Hub sends Web Push (D19)", () => {
     d.send({ t: "send", req_id: "r4", session_id: sid, text: "four", urgency: "normal" });
     expect((await waitFor(() => d.frames.find((f) => f.req_id === "r4"), "sent")).notify).toBe("push notification sent to 1 phone");
     // ...but a keepalive ping answered by the runtime (auto-response, no wake-up) is a sign of life.
-    p!.ws.send("ping");
+    p.ws.send("ping");
     await sleep(50);
     d.send({ t: "send", req_id: "r5", session_id: sid, text: "five", urgency: "normal" });
     expect((await waitFor(() => d.frames.find((f) => f.req_id === "r5"), "sent")).notify).toMatch(/app is open/);
     expect(calls.length).toBe(2);
+  });
+
+  it("per device: an open app suppresses only its own device's push; a socket opened in the background never does", async () => {
+    const { d, sid } = await setup("wp-dev");
+    const [mine, other] = await subscribed("wp-dev", 2);
+    const calls = await fakePushService("wp-dev");
+    const p = await phone("wp-dev", `?vis=1&dev=${await subscriptionId(mine!.endpoint)}`);
+    await waitFor(() => last(p, "state"), "state");
+    d.send({ t: "send", req_id: "r1", session_id: sid, text: "one", urgency: "normal" });
+    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r1"), "sent")).notify).toBe(
+      "push notification sent to 1 phone; also shown in the app that is open",
+    );
+    expect(calls.map((c) => c.url)).toEqual([other!.endpoint]);
+    p.ws.close();
+    // Review round 1: a socket opened while the page was hidden (no ?vis=1) counts as hidden.
+    const bg = await phone("wp-dev", `?dev=${await subscriptionId(mine!.endpoint)}`);
+    await waitFor(() => last(bg, "state"), "state");
+    await sleep(50);
+    d.send({ t: "send", req_id: "r2", session_id: sid, text: "two", urgency: "normal" });
+    expect((await waitFor(() => d.frames.find((f) => f.req_id === "r2"), "sent")).notify).toBe("push notification sent to 2 phones");
   });
 
   it("without the lock-screen preview, the payload names neither the project nor the text", async () => {
@@ -255,93 +304,135 @@ describe("when the Hub sends Web Push (D19)", () => {
   });
 });
 
-describe("on-demand location (D14)", () => {
+describe("on-demand location (D14): consent per request and per session", () => {
   const pos = (at = Date.now()) => ({ lat: 52.37, lon: 4.89, accuracy_m: 12, at });
 
-  it("open app: the phone is asked, the answer goes back to the asking session and becomes last-known", async () => {
-    const { d, p, sid, machineId } = await setup("loc-app", true);
-    d.send({ t: "location_req", req_id: "l1", session_id: sid, max_age_s: 0, reason: "directions to the station" });
-    const w = await waitFor(() => last(d, "location_wait"), "wait");
-    expect(w).toEqual({ t: "location_wait", req_id: "l1", via: "app", last: null });
-    const q = await waitFor(() => last(p!, "location_request"), "prompt");
-    expect(q).toEqual({ t: "location_request", rid: "l1", machine_id: machineId, session_id: sid, project: "proj", reason: "directions to the station" });
-    p!.send({ t: "location", rid: "l1", machine_id: machineId, session_id: sid, status: "ok", position: pos() });
-    const r = await waitFor(() => last(d, "location"), "answer");
-    expect(r.result).toMatchObject({ status: "ok", fresh: true, position: { lat: 52.37, lon: 4.89, accuracy_m: 12 } });
-    expect(last(p!, "location_done")).toEqual({ t: "location_done", rid: "l1" });
-    // A later request that accepts a recent position is answered at once, without bothering the phone.
-    d.send({ t: "location_req", req_id: "l2", session_id: sid, max_age_s: 600 });
-    const r2 = await waitFor(() => d.frames.find((f) => f.t === "location" && f.req_id === "l2"), "cached");
-    expect(r2.result).toMatchObject({ status: "ok", fresh: false });
-    expect(p!.frames.filter((f) => f.t === "location_request").length).toBe(1);
-    // The phone list learns when (never where) the last position was taken.
-    expect(last(p!, "settings").settings.location_at).toBe(r.result.position.at);
+  /** Daemon with two sessions (A, B) and a visible phone. */
+  async function two(user: string) {
+    const { token, machineId } = await newMachine(user);
+    const d = await daemon(token);
+    d.send({ t: "hello", v: 1, sessions: [{ session_id: "sA", project: "projA" }, { session_id: "sB", project: "projB" }] });
+    await waitFor(() => last(d, "welcome"), "welcome");
+    await sleep(50);
+    const p = await phone(user);
+    await waitFor(() => last(p, "state")?.sessions.length === 2, "online");
+    return { d, p, machineId };
+  }
+  const ask = (d: Sock, rid: string, sid: string, max_age_s = 0, reason?: string) =>
+    d.send({ t: "location_req", req_id: rid, session_id: sid, max_age_s, ...(reason ? { reason } : {}) });
+  const prompt = (p: Sock, rid: string) => waitFor(() => p.frames.find((f) => f.t === "location_request" && f.request.rid === rid)?.request, `prompt ${rid}`);
+  const answer = (d: Sock, rid: string) => waitFor(() => d.frames.find((f) => f.t === "location" && f.req_id === rid), `answer ${rid}`);
+
+  it("open app: prompt, Share -> only the asking session gets it; location_wait carries no position", async () => {
+    const { d, p } = await two("loc-app");
+    ask(d, "a1", "sA", 0, "directions to the station");
+    expect(await waitFor(() => last(d, "location_wait"), "wait")).toEqual({ t: "location_wait", req_id: "a1", via: "app" });
+    const q = await prompt(p, "a1");
+    expect(q).toMatchObject({ session_id: "sA", project: "projA", reason: "directions to the station" });
+    expect(q.tok).toMatch(/^[\w-]{22}$/);
+    p.send({ t: "location", rid: "a1", tok: q.tok, status: "ok", position: pos() });
+    expect((await answer(d, "a1")).result).toMatchObject({ status: "ok", fresh: true, position: { lat: 52.37, lon: 4.89, accuracy_m: 12 } });
+    expect(last(p, "location_done")).toEqual({ t: "location_done", rid: "a1", status: "ok" });
+    expect(last(p, "settings").settings).toMatchObject({ location_project: "projA" });
+    // The same session may reuse what it was given, within its max_age_s, without asking again...
+    ask(d, "a2", "sA", 600);
+    expect((await answer(d, "a2")).result).toMatchObject({ status: "ok", fresh: false });
+    // ...but max_age_s is strict (0 = always ask) and another session never gets it: the user is asked.
+    ask(d, "a3", "sA", 0);
+    await prompt(p, "a3");
+    ask(d, "b1", "sB", 86400);
+    const qb = await prompt(p, "b1");
+    expect(await waitFor(() => d.frames.find((f) => f.t === "location_wait" && f.req_id === "b1"), "wait b1")).toEqual({ t: "location_wait", req_id: "b1", via: "app" });
+    // Review round 1 repro: B declined -> B gets nothing, not A's position.
+    p.send({ t: "location", rid: "b1", tok: qb.tok, status: "denied" });
+    expect((await answer(d, "b1")).result).toEqual({ status: "denied", position: null, fresh: false, message: "the user declined to share their location" });
   });
 
-  it("declined / unavailable answers reach the session; a future timestamp is clamped", async () => {
-    const { d, p, sid, machineId } = await setup("loc-deny", true);
-    d.send({ t: "location_req", req_id: "l1", session_id: sid, max_age_s: 0 });
-    await waitFor(() => last(p!, "location_request"), "prompt");
-    p!.send({ t: "location", rid: "l1", machine_id: machineId, session_id: sid, status: "denied" });
-    expect((await waitFor(() => last(d, "location"), "denied")).result).toMatchObject({ status: "denied", position: null, fresh: false });
-    p!.send({ t: "location", status: "ok", position: pos(Date.now() + 3_600_000) });
-    await waitFor(() => last(p!, "settings")?.settings.location_at, "stored");
-    expect(last(p!, "settings").settings.location_at).toBeLessThanOrEqual(Date.now());
-    // "ok" without a position is refused by the schema.
-    p!.send({ t: "location", status: "ok" });
-    await waitFor(() => last(p!, "error")?.error.includes("position is required"), "schema error");
+  it("answers for unknown, mismatched or already answered requests are refused and never stored", async () => {
+    const { d, p } = await two("loc-rid");
+    // Review round 1 repro: a made-up rid used to become last-known.
+    p.send({ t: "location", rid: "made-up", tok: "x".repeat(22), status: "ok", position: pos() });
+    await waitFor(() => last(p, "error")?.error.includes("expired or was already answered"), "refused");
+    ask(d, "c1", "sA", 300);
+    const q = await prompt(p, "c1"); // nothing usable was stored: the phone is asked
+    p.send({ t: "location", rid: "c1", tok: "y".repeat(22), status: "ok", position: pos() });
+    await waitFor(() => p.frames.filter((f) => f.t === "error").length === 2, "wrong tok refused");
+    p.send({ t: "location", rid: "c1", tok: q.tok, status: "ok", position: pos(Date.now() + 3_600_000) });
+    const r = await answer(d, "c1");
+    expect(r.result.position.at).toBeLessThanOrEqual(Date.now()); // a clock running ahead is clamped
+    p.send({ t: "location", rid: "c1", tok: q.tok, status: "ok", position: pos() });
+    await waitFor(() => p.frames.filter((f) => f.t === "error").length === 3, "second answer refused");
+    expect(d.frames.filter((f) => f.t === "location" && f.req_id === "c1").length).toBe(1);
+    p.send({ t: "location", rid: "c1", tok: q.tok, status: "ok" });
+    await waitFor(() => last(p, "error")?.error.includes("position is required"), "schema error");
   });
 
-  it("no open app: a high-priority push asks for it; nothing to ask: no_device right away", async () => {
-    const { d, sid, machineId } = await setup("loc-push");
-    d.send({ t: "location_req", req_id: "l0", session_id: sid, max_age_s: 0 });
-    const nd = await waitFor(() => last(d, "location"), "no device");
+  it("no open app: push with the request token; the list of pending requests is sent on connect", async () => {
+    const { d, sid } = await setup("loc-push");
+    ask(d, "l0", sid);
+    const nd = await answer(d, "l0");
     expect(nd.result).toMatchObject({ status: "no_device", position: null });
-    expect(nd.result.message).toMatch(/not open/);
     const [sub] = await subscribed("loc-push");
     const calls = await fakePushService("loc-push");
-    d.send({ t: "location_req", req_id: "l1", session_id: sid, max_age_s: 0, reason: "where am I?" });
-    expect(await waitFor(() => last(d, "location_wait"), "wait")).toMatchObject({ via: "push" });
+    ask(d, "l1", sid, 0, "where am I?");
+    expect(await waitFor(() => last(d, "location_wait"), "wait")).toEqual({ t: "location_wait", req_id: "l1", via: "push" });
     await waitFor(() => calls.length === 1, "push");
     expect(calls[0]!.headers).toMatchObject({ urgency: "high", ttl: "120" });
-    expect(await decryptPush(sub!, calls[0]!.body)).toEqual({ k: "l", r: "l1", m: machineId, s: sid, p: "proj", b: "where am I?" });
+    const payload = (await decryptPush(sub!, calls[0]!.body)) as Record<string, string>;
+    expect(payload).toMatchObject({ k: "l", r: "l1", s: sid, p: "proj", b: "where am I?" });
+    // The tapped notification opens the app; the Hub lists the pending request (with the same token).
+    const p = await phone("loc-push");
+    const list = await waitFor(() => last(p, "location_pending"), "pending list");
+    expect(list.requests).toEqual([expect.objectContaining({ rid: "l1", tok: payload.t, session_id: sid })]);
+    p.send({ t: "location", rid: "l1", tok: payload.t, status: "ok", position: pos() });
+    expect((await answer(d, "l1")).result.status).toBe("ok");
+    p.send({ t: "location_list" });
+    await waitFor(() => p.frames.filter((f) => f.t === "location_pending").length === 2, "second list");
+    expect(last(p, "location_pending").requests).toEqual([]);
   });
 
-  it("disabled in Settings: refused, and the last-known position is forgotten", async () => {
-    const { d, p, sid } = await setup("loc-off", true);
-    p!.send({ t: "location", status: "ok", position: pos() });
-    await waitFor(() => last(p!, "settings")?.settings.location_at, "stored");
-    p!.send({ t: "settings", location: false });
-    await waitFor(() => last(p!, "settings")?.settings.location === false, "off");
-    expect(last(p!, "settings").settings.location_at).toBeNull();
-    expect(await withHub("loc-off", (_h, s) => s.storage.sql.exec("SELECT v FROM meta WHERE k = 'loc'").toArray())).toEqual([]);
-    d.send({ t: "location_req", req_id: "l1", session_id: sid, max_age_s: 86400 });
-    expect((await waitFor(() => last(d, "location"), "disabled")).result).toMatchObject({ status: "disabled", position: null });
-    p!.send({ t: "location", status: "ok", position: pos() });
-    await waitFor(() => last(p!, "error")?.error.includes("turned off"), "refused");
+  it("disabled in Settings: refused, last-known and pending requests forgotten", async () => {
+    const { d, p } = await two("loc-off");
+    ask(d, "a1", "sA");
+    const q = await prompt(p, "a1");
+    p.send({ t: "location", rid: "a1", tok: q.tok, status: "ok", position: pos() });
+    await answer(d, "a1");
+    ask(d, "a2", "sA");
+    const q2 = await prompt(p, "a2");
+    p.send({ t: "settings", location: false });
+    await waitFor(() => last(p, "settings")?.settings.location === false, "off");
+    expect(last(p, "settings").settings.location_at).toBeNull();
+    expect(await withHub("loc-off", (_h, s) => s.storage.sql.exec("SELECT k FROM meta WHERE k = 'loc' UNION ALL SELECT rid FROM loc_req").toArray())).toEqual([]);
+    ask(d, "a3", "sA", 86400);
+    expect((await answer(d, "a3")).result).toMatchObject({ status: "disabled", position: null });
+    p.send({ t: "location", rid: "a2", tok: q2.tok, status: "ok", position: pos() });
+    await waitFor(() => last(p, "error")?.error.includes("expired"), "refused");
   });
 
-  it("last-known expires after 6 h (and is deleted), and phone-asking requests are rate limited", async () => {
-    const { d, p, sid } = await setup("loc-old", true);
-    p!.send({ t: "location", status: "ok", position: pos(Date.now() - 7 * 3600_000) });
-    await waitFor(() => last(p!, "settings"), "stored");
-    d.send({ t: "location_req", req_id: "l1", session_id: sid, max_age_s: 86400 });
-    expect(await waitFor(() => last(d, "location_wait"), "asks the phone")).toMatchObject({ last: null });
+  it("last-known expires after 6 h (and is deleted); phone-asking requests are rate limited", async () => {
+    const { d, p } = await two("loc-old");
+    ask(d, "a1", "sA");
+    const q = await prompt(p, "a1");
+    p.send({ t: "location", rid: "a1", tok: q.tok, status: "ok", position: pos(Date.now() - 7 * 3600_000) });
+    await answer(d, "a1");
+    ask(d, "a2", "sA", 86400);
+    await prompt(p, "a2"); // 7 h old: not reused
+    expect(await withHub("loc-old", (_h, s) => s.storage.sql.exec("SELECT k FROM meta WHERE k = 'loc'").toArray())).toEqual([]);
     await setLimits("loc-old", { location: { burst: 1, per: 1, perMs: 3_600_000 } });
-    d.send({ t: "location_req", req_id: "l2", session_id: sid, max_age_s: 0 });
-    await waitFor(() => d.frames.filter((f) => f.t === "location_wait").length === 2, "second wait");
-    d.send({ t: "location_req", req_id: "l3", session_id: sid, max_age_s: 0 });
-    const r = await waitFor(() => d.frames.find((f) => f.t === "location" && f.req_id === "l3"), "limited");
-    expect(r.result.status).toBe("rate_limited");
+    ask(d, "a3", "sA");
+    await prompt(p, "a3");
+    ask(d, "a4", "sA");
+    const r = await answer(d, "a4");
+    expect(r.result).toMatchObject({ status: "rate_limited", position: null });
     expect(r.result.message).toMatch(/too many location requests/);
   });
 
-  it("survives the Hub hibernating between the request and the answer (routing travels with the request)", async () => {
-    const { d, p, sid, machineId } = await setup("loc-evict", true);
-    d.send({ t: "location_req", req_id: "l1", session_id: sid, max_age_s: 0 });
-    await waitFor(() => last(p!, "location_request"), "prompt");
+  it("survives the Hub hibernating between the request and the answer", async () => {
+    const { d, p } = await two("loc-evict");
+    ask(d, "a1", "sA");
+    const q = await prompt(p, "a1");
     await evictDurableObject(E.HUB.get(E.HUB.idFromName(tenantIdForDev("loc-evict"))));
-    p!.send({ t: "location", rid: "l1", machine_id: machineId, session_id: sid, status: "ok", position: pos() });
-    expect((await waitFor(() => last(d, "location"), "answer")).result.status).toBe("ok");
+    p.send({ t: "location", rid: "a1", tok: q.tok, status: "ok", position: pos() });
+    expect((await answer(d, "a1")).result.status).toBe("ok");
   });
 });

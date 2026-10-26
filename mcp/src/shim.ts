@@ -13,7 +13,6 @@ import {
   type LocationVia,
   type MessageRecord,
   PROTOCOL_VERSION,
-  type Position,
   SessionId,
   type ShimToDaemon,
   type Urgency,
@@ -83,7 +82,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   /** get_location calls waiting for the phone. */
   const locWaiting = new Map<
     string,
-    { resolve: (r: LocationResult) => void; timer: NodeJS.Timeout; via: LocationVia | null; last: Position | null }
+    { resolve: (r: LocationResult) => void; timer: NodeJS.Timeout; via: LocationVia | null }
   >();
   let deliverChain: Promise<void> = Promise.resolve();
   const seen = new Set<number>();
@@ -98,7 +97,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
     for (const [k, w] of locWaiting) {
       clearTimeout(w.timer);
       locWaiting.delete(k);
-      w.resolve({ status: "unavailable", position: w.last, fresh: false, message: error });
+      w.resolve({ status: "unavailable", position: null, fresh: false, message: error });
     }
   }
 
@@ -174,10 +173,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
           }
           case "location_wait": {
             const w = locWaiting.get(f.req_id);
-            if (w) {
-              w.via = f.via;
-              w.last = f.last;
-            }
+            if (w) w.via = f.via;
             return;
           }
           case "location": {
@@ -279,10 +275,9 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
     return new Promise((resolve) => {
       const entry = {
         via: null as LocationVia | null,
-        last: null as Position | null,
         timer: setTimeout(() => {
           locWaiting.delete(reqId);
-          resolve({ result: { status: "timeout", position: entry.last, fresh: false }, via: entry.via });
+          resolve({ result: { status: "timeout", position: null, fresh: false }, via: entry.via });
         }, timeoutS * 1000),
         resolve: (result: LocationResult) => resolve({ result, via: entry.via }),
       };

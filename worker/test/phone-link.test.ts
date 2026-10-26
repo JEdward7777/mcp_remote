@@ -65,7 +65,7 @@ class FakeSocket implements SocketLike {
   }
 }
 
-function harness(opts: { auth?: () => AuthCheck; random?: () => number } = {}) {
+function harness(opts: { auth?: () => AuthCheck | Promise<AuthCheck>; random?: () => number } = {}) {
   const clock = new FakeClock();
   const sockets: FakeSocket[] = [];
   const events: string[] = [];
@@ -130,6 +130,25 @@ describe("PhoneLink (PWA)", () => {
     await h.clock.advance(5_000); // no answer within the 5 s probe deadline
     expect(h.events).toContain("down");
     await h.clock.advance(PHONE_RECONNECT.spreadMs);
+    expect(h.sockets.length).toBe(2);
+  });
+
+  it("does not open a socket if the page went hidden while the reconnect's auth check was in flight (review round 1)", async () => {
+    let release!: () => void;
+    const h = harness({ auth: () => new Promise<AuthCheck>((r) => (release = () => r("ok"))) });
+    h.link.start();
+    h.last().accept();
+    h.last().serverClose(1006);
+    await h.clock.advance(PHONE_RECONNECT.spreadMs); // reconnect timer fires; checkAuth pending
+    h.setVisible(false);
+    release();
+    await flush();
+    expect(h.sockets.length).toBe(1);
+    h.setVisible(true);
+    h.link.wake();
+    await h.clock.advance(1);
+    release();
+    await flush();
     expect(h.sockets.length).toBe(2);
   });
 

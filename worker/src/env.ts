@@ -72,3 +72,7 @@ export function pushExtraOrigins(env: Env): string[] {
     .map((s) => s.trim())
     .filter((s) => /^https?:\/\/[A-Za-z0-9.-]+(:\d+)?$/.test(s));
 }
+
+/** Phone socket: the page was visible when it connected ("1") and its push subscription id (Phase 4). */
+export const H_VIS = "x-mr-vis";
+export const H_DEV = "x-mr-dev";

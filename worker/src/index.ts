@@ -19,7 +19,7 @@ import {
   verifySessionCookieValue,
 } from "./auth";
 import { randomToken, sha256Hex, timingSafeEqual } from "./crypto";
-import { type Env, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH, pushConfigured, pushExtraOrigins } from "./env";
+import { type Env, H_DEV, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH, H_VIS, pushConfigured, pushExtraOrigins } from "./env";
 import { checkSubscription, subscriptionId } from "./webpush";
 import { z } from "zod";
 import {
@@ -132,7 +132,29 @@ const PushSubscribeBody = z.object({
   expirationTime: z.number().nullable().optional(),
 });
 /** Body of DELETE /api/push/subscribe. */
-const PushUnsubscribeBody = z.object({ endpoint: z.string().min(1).max(2048) });
+const PushUnsubscribeBody = z.union([
+  z.object({ endpoint: z.string().min(1).max(2048) }),
+  z.object({ id: z.string().regex(/^[0-9a-f]{16}$/) }),
+  z.object({ all: z.literal(true) }),
+]);
+
+/** "Chrome on Android" from a User-Agent: shown in the phone's device list (no other use, no fingerprint). */
+export function deviceLabel(ua: string | null): string {
+  const u = ua ?? "";
+  const browser = /Edg\//.test(u)
+    ? "Edge"
+    : /SamsungBrowser\//.test(u)
+      ? "Samsung Internet"
+      : /Firefox\//.test(u)
+        ? "Firefox"
+        : /Chrome\//.test(u)
+          ? "Chrome"
+          : /Safari\//.test(u)
+            ? "Safari"
+            : "Browser";
+  const os = /Android/.test(u) ? "Android" : /iPhone|iPad/.test(u) ? "iOS" : /Windows/.test(u) ? "Windows" : /Mac OS X/.test(u) ? "macOS" : /Linux/.test(u) ? "Linux" : "";
+  return os ? `${browser} on ${os}` : browser;
+}
 
 /** Cookie-authenticated, state-changing requests must come from our own origin (CSRF / CSWSH). */
 function sameOrigin(request: Request, url: URL): boolean {
@@ -449,9 +471,10 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
       try {
         body = PushUnsubscribeBody.parse(await readJson(request));
       } catch (e) {
-        return e instanceof BodyError && e.status !== 400 ? bodyErr(e, "") : err(400, "expected {endpoint}");
+        return e instanceof BodyError && e.status !== 400 ? bodyErr(e, "") : err(400, "expected {endpoint} or {id} or {all: true}");
       }
-      const r = unwrap(await hubFor(env, session.tid).pushUnsubscribe(await subscriptionId(body.endpoint)));
+      const target = "all" in body ? "all" : "id" in body ? body.id : await subscriptionId(body.endpoint);
+      const r = unwrap(await hubFor(env, session.tid).pushUnsubscribe(target));
       return r instanceof Response ? r : json({ ok: true, ...r.value });
     }
     let body: z.infer<typeof PushSubscribeBody>;
@@ -464,15 +487,25 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     const bad = await checkSubscription(sub, pushExtraOrigins(env));
     if (bad) return err(400, bad);
     const id = await subscriptionId(sub.endpoint);
-    const r = unwrap(await hubFor(env, session.tid).pushSubscribe({ id, ...sub }, url.origin));
+    const r = unwrap(await hubFor(env, session.tid).pushSubscribe({ id, ...sub, label: deviceLabel(request.headers.get("user-agent")) }, url.origin));
     return r instanceof Response ? r : json({ ok: true, id, ...r.value });
   }
 
   if (path === "/api/ws") {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return err(426, "expected websocket");
     if (!sameOrigin(request, url)) return err(403, "bad origin");
+    // ?vis=1: the page was visible when it connected (else it counts as hidden for push decisions);
+    // ?dev=<id>: this browser's push subscription (no push to it while its page is visible).
+    const dev = url.searchParams.get("dev") ?? "";
     const fwd = new Request("https://hub/phone", {
-      headers: { upgrade: "websocket", [H_KIND]: "phone", [H_TENANT]: session.tid, [H_EMAIL]: session.email },
+      headers: {
+        upgrade: "websocket",
+        [H_KIND]: "phone",
+        [H_TENANT]: session.tid,
+        [H_EMAIL]: session.email,
+        [H_VIS]: url.searchParams.get("vis") === "1" ? "1" : "0",
+        ...(/^[0-9a-f]{16}$/.test(dev) ? { [H_DEV]: dev } : {}),
+      },
     });
     return hubFor(env, session.tid).fetch(fwd);
   }

@@ -33,7 +33,7 @@ beforeEach(async () => {
       if (f.t === "send") ws.send(JSON.stringify({ t: "sent", req_id: f.req_id, message_id: 1, notify: "push notification sent to 1 phone" }));
       // Phase 4: a fake phone that answers location requests whose reason contains "answer".
       if (f.t === "location_req") {
-        ws.send(JSON.stringify({ t: "location_wait", req_id: f.req_id, via: "push", last: null }));
+        ws.send(JSON.stringify({ t: "location_wait", req_id: f.req_id, via: "push" }));
         if (/answer/.test(f.reason ?? "")) {
           const position = { lat: 48.8584, lon: 2.2945, accuracy_m: 8, at: Date.now() - 1000 };
           setTimeout(() => ws.send(JSON.stringify({ t: "location", req_id: f.req_id, result: { status: "ok", position, fresh: true } })), 200);

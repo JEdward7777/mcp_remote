@@ -2,6 +2,7 @@
 import type {
   HubToPhone,
   LaunchRecord,
+  LocationRequestInfo,
   LaunchState,
   MachineRecord,
   MessageRecord,
@@ -21,7 +22,10 @@ import {
   disablePush,
   enablePush,
   getPosition,
+  closeLocNotifications,
+  currentDeviceId,
   healPush,
+  removeDevices,
   install,
   isStandalone,
   pushState,
@@ -40,13 +44,7 @@ interface Me {
 }
 
 /** A location request from a session (D14) waiting for the user's Share / Not now. */
-interface LocRequest {
-  rid: string;
-  machine_id: string;
-  session_id: string;
-  project: string;
-  reason: string | null;
-}
+type LocRequest = LocationRequestInfo;
 
 const state = {
   me: null as Me | null,
@@ -67,8 +65,20 @@ const state = {
   applyUpdate: null as (() => void) | null,
 };
 
-/** A location request opened from a notification, answered as soon as the socket is up (the tap was the consent). */
-let autoShare: LocRequest | null = null;
+/**
+ * A location request opened from its notification (the tap is the consent). It is answered only when the
+ * Hub lists that request with the same token (location_pending): that proves the request is real and
+ * still open, and that the socket is alive (a half-open one never delivers the list).
+ */
+let autoShare: { rid: string; tok: string } | null = null;
+/** Answers sent but not confirmed (location_done) yet: sent again whenever the Hub lists them as pending. */
+const answers = new Map<string, PhoneToHub>();
+/** This browser's push subscription id (no push to it while this page is visible). */
+let deviceId: string | null = null;
+
+function visibilityFrame(visible: boolean): PhoneToHub {
+  return { t: "visibility", visible, ...(deviceId ? { dev: deviceId } : {}) };
+}
 
 /** Retry counter for boot() when the server can't be reached at all. */
 let attempt = 0;
@@ -146,7 +156,11 @@ async function checkAuth(): Promise<AuthCheck> {
 }
 
 const link = new PhoneLink({
-  url: () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/ws`,
+  // The page's visibility (and push device) go along with the connect, so a socket opened while hidden
+  // never counts as "app open" for push decisions.
+  url: () =>
+    `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/ws?vis=${document.visibilityState === "visible" ? 1 : 0}` +
+    (deviceId ? `&dev=${deviceId}` : ""),
   open: (url) => new WebSocket(url) as unknown as SocketLike,
   clock: realClock,
   isVisible: () => document.visibilityState === "visible",
@@ -155,11 +169,7 @@ const link = new PhoneLink({
     attempt = 0;
     state.connected = true;
     renderStatus();
-    if (autoShare) {
-      const req = autoShare;
-      autoShare = null;
-      void shareLocation(req);
-    }
+    // The Hub sends the pending location requests itself right after connecting (location_pending).
     // Anything may have happened while we were disconnected: drop every cached thread except the
     // visible one (refetched now; the fresh copy wins on merge) so others reload when opened.
     const sid = currentSession();
@@ -197,7 +207,7 @@ document.addEventListener("visibilitychange", () => {
   if (!state.me) return;
   const visible = document.visibilityState === "visible";
   // While no visible app is connected, the Hub notifies by Web Push instead (D19).
-  if (link.connected) send({ t: "visibility", visible });
+  if (link.connected) send(visibilityFrame(visible));
   if (visible) {
     link.wake();
     checkForUpdate();
@@ -296,21 +306,55 @@ function onFrame(f: HubToPhone): void {
       render();
       return;
     case "location_request":
-      // One prompt per session: a newer request from the same session replaces an unanswered older one.
-      for (const [rid, r] of state.locRequests) if (r.session_id === f.session_id && !state.sharing.has(rid)) state.locRequests.delete(rid);
-      state.locRequests.set(f.rid, { rid: f.rid, machine_id: f.machine_id, session_id: f.session_id, project: f.project, reason: f.reason });
+      addLocRequest(f.request);
       if (document.visibilityState === "visible") navigator.vibrate?.([80, 60, 80]);
       render();
       return;
-    case "location_done":
-      if (state.locRequests.delete(f.rid)) render();
+    case "location_pending": {
+      // The complete list: anything not in it was answered elsewhere or expired.
+      const listed = new Set(f.requests.map((r) => r.rid));
+      for (const rid of [...state.locRequests.keys()]) if (!listed.has(rid) && !state.sharing.has(rid)) state.locRequests.delete(rid);
+      for (const r of f.requests) {
+        const answer = answers.get(r.rid);
+        if (answer) send(answer); // sent before, never confirmed (e.g. the socket dropped): again
+        else addLocRequest(r);
+      }
+      for (const rid of [...answers.keys()]) if (!listed.has(rid)) answers.delete(rid);
+      if (autoShare) {
+        const want = autoShare;
+        autoShare = null;
+        const req = f.requests.find((r) => r.rid === want.rid);
+        if (req && req.tok === want.tok) void shareLocation(req);
+        else if (!answers.has(want.rid)) toast("That location request has expired or was already answered; nothing was shared.");
+      }
+      void closeLocNotifications((rid) => !listed.has(rid));
+      render();
       return;
+    }
+    case "location_done": {
+      state.locRequests.delete(f.rid);
+      if (answers.delete(f.rid)) {
+        if (f.status === "ok") toast("Location shared.");
+        else if (f.status === "expired") toast("That location request had expired; nothing was shared.");
+      }
+      void closeLocNotifications((rid) => rid === f.rid);
+      render();
+      return;
+    }
   }
 }
 
 function onSettings(s: Settings): void {
   state.settings = s;
-  void healPush(state.me?.push_key ?? null, s.push_devices).catch(() => {});
+  void healPush(state.me?.push_key ?? null).catch(() => {});
+}
+
+function addLocRequest(r: LocRequest): void {
+  // One prompt per session: a newer request from the same session replaces an unanswered older one.
+  for (const [rid, x] of state.locRequests) if (x.session_id === r.session_id && rid !== r.rid && !state.sharing.has(rid)) state.locRequests.delete(rid);
+  state.locRequests.set(r.rid, r);
+  const ms = r.expires_at - Date.now();
+  if (ms > 0) window.setTimeout(() => render(), Math.min(ms + 500, 2 ** 31 - 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -323,29 +367,34 @@ async function shareLocation(req: LocRequest): Promise<void> {
   const r = await getPosition();
   state.sharing.delete(req.rid);
   state.locRequests.delete(req.rid);
-  const base = { t: "location" as const, rid: req.rid, machine_id: req.machine_id, session_id: req.session_id };
-  const ok = send(r.status === "ok" ? { ...base, status: "ok", position: r.position } : { ...base, status: r.status });
-  if (!ok) toast("Not connected; the location was not sent.");
-  else toast(r.status === "ok" ? `Location shared with ${req.project || "the session"}.` : r.message);
+  const frame: PhoneToHub =
+    r.status === "ok" ? { t: "location", rid: req.rid, tok: req.tok, status: "ok", position: r.position } : { t: "location", rid: req.rid, tok: req.tok, status: r.status };
+  // Kept until the Hub confirms (location_done); resent after a reconnect if it never arrived.
+  answers.set(req.rid, frame);
+  send(frame);
+  toast(r.status === "ok" ? `Sending your location to ${req.project || "the session"}\u2026` : r.message);
   render();
 }
 
 function declineLocation(req: LocRequest): void {
   state.locRequests.delete(req.rid);
-  send({ t: "location", rid: req.rid, machine_id: req.machine_id, session_id: req.session_id, status: "denied" });
+  const frame: PhoneToHub = { t: "location", rid: req.rid, tok: req.tok, status: "denied" };
+  answers.set(req.rid, frame);
+  send(frame);
   render();
 }
 
-/** A URL from a notification click (or the page's own address): `?loc=<rid>&m=<machine>&s=<session>`. */
+/** A URL from a notification click (or the page's own address): `?loc=<rid>&tok=<token>`. */
 function takeLocationParams(url: URL): void {
   const rid = url.searchParams.get("loc");
-  const m = url.searchParams.get("m");
-  const sid = url.searchParams.get("s");
-  if (!rid || !m || !sid || !/^[A-Za-z0-9_-]{1,64}$/.test(m) || !/^[A-Za-z0-9_-]{1,64}$/.test(sid) || rid.length > 64) return;
-  const project = state.sessions.find((x) => x.session_id === sid)?.project ?? "";
-  const req: LocRequest = { rid, machine_id: m, session_id: sid, project, reason: null };
-  if (link.connected) void shareLocation(req);
-  else autoShare = req;
+  const tok = url.searchParams.get("tok");
+  if (!rid || !tok || rid.length > 64 || !/^[\w-]{16,64}$/.test(tok)) return;
+  autoShare = { rid, tok };
+  // Answered when the Hub's list arrives: now (open socket) or right after the (re)connect.
+  if (link.connected) {
+    send({ t: "location_list" });
+    link.wake(); // a socket that went half-open in the background is found out and replaced
+  }
 }
 
 function openFromNotification(raw: string): void {
@@ -887,6 +936,7 @@ interface SettingsView {
   locStatus: HTMLElement;
   installBox: HTMLElement;
   pushCount: HTMLElement;
+  devices: HTMLElement;
 }
 
 let pushBusy = false;
@@ -905,6 +955,19 @@ function refreshPushLocal(): void {
     .catch(() => {});
 }
 
+/** This browser's subscription is on the account's device list (it may have been removed from another phone). */
+function thisDeviceListed(): boolean {
+  return !!deviceId && !!state.settings?.push_devices.some((d) => d.id === deviceId);
+}
+
+/** After turning notifications on/off or removing devices: tell the Hub which device this page is. */
+async function afterPushChange(): Promise<void> {
+  deviceId = await currentDeviceId().catch(() => null);
+  if (link.connected) send(visibilityFrame(document.visibilityState === "visible"));
+  refreshPushLocal();
+  render();
+}
+
 function buildSettings(): SettingsView {
   const root = h("section", { class: "settings" });
   const pushStatus = h("p", { class: "muted" });
@@ -914,11 +977,10 @@ function buildSettings(): SettingsView {
     if (pushBusy || !key) return;
     pushBusy = true;
     render();
-    const error = pushLocal === "on" ? await disablePush() : await enablePush(key);
+    const error = pushLocal === "on" && thisDeviceListed() ? await disablePush() : await enablePush(key);
     pushBusy = false;
     if (error) toast(error);
-    refreshPushLocal();
-    render();
+    await afterPushChange();
   };
   const preview = h("input", { type: "checkbox" });
   preview.onchange = () => {
@@ -935,6 +997,7 @@ function buildSettings(): SettingsView {
   const locStatus = h("p", { class: "muted" });
   const installBox = h("div", {});
   const pushCount = h("p", { class: "muted" });
+  const devices = h("div", { class: "devices" });
   root.append(
     h("h2", {}, "Notifications on this phone"),
     pushStatus,
@@ -946,13 +1009,20 @@ function buildSettings(): SettingsView {
       "A session's message notifies you only while the app is not open: silent = no notification, normal = a notification, urgent = high priority, stays until dismissed.",
     ),
     pushCount,
+    h("h2", {}, "Devices that get notifications"),
+    devices,
     h("h2", {}, "Location"),
-    h("label", { class: "toggle" }, loc, " Claude may ask for this phone's location (you confirm every time)"),
+    h("label", { class: "toggle" }, loc, " Claude may ask for this phone's location"),
+    h(
+      "p",
+      { class: "muted small" },
+      "You confirm each request (Share, or tapping its notification). Only the session you shared with gets the position; it may reuse it for a few minutes (and is told how old it is). Any other session has to ask you again.",
+    ),
     locStatus,
     h("h2", {}, "App"),
     installBox,
   );
-  return { root, pushStatus, pushBtn, preview, location: loc, locStatus, installBox, pushCount };
+  return { root, pushStatus, pushBtn, preview, location: loc, locStatus, installBox, pushCount, devices };
 }
 
 function ago(ms: number): string {
@@ -970,10 +1040,11 @@ function updateSettings(v: SettingsView): void {
   if (!key || (st && !st.push_available)) status = "Notifications are not set up on the server (VAPID keys; see SETUP).";
   else if (unsupported) status = `Not available here: ${unsupported}. Install the app from Chrome on Android.`;
   else if (pushLocal === "blocked") status = "Blocked for this site. Allow notifications in Chrome: site settings (lock icon) > Notifications.";
+  else if (pushLocal === "on" && st && !thisDeviceListed()) status = "This phone was removed from the account's devices: no notifications. Turn on to add it again.";
   else if (pushLocal === "on") status = `On for this phone (${st?.push_devices.length ?? 1} of at most 5 devices on this account).`;
   else status = "Off for this phone.";
   v.pushStatus.textContent = status;
-  v.pushBtn.textContent = pushBusy ? "…" : pushLocal === "on" ? "Turn off" : "Turn on";
+  v.pushBtn.textContent = pushBusy ? "…" : pushLocal === "on" && thisDeviceListed() ? "Turn off" : "Turn on";
   v.pushBtn.disabled = pushBusy || !key || !!unsupported || pushLocal === "blocked";
   v.pushBtn.hidden = !key || !!unsupported;
   v.preview.checked = st?.push_preview ?? true;
@@ -983,8 +1054,37 @@ function updateSettings(v: SettingsView): void {
   v.locStatus.textContent = !st?.location
     ? "Off: requests from sessions are refused."
     : st.location_at
-      ? `Last shared ${ago(st.location_at)}; kept for 6 hours, then deleted.`
+      ? `Last shared ${ago(st.location_at)} with ${st.location_project ?? "a session"} (only that session may reuse it); deleted after 6 hours.`
       : "No location stored. It is only sent when you tap Share on a request.";
+  const devs = st?.push_devices ?? [];
+  const rows: Node[] = devs.map((d) => {
+    const b = h("button", { type: "button", class: "small danger" }, "Remove");
+    b.onclick = async () => {
+      if (!confirm(`Remove ${d.label}? It gets no more notifications (it can be turned on again there).`)) return;
+      const err = d.id === deviceId ? await disablePush() : await removeDevices(d.id);
+      if (err) toast(err);
+      await afterPushChange();
+    };
+    return h(
+      "div",
+      { class: "machine-row", "data-device": d.id },
+      h("span", { class: "proj" }, d.label + (d.id === deviceId ? " (this one)" : "")),
+      h("span", { class: "time" }, `added ${fmtTime(d.added_at)}`),
+      b,
+    );
+  });
+  if (!devs.length) rows.push(h("p", { class: "muted" }, "None."));
+  else {
+    const all = h("button", { type: "button", class: "danger" }, "Remove all devices");
+    all.onclick = async () => {
+      if (!confirm("Remove every device? None of them gets notifications until it is turned on again.")) return;
+      const err = await removeDevices("all");
+      if (err) toast(err);
+      await afterPushChange();
+    };
+    rows.push(h("div", { class: "row" }, all));
+  }
+  v.devices.replaceChildren(...rows);
   const u = state.usage;
   v.pushCount.textContent = u?.push_cap ? `Today (UTC): ${u.pushes ?? 0} of ${u.push_cap} notifications.` : "";
   v.pushCount.hidden = !u?.push_cap;
@@ -1011,6 +1111,7 @@ function renderBanners(): void {
   }
   for (const req of state.locRequests.values()) {
     const busy = state.sharing.has(req.rid);
+    if (req.expires_at <= Date.now() && !busy) continue; // expired: nothing to answer any more
     const share = h("button", { type: "button", class: "small" }, busy ? "Locating…" : "Share");
     share.disabled = busy;
     share.onclick = () => void shareLocation(req);
@@ -1117,6 +1218,11 @@ function renderShell(): void {
   logout.onsubmit = async (ev) => {
     // fetch() always sends our Origin on POST; a plain form post may send "Origin: null".
     ev.preventDefault();
+    // Signed out, this browser must not keep getting this account's notifications (or a next user's
+    // too): unregister it first, while the session cookie still works.
+    const pushErr = await disablePush().catch(() => "could not turn off notifications");
+    if (pushErr) toast(pushErr);
+    deviceId = null;
     const r = await fetch("/auth/logout", { method: "POST", headers: { accept: "application/json" } }).catch(() => null);
     if (!r || !r.ok) {
       toast("Sign-out failed; try again.");
@@ -1175,6 +1281,7 @@ async function boot(): Promise<void> {
   state.me = (await r.json()) as Me;
   renderShell();
   render(true);
+  deviceId = await currentDeviceId().catch(() => null);
   link.start();
   // Opened from a "Claude wants your location" notification (the tap was the consent).
   const here = new URL(location.href);

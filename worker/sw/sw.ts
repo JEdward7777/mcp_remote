@@ -73,7 +73,7 @@ interface Payload {
   p?: string;
   b?: string;
   r?: string;
-  m?: string;
+  t?: string;
 }
 
 function clip(s: unknown, n: number): string | undefined {
@@ -92,12 +92,14 @@ self.addEventListener("push", (e) => {
 
 async function show(d: Payload | null): Promise<void> {
   const reg = self.registration;
-  if (d?.k === "l" && typeof d.r === "string" && typeof d.m === "string" && typeof d.s === "string" && SID.test(d.s)) {
-    const q = new URLSearchParams({ loc: d.r.slice(0, 64), m: d.m.slice(0, 64), s: d.s });
+  if (d?.k === "l" && typeof d.r === "string" && typeof d.t === "string" && typeof d.s === "string" && SID.test(d.s)) {
+    // The request's token goes into the URL: only a tap on this notification shares without a second
+    // prompt (the app checks it against the Hub's list of pending requests before reading the GPS).
+    const q = new URLSearchParams({ loc: d.r.slice(0, 64), tok: d.t.slice(0, 64) });
     const project = clip(d.p, 64);
     const why = clip(d.b, 100);
     await reg.showNotification("Claude wants your location", {
-      body: project ? `${project}${why ? `: ${why}` : ""}. Tap to share it once.` : "Tap to share it once, or ignore this.",
+      body: project ? `${project}${why ? `: ${why}` : ""}. Tap to share it once with this session.` : "Tap to share it once, or ignore this.",
       tag: `loc:${d.r.slice(0, 64)}`,
       requireInteraction: true,
       icon: ICON,

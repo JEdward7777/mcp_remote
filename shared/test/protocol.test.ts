@@ -147,21 +147,25 @@ describe("remote launch frames (Phase 2)", () => {
   it("Phase 4 frames: location answers need a position when ok, coordinates are range-checked", () => {
     const pos = { lat: 52.37, lon: 4.89, accuracy_m: 10, at: 1 };
     const loc = (f: object) => parseFrame(PhoneToHub, JSON.stringify({ t: "location", ...f })).ok;
-    expect(loc({ rid: "r", machine_id: "m", session_id: "s", status: "ok", position: pos })).toBe(true);
-    expect(loc({ status: "ok" })).toBe(false);
-    expect(loc({ status: "denied" })).toBe(true);
-    expect(loc({ status: "ok", position: { ...pos, lat: 91 } })).toBe(false);
-    expect(loc({ status: "ok", position: { ...pos, lon: -181 } })).toBe(false);
-    expect(loc({ status: "maybe" })).toBe(false);
+    const req = { rid: "r", tok: "t".repeat(22) };
+    expect(loc({ ...req, status: "ok", position: pos })).toBe(true);
+    expect(loc({ ...req, status: "ok" })).toBe(false);
+    expect(loc({ ...req, status: "denied" })).toBe(true);
+    // No position without a request (rid + tok): nothing unsolicited.
+    expect(loc({ status: "ok", position: pos })).toBe(false);
+    expect(loc({ rid: "r", status: "ok", position: pos })).toBe(false);
+    expect(loc({ ...req, status: "ok", position: { ...pos, lat: 91 } })).toBe(false);
+    expect(loc({ ...req, status: "ok", position: { ...pos, lon: -181 } })).toBe(false);
+    expect(loc({ ...req, status: "maybe" })).toBe(false);
     expect(parseFrame(PhoneToHub, JSON.stringify({ t: "visibility", visible: false })).ok).toBe(true);
     expect(parseFrame(PhoneToHub, JSON.stringify({ t: "settings", location: false })).ok).toBe(true);
     expect(parseFrame(DaemonToHub, JSON.stringify({ t: "location_req", req_id: "l1", session_id: "s", max_age_s: 0, reason: "x".repeat(201) })).ok).toBe(false);
     expect(parseFrame(DaemonToHub, JSON.stringify({ t: "location_req", req_id: "l1", session_id: "s", max_age_s: 86_401 })).ok).toBe(false);
     expect(parseFrame(HubToDaemon, JSON.stringify({ t: "location", req_id: "l1", result: { status: "timeout", position: null, fresh: false } })).ok).toBe(true);
     expect(parseFrame(HubToDaemon, JSON.stringify({ t: "sent", req_id: "r", message_id: 1, notify: "push notification sent to 1 phone" })).ok).toBe(true);
-    expect(
-      parseFrame(HubToPhone, JSON.stringify({ t: "location_request", rid: "l1", machine_id: "m", session_id: "s", project: "p", reason: null })).ok,
-    ).toBe(true);
+    const info = { rid: "l1", session_id: "s", project: "p", reason: null, tok: "t".repeat(22), expires_at: 1 };
+    expect(parseFrame(HubToPhone, JSON.stringify({ t: "location_request", request: info })).ok).toBe(true);
+    expect(parseFrame(HubToDaemon, JSON.stringify({ t: "location_wait", req_id: "l1", via: "app" })).ok).toBe(true);
   });
 });
 

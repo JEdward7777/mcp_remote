@@ -304,11 +304,14 @@ export interface MessagePush {
   b?: string;
 }
 
-/** Payload of a location request push: the click opens the app, which shares and answers rid. */
+/**
+ * Payload of a location request push: the click opens the app, which shares once and answers rid with
+ * the request's random token `t` (only a tap on this notification, or Share in the app, answers it).
+ */
 export interface LocationPush {
   k: "l";
   r: string;
-  m: string;
+  t: string;
   s: string;
   p?: string;
   b?: string;
@@ -368,6 +371,8 @@ export async function buildPushRequest(
   const jwt = await vapidJwt(opts.keys, audience, opts.subject);
   return new Request(sub.endpoint, {
     method: "POST",
+    // A push service never redirects; following one would send our VAPID-signed request elsewhere.
+    redirect: "manual",
     headers: {
       authorization: `vapid t=${jwt}, k=${opts.keys.publicKey}`,
       "content-encoding": "aes128gcm",
@@ -379,7 +384,7 @@ export async function buildPushRequest(
   });
 }
 
-export type FetchLike = (req: Request, init?: { signal?: AbortSignal }) => Promise<Response>;
+export type FetchLike = (req: Request, init?: { signal?: AbortSignal; redirect?: "manual" }) => Promise<Response>;
 
 /** Send one push; never throws (network errors and timeouts count as "later"). */
 export async function sendPush(
@@ -399,7 +404,7 @@ export async function sendPush(
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const res = await Promise.race([
-      fetchFn(req, { signal: ac.signal }),
+      fetchFn(req, { signal: ac.signal, redirect: "manual" }),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           ac.abort();

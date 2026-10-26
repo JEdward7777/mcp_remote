@@ -69,12 +69,26 @@ describe("linkify (which message parts the phone makes tappable)", () => {
       "data:text/html,<b>x</b>",
       "geo:200,1",
       "geo:1,2;crs=x",
+      // Phase 4 review round 1: dot segments must not escape the /maps prefix.
+      "https://www.google.com/maps/../amp/s/evil.example/login",
+      "https://www.google.com/maps/%2e%2e/url?q=https://evil.example",
+      "https://www.google.com/maps/%2E./url?q=x",
+      "https://goo.gl/maps/../abc",
+      "https://google.com/maps/..\\x",
+      "https://www.google.com/maps/./../x",
+      "https://www.google.com/maps%2f..%2fx",
     ]) {
       expect(linkify(`see ${t} now`).every((s) => s.href === undefined), t).toBe(true);
       expect(allowedMapHref(t), t).toBeNull();
     }
     expect(linkify("plain text")).toEqual([{ text: "plain text" }]);
     expect(linkify("")).toEqual([]);
+  });
+
+  it("emits the parsed URL as the link (what the browser opens is what was checked)", () => {
+    expect(allowedMapHref("https://WWW.Google.com/maps/search/?api=1&query=a b")).toBeNull(); // space ends a link anyway
+    expect(allowedMapHref("https://WWW.Google.com/maps/place/X")).toEqual({ href: "https://www.google.com/maps/place/X", kind: "map" });
+    expect(allowedMapHref("https://maps.app.goo.gl/AbC")).toEqual({ href: "https://maps.app.goo.gl/AbC", kind: "map" });
   });
 
   it("keeps a closing parenthesis that belongs to the URL", () => {

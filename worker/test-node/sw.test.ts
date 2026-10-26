@@ -113,11 +113,12 @@ describe("service worker: Web Push -> notification (D19)", () => {
   });
 
   it("location request: asks to tap, opens the app on the request; bad ids fall back to a generic notification", async () => {
-    await sw.push({ k: "l", r: "l0123abcd", m: "mach1", s: "sess-1", p: "trip", b: "directions" });
+    await sw.push({ k: "l", r: "l0123abcd", t: "tok_0123456789abcdefgh", s: "sess-1", p: "trip", b: "directions" });
     const { title, opts } = sw.shown[0]!;
     expect(title).toBe("Claude wants your location");
-    expect(opts.body).toBe("trip: directions. Tap to share it once.");
-    expect(opts.data.url).toBe("/?loc=l0123abcd&m=mach1&s=sess-1#/s/sess-1");
+    expect(opts.body).toBe("trip: directions. Tap to share it once with this session.");
+    expect(opts.data.url).toBe("/?loc=l0123abcd&tok=tok_0123456789abcdefgh#/s/sess-1");
+    expect(opts.tag).toBe("loc:l0123abcd");
     expect(opts.actions.map((a: { action: string }) => a.action)).toEqual(["share", "dismiss"]);
     await sw.push({ k: "m", s: "../../evil", u: "normal", i: 1 });
     await sw.push("not json at all");

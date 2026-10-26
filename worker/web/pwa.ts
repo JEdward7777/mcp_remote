@@ -141,18 +141,45 @@ export async function disablePush(): Promise<string | null> {
 }
 
 /**
- * Keep the server's list in step with this phone, once per page load: re-register when this phone has a
- * subscription the server doesn't list (e.g. it was dropped after a 410, or the server's key changed).
+ * Once per page load: if this browser's subscription was made with another server key (the VAPID keys
+ * were replaced), make a new one and register it. A device that was removed from the account's list
+ * (e.g. from another phone) is NOT re-added behind the user's back: Settings offers "Turn on".
  */
 let healed = false;
-export async function healPush(key: string | null, serverDevices: string[]): Promise<void> {
+export async function healPush(key: string | null): Promise<void> {
   if (healed || !key || pushSupported() || Notification.permission !== "granted") return;
   const reg = await navigator.serviceWorker.ready;
   const sub = await reg.pushManager.getSubscription();
-  if (!sub) return;
-  if (sameKey(sub, key) && serverDevices.includes(await subscriptionId(sub.endpoint))) return;
+  if (!sub || sameKey(sub, key)) return;
   healed = true;
   await enablePush(key);
+}
+
+/** This browser's push subscription id, if it has one and notifications are allowed. */
+export async function currentDeviceId(): Promise<string | null> {
+  if (pushSupported() || Notification.permission !== "granted") return null;
+  const reg = await navigator.serviceWorker.getRegistration();
+  const sub = await reg?.pushManager.getSubscription();
+  return sub ? subscriptionId(sub.endpoint) : null;
+}
+
+/** Remove another device (by id, e.g. a lost phone) or every device from the account. */
+export async function removeDevices(id: string | "all"): Promise<string | null> {
+  const r = await api("DELETE", id === "all" ? { all: true } : { id });
+  if (!r.ok) return `Could not remove: ${r.error}`;
+  if (id === "all" && !pushSupported()) {
+    const sub = await (await navigator.serviceWorker.ready).pushManager.getSubscription();
+    await sub?.unsubscribe().catch(() => false);
+  }
+  return null;
+}
+
+/** Close "Claude wants your location" notifications whose request is answered or gone. */
+export async function closeLocNotifications(close: (rid: string) => boolean): Promise<void> {
+  if (!swSupported()) return;
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg) return;
+  for (const n of await reg.getNotifications()) if (n.tag.startsWith("loc:") && close(n.tag.slice(4))) n.close();
 }
 
 // ---------------------------------------------------------------------------
