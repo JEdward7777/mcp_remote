@@ -34,6 +34,7 @@
     "OPEN_SIGNUP": "false"
     // Per-tenant and abuse limits (Phase 3) have safe defaults in src/budget.ts. To tune one, add it
     // here, e.g. "LIMIT_PHONE_SEND": "10,20/min" or "DAILY_MESSAGE_CAP": "500" (see harness/SETUP.md).
+    // OWNER_EMAILS (your account on the roomier "owner" plan) is set with `wrangler secret put`.
   },
   "observability": { "enabled": true }
 }

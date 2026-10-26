@@ -94,10 +94,34 @@ const rate = (s: string): Rate => parseRate(s)!;
 // Per-tenant limits (D10), enforced in the tenant's Hub. Owner-tunable via env vars.
 
 /**
- * Sizing (free plan shared by every tenant, D9): a phone message costs ~1/20 request (inbound WS
- * frame), a handful of rows written (message row + indexes + session counter) and the Hub
- * broadcast; so ~100k rows written/day is the first wall at roughly 15-20k messages/day for the
- * whole deployment. 500 messages per tenant per day lets ~20-30 active tenants share it.
+ * Daily per-tenant budget on the real cost drivers, as a share of each free daily limit: whatever one
+ * tenant does, it can use at most `share` of the deployment's DO requests, rows read and rows written
+ * per UTC day. When any of them is used up, the tenant's Hub refuses work until 00:00 UTC.
+ */
+export interface DailyBudget {
+  /** DO requests: connects + HTTP API calls + inbound WebSocket frames / wsIncomingMessagesPerBilledRequest. */
+  do_requests: number;
+  rows_read: number;
+  rows_written: number;
+}
+
+export function dailyBudget(sharePercent: number): DailyBudget {
+  const f = sharePercent / 100;
+  return {
+    do_requests: Math.floor(FREE_PLAN.doRequestsPerDay * f),
+    rows_read: Math.floor(FREE_PLAN.sqliteRowsReadPerDay * f),
+    rows_written: Math.floor(FREE_PLAN.sqliteRowsWrittenPerDay * f),
+  };
+}
+
+/**
+ * Two layers per tenant:
+ *  - per-minute token buckets below bound bursts (one noisy client, a loop);
+ *  - the daily budget (`daily`, default 10% of each free daily limit) bounds the whole day. The
+ *    per-minute rates alone do NOT (rate x 1440 is far above a fair daily share for frames, history
+ *    and HTTP), which is why the daily budget exists.
+ * With the default 10% share, at least 10 accounts would have to run into their own budgets before the
+ * shared free quota is exhausted; normal use (hundreds of messages a day) stays far below it.
  */
 export interface TenantLimits {
   /** Phone -> session messages. */
@@ -106,7 +130,7 @@ export interface TenantLimits {
   agent_send: Rate;
   /** launch / launch_stop / launch_restart / launch_dismiss from the phone. */
   launch: Rate;
-  /** History page fetches. */
+  /** History page fetches (each reads up to HISTORY_PAGE rows; also charged to daily rows_read). */
   history: Rate;
   /** Any phone frame (refresh, forget, ...): exceeding it closes the socket with 4029. */
   phone_frames: Rate;
@@ -120,26 +144,53 @@ export interface TenantLimits {
   pair_approve: Rate;
   /** Messages (in + out) per UTC day. */
   daily_messages: number;
+  /** Share (%) of each free daily limit this tenant may use; `daily` is derived from it. */
+  daily_share_percent: number;
+  daily: DailyBudget;
 }
 
-export type LimitName = Exclude<keyof TenantLimits, "daily_messages">;
+export type LimitName = Exclude<keyof TenantLimits, "daily_messages" | "daily_share_percent" | "daily">;
+
+const FREE_SHARE = 10;
+const OWNER_SHARE = 50;
 
 export const PLANS: Record<string, TenantLimits> = {
   free: {
     phone_send: rate("10,20/min"),
     agent_send: rate("10,20/min"),
     launch: rate("20,20/min"),
-    history: rate("20,60/min"),
-    phone_frames: rate("60,120/min"),
-    daemon_frames: rate("200,600/min"),
-    connects: rate("20,20/min"),
-    http: rate("30,60/min"),
+    history: rate("20,20/min"),
+    phone_frames: rate("60,60/min"),
+    daemon_frames: rate("200,120/min"),
+    connects: rate("20,10/min"),
+    http: rate("30,30/min"),
     pair_approve: rate("5,10/h"),
     daily_messages: 500,
+    daily_share_percent: FREE_SHARE,
+    daily: dailyBudget(FREE_SHARE),
+  },
+  /**
+   * The deployer's own account(s) (OWNER_EMAILS, or meta.plan = "owner"): roomier, but still capped
+   * (default 50% of each free daily limit) so a runaway loop can't take the whole quota.
+   */
+  owner: {
+    phone_send: rate("30,60/min"),
+    agent_send: rate("30,60/min"),
+    launch: rate("30,30/min"),
+    history: rate("40,60/min"),
+    phone_frames: rate("120,240/min"),
+    daemon_frames: rate("400,600/min"),
+    connects: rate("40,30/min"),
+    http: rate("60,120/min"),
+    pair_approve: rate("10,20/h"),
+    daily_messages: 5000,
+    daily_share_percent: OWNER_SHARE,
+    daily: dailyBudget(OWNER_SHARE),
   },
 };
 
 export const DEFAULT_PLAN = "free";
+export const OWNER_PLAN = "owner";
 
 /** Env var that overrides each limit of the free plan, e.g. LIMIT_PHONE_SEND="10,20/min". */
 export const LIMIT_ENV: Record<LimitName, string> = {
@@ -154,6 +205,12 @@ export const LIMIT_ENV: Record<LimitName, string> = {
   pair_approve: "LIMIT_PAIR_APPROVE",
 };
 export const DAILY_CAP_ENV = "DAILY_MESSAGE_CAP";
+/** % of each free daily limit one free-plan tenant may use (1-100). */
+export const SHARE_ENV = "TENANT_DAILY_SHARE_PERCENT";
+/** % for owner-plan tenants (1-100). */
+export const OWNER_SHARE_ENV = "OWNER_DAILY_SHARE_PERCENT";
+/** Comma-separated emails whose accounts get the owner plan. */
+export const OWNER_EMAILS_ENV = "OWNER_EMAILS";
 
 type EnvLike = Record<string, unknown>;
 const warned = new Set<string>();
@@ -163,16 +220,46 @@ function warnOnce(key: string, v: unknown): void {
   console.warn(`ignoring invalid ${key}=${JSON.stringify(v)}; using the default`);
 }
 
-/** Limits for a plan: the plan's defaults, with env overrides applied to the free plan. Never throws. */
+function sharePercent(env: EnvLike, key: string, dflt: number): number {
+  const v = env[key];
+  if (typeof v !== "string" || v === "") return dflt;
+  const n = Number(v.trim());
+  if (/^\d{1,3}(\.\d+)?$/.test(v.trim()) && n > 0 && n <= 100) return n;
+  warnOnce(key, v);
+  return dflt;
+}
+
+/** True if `email` is listed in OWNER_EMAILS (case-insensitive). */
+export function isOwnerEmail(email: string | null | undefined, env: EnvLike): boolean {
+  const list = env[OWNER_EMAILS_ENV];
+  if (!email || typeof list !== "string") return false;
+  const e = email.trim().toLowerCase();
+  return list.split(",").some((x) => x.trim().toLowerCase() === e && e !== "");
+}
+
+/** The plan a tenant runs on: owner by email, else its stored plan if known, else free. */
+export function resolvePlan(stored: string | null | undefined, email: string | null | undefined, env: EnvLike): string {
+  if (isOwnerEmail(email, env)) return OWNER_PLAN;
+  return stored && PLANS[stored] ? stored : DEFAULT_PLAN;
+}
+
+/**
+ * Limits for a plan. Free: defaults + LIMIT_* / DAILY_MESSAGE_CAP / TENANT_DAILY_SHARE_PERCENT overrides
+ * (they apply to free-plan tenants only). Owner: its own defaults + OWNER_DAILY_SHARE_PERCENT. Never throws.
+ */
 export function limitsFor(plan: string | null | undefined, env: EnvLike): TenantLimits {
-  const base = PLANS[plan ?? DEFAULT_PLAN] ?? PLANS[DEFAULT_PLAN]!;
-  if ((plan ?? DEFAULT_PLAN) !== DEFAULT_PLAN && PLANS[plan!]) return base;
+  const name = plan && PLANS[plan] ? plan : DEFAULT_PLAN;
+  const base = PLANS[name]!;
+  if (name === OWNER_PLAN) {
+    const share = sharePercent(env, OWNER_SHARE_ENV, base.daily_share_percent);
+    return { ...base, daily_share_percent: share, daily: dailyBudget(share) };
+  }
   const out: TenantLimits = { ...base };
-  for (const [name, key] of Object.entries(LIMIT_ENV) as [LimitName, string][]) {
+  for (const [n, key] of Object.entries(LIMIT_ENV) as [LimitName, string][]) {
     const v = env[key];
     if (typeof v !== "string" || v === "") continue;
     const r = parseRate(v);
-    if (r) out[name] = r;
+    if (r) out[n] = r;
     else warnOnce(key, v);
   }
   const cap = env[DAILY_CAP_ENV];
@@ -180,6 +267,8 @@ export function limitsFor(plan: string | null | undefined, env: EnvLike): Tenant
     if (/^\d{1,9}$/.test(cap.trim())) out.daily_messages = Number(cap.trim());
     else warnOnce(DAILY_CAP_ENV, cap);
   }
+  out.daily_share_percent = sharePercent(env, SHARE_ENV, base.daily_share_percent);
+  out.daily = dailyBudget(out.daily_share_percent);
   return out;
 }
 
@@ -189,6 +278,8 @@ export function limitsFor(plan: string | null | undefined, env: EnvLike): Tenant
 export interface PublicLimits {
   /** /api/pair/start per IP: each start creates a Pairing DO (put + alarm + wipe later). */
   pair_start_ip: Rate;
+  /** /api/pair/start per IPv6 /48 (one site can rotate through many /64s). */
+  pair_start_ip48: Rate;
   /** /api/pair/start for everyone together (split across THROTTLE_SHARDS shards). */
   pair_start_global: Rate;
   /** /api/pair/wait per IP, isolate-local only (a DO check would cost as much as the wait itself). */
@@ -201,7 +292,8 @@ export interface PublicLimits {
 
 export const PUBLIC_DEFAULTS: PublicLimits = {
   pair_start_ip: rate("5,10/h"),
-  pair_start_global: rate("80,120/h"),
+  pair_start_ip48: rate("15,30/h"),
+  pair_start_global: rate("160,240/h"),
   pair_wait_ip: rate("30,120/h"),
   auth_ip: rate("30,120/h"),
   approve_attempts_per_code: 5,
@@ -209,6 +301,7 @@ export const PUBLIC_DEFAULTS: PublicLimits = {
 
 export const PUBLIC_ENV: Record<Exclude<keyof PublicLimits, "approve_attempts_per_code">, string> = {
   pair_start_ip: "LIMIT_PAIR_START_IP",
+  pair_start_ip48: "LIMIT_PAIR_START_IP48",
   pair_start_global: "LIMIT_PAIR_START_GLOBAL",
   pair_wait_ip: "LIMIT_PAIR_WAIT_IP",
   auth_ip: "LIMIT_AUTH_IP",

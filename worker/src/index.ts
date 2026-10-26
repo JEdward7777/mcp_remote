@@ -52,13 +52,14 @@ function err(status: number, error: string): Response {
 }
 
 /** 429 with Retry-After and a sentence a person can act on. */
-function tooMany(retryAfterMs: number, what: string): Response {
+function tooMany(retryAfterMs: number, what: string, saysWhen = false): Response {
   const secs = Math.max(1, Math.ceil(retryAfterMs / 1000));
-  return json({ error: `${what}; try again in ${humanWait(retryAfterMs)}`, retry_after_s: secs }, 429, { "retry-after": String(secs) });
+  const error = saysWhen ? what : `${what}; try again in ${humanWait(retryAfterMs)}`;
+  return json({ error, retry_after_s: secs }, 429, { "retry-after": String(secs) });
 }
 
 function unwrap<T>(r: Limited<T>): { value: T } | Response {
-  return r.ok ? { value: r.value } : tooMany(r.retryAfterMs, "too many requests for this account");
+  return r.ok ? { value: r.value } : tooMany(r.retryAfterMs, r.error, r.says_when);
 }
 
 class BodyError extends Error {
@@ -364,7 +365,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     if (!code) return err(400, "that does not look like a pairing code");
     // Per-tenant guess limit before any Pairing DO is woken (a wrong code wakes a fresh one).
     const allowed = await hubFor(env, session.tid).allowPairApprove();
-    if (!allowed.ok) return tooMany(allowed.retryAfterMs, "too many pairing approvals on this account");
+    if (!allowed.ok) return tooMany(allowed.retryAfterMs, allowed.error ?? "too many pairing approvals on this account", allowed.says_when);
     const pairing = env.PAIRING.get(env.PAIRING.idFromName(`pair:${code}`));
     const claim = await pairing.beginApprove(publicLimits(env as unknown as Record<string, unknown>).approve_attempts_per_code);
     if (!claim.ok) return err(claim.status ?? 404, claim.error);

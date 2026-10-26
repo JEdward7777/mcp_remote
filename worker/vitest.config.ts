@@ -14,6 +14,8 @@ export default defineConfig({
           GOOGLE_CLIENT_ID: "test-client.apps.googleusercontent.com",
           GOOGLE_CLIENT_SECRET: "test-google-secret",
           ALLOWED_EMAILS: "allowed@example.com",
+          // Phase 3: the "boss" dev tenant runs on the owner plan (limits.test.ts).
+          OWNER_EMAILS: "someone@example.com, Boss@dev.local",
         },
       },
     }),

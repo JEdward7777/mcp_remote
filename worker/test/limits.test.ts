@@ -3,12 +3,12 @@
 import { SELF, evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { tenantIdForDev } from "../src/auth";
-import { PLANS, formatRate, limitsFor, parseRate, publicLimits } from "../src/budget";
+import { FREE_PLAN, PLANS, dailyBudget, formatRate, isOwnerEmail, limitsFor, parseRate, publicLimits, resolvePlan } from "../src/budget";
 import type { Env } from "../src/env";
 import { Limiter, fullAt, take } from "../src/ratelimit";
 import { checkPairStart, clientKey, perShard, shardOf } from "../src/throttle";
 import { UsageMeter, msUntilUtcMidnight, utcDay } from "../src/usage";
-import { E, ORIGIN, connect, cookieFor, daemon, last, newMachine, phone, setLimits, waitFor, withHub } from "./helpers";
+import { E, ORIGIN, connect, cookieFor, daemon, last, newMachine, phone, setLimits, sleep, waitFor, withHub } from "./helpers";
 
 const MIN = 60_000;
 const r = (s: string) => parseRate(s)!;
@@ -64,6 +64,27 @@ describe("token buckets (pure, explicit time)", () => {
     expect(publicLimits({ LIMIT_PAIR_START_IP: "1,1/day" }).pair_start_ip).toEqual({ burst: 1, per: 1, perMs: 86_400_000 });
   });
 
+  it("derives each plan's daily budget from the free-plan numbers (rate x 1440 is not the bound)", () => {
+    expect(dailyBudget(10)).toEqual({
+      do_requests: FREE_PLAN.doRequestsPerDay / 10,
+      rows_read: FREE_PLAN.sqliteRowsReadPerDay / 10,
+      rows_written: FREE_PLAN.sqliteRowsWrittenPerDay / 10,
+    });
+    const free = limitsFor("free", {});
+    expect(free.daily_share_percent).toBe(10);
+    expect(limitsFor("free", { TENANT_DAILY_SHARE_PERCENT: "5" }).daily.rows_written).toBe(FREE_PLAN.sqliteRowsWrittenPerDay / 20);
+    expect(limitsFor("free", { TENANT_DAILY_SHARE_PERCENT: "250" }).daily_share_percent).toBe(10);
+    const owner = limitsFor("owner", { LIMIT_PHONE_SEND: "1,1/h", OWNER_DAILY_SHARE_PERCENT: "30" });
+    expect(owner.phone_send).toEqual(PLANS.owner!.phone_send); // free-plan overrides don't touch the owner
+    expect(owner.daily_share_percent).toBe(30);
+    expect(owner.daily_messages).toBeGreaterThan(free.daily_messages);
+    expect(isOwnerEmail("BOSS@dev.local", { OWNER_EMAILS: "a@b.c, boss@dev.local" })).toBe(true);
+    expect(isOwnerEmail("", { OWNER_EMAILS: "," })).toBe(false);
+    expect(resolvePlan("free", "boss@dev.local", { OWNER_EMAILS: "boss@dev.local" })).toBe("owner");
+    expect(resolvePlan("owner", null, {})).toBe("owner");
+    expect(resolvePlan("platinum", null, {})).toBe("free");
+  });
+
   it("keys clients by IPv4 address and IPv6 /64, and spreads keys over shards", () => {
     const req = (ip?: string) => new Request("https://x/", ip ? { headers: { "cf-connecting-ip": ip } } : {});
     expect(clientKey(req("203.0.113.7"))).toBe("ip:203.0.113.7");
@@ -76,7 +97,7 @@ describe("token buckets (pure, explicit time)", () => {
     expect(shardOf("ip:203.0.113.7")).toBe(shardOf("ip:203.0.113.7"));
     const seen = new Set(Array.from({ length: 200 }, (_, i) => shardOf(`ip:10.0.0.${i}`)));
     expect(seen.size).toBe(8);
-    expect(perShard(r("80,120/h"))).toEqual({ burst: 10, per: 15, perMs: 3600_000 });
+    expect(perShard(r("160,240/h"))).toEqual({ burst: 20, per: 30, perMs: 3600_000 });
   });
 
   it("UTC day helpers", () => {
@@ -223,7 +244,9 @@ describe("per-tenant limits in the Hub (D10)", () => {
     p.send({ t: "refresh" });
     const st = await waitFor(() => [...p.frames].reverse().find((f) => f.t === "state" && f.usage?.messages === 3), "usage");
     expect(st.usage).toMatchObject({ plan: "free", day: utcDay(Date.now()), messages: 3, message_cap: 3 });
-    expect(st.usage.requests).toBeGreaterThan(5);
+    expect(st.usage.frames).toBeGreaterThan(5);
+    expect(st.usage.rows_written).toBeGreaterThan(0);
+    expect(st.usage.blocked).toBeNull();
   });
 
   it("rate limits launch requests and history fetches", async () => {
@@ -318,6 +341,149 @@ describe("per-tenant limits in the Hub (D10)", () => {
     expect([...phoneSend, ...agentSend].some((q) => /usage|meta/.test(q))).toBe(false);
   });
 
+  it("refuses everything once a daily budget is used up, until 00:00 UTC, with a clear reason", async () => {
+    const { d, p, sid } = await setup("budget-a");
+    await withHub("budget-a", (hub) => {
+      hub.limits = { ...hub.limits, daily: { ...hub.limits.daily, rows_written: hub.meter.today(Date.now()).rows_written + 15 } };
+    });
+    // Each message writes a few rows: a handful exhausts the patched budget.
+    for (let i = 0; i < 8; i++) p.send({ t: "send", session_id: sid, text: `b${i}`, client_id: `b${i}` });
+    const e = await waitFor(() => p.frames.find((f) => f.t === "error" && /daily budget/.test(f.error)), "phone refused");
+    expect(e.error).toMatch(
+      /^this account's daily budget is used up \(database rows written: \d+ of \d+ per UTC day, 10% of the free plan's daily limit, "free" plan\); it resets at 00:00 UTC, in /,
+    );
+    expect(e.retry_after_s).toBeGreaterThan(0);
+    // The daemon's next frame closes it with a hint until midnight.
+    d.send({ t: "session_down", session_id: sid });
+    await waitFor(() => d.closed, "daemon closed");
+    expect(d.closed!.code).toBe(4029);
+    expect(d.closed!.reason).toMatch(/^daily budget used up; retry in \d+s$/);
+    const cookie = await cookieFor("budget-a");
+    const st = await SELF.fetch(`${ORIGIN}/api/state`, { headers: { cookie } });
+    expect(st.status).toBe(429);
+    expect(((await st.json()) as { error: string }).error).toMatch(/^this account's daily budget is used up .* in \d+ (h|min|s)$/);
+    p.send({ t: "launch", machine_id: "x", project_id: "p", continue: false, client_id: "L" });
+    const lr = await waitFor(() => p.frames.find((f) => f.t === "launch_result" && f.client_id === "L"), "launch refused");
+    expect(lr.error).toMatch(/daily budget is used up/);
+    // A phone can still connect and sees why.
+    const p2 = await phone("budget-a");
+    const s2 = await waitFor(() => last(p2, "state"), "state");
+    expect(s2.usage.blocked).toMatch(/daily budget is used up/);
+  });
+
+  it("counts frames, rows read and rows written, and stops a request flood at the daily request budget", async () => {
+    const { d, p } = await setup("budget-b");
+    await withHub("budget-b", (hub) => {
+      const t = hub.meter.today(Date.now());
+      const used = t.requests + Math.ceil(t.frames / 20);
+      hub.limits = { ...hub.limits, daily: { ...hub.limits.daily, do_requests: used + 3 } };
+    });
+    for (let i = 0; i < 80; i++) p.send({ t: "refresh" });
+    await waitFor(() => p.frames.some((f) => f.t === "error" && /requests: \d+ of \d+/.test(f.error)), "request budget");
+    const t = await withHub("budget-b", (hub) => hub.meter.today(Date.now()));
+    expect(t.frames).toBeGreaterThan(60);
+    expect(t.rows_read).toBeGreaterThan(0);
+    void d;
+  });
+
+  it("writes nothing for repeated session_up / session_down (flapping costs only real changes)", async () => {
+    const { d, sid } = await setup("flap");
+    const written = () => withHub("flap", (hub) => hub.meter.today(Date.now()).rows_written as number);
+    const settle = async () => {
+      d.send({ t: "launches", launches: [] }); // a cheap frame so the Hub settles the previous one's rows
+      await sleep(50);
+    };
+    await settle();
+    let before = await written();
+    for (let i = 0; i < 10; i++) d.send({ t: "session_up", session: { session_id: sid, project: "p" } });
+    await settle();
+    expect((await written()) - before).toBe(0);
+    d.send({ t: "session_down", session_id: sid });
+    await settle();
+    before = await written();
+    for (let i = 0; i < 10; i++) d.send({ t: "session_down", session_id: sid });
+    await settle();
+    expect((await written()) - before).toBe(0);
+    // A real up/down pair: one row each.
+    before = await written();
+    d.send({ t: "session_up", session: { session_id: sid, project: "p" } });
+    d.send({ t: "session_down", session_id: sid });
+    await settle();
+    expect((await written()) - before).toBeLessThanOrEqual(4);
+    // A reconnect hello with the same sessions rewrites nothing for sessions still online.
+    d.send({ t: "session_up", session: { session_id: sid, project: "p" } });
+    await settle();
+    before = await written();
+    d.send({ t: "hello", v: 1, sessions: [{ session_id: sid, project: "p" }] });
+    await settle();
+    expect((await written()) - before).toBe(0);
+  });
+
+  it("refused HTTP calls with no open socket write no usage row (counts stay in memory)", async () => {
+    const cookie = await cookieFor("nosock");
+    await withHub("nosock", () => {});
+    await setLimits("nosock", { http: r("2,1/min") });
+    const stmts: string[] = [];
+    await withHub("nosock", (hub) => {
+      const real = hub.sql;
+      const spy = { exec: (q: string, ...a: unknown[]) => (stmts.push(q), real.exec(q, ...a)) };
+      hub.sql = spy;
+      hub.meter.sql = spy;
+    });
+    const statuses: number[] = [];
+    for (let i = 0; i < 10; i++) statuses.push((await SELF.fetch(`${ORIGIN}/api/machines`, { headers: { cookie } })).status);
+    expect(statuses.filter((x) => x === 429).length).toBe(8);
+    expect(stmts.filter((q) => /usage|meta/.test(q))).toEqual([]);
+    expect(await withHub("nosock", (hub) => hub.meter.today(Date.now()).requests)).toBeGreaterThanOrEqual(10);
+  });
+
+  it("keeps limits when the socket holding the newest snapshot closes and the Hub is evicted", async () => {
+    const user = "keep-rl";
+    const { d, p: first, sid } = await setup(user);
+    first.ws.close(1000, "bye"); // only the round's phone (and the daemon) are open below
+    await sleep(50);
+    let accepted = 0;
+    for (let round = 0; round < 3; round++) {
+      const p = await phone(user);
+      await waitFor(() => last(p, "state"), "state");
+      for (let i = 0; i < 12; i++) p.send({ t: "send", session_id: sid, text: "x", client_id: `${round}-${i}` });
+      await waitFor(() => p.frames.filter((f) => (f.t === "error" || f.t === "message") && f.client_id?.startsWith(`${round}-`)).length >= 12, "replies");
+      accepted += p.frames.filter((f) => f.t === "message" && f.client_id?.startsWith(`${round}-`)).length;
+      p.ws.close(1000, "bye");
+      await sleep(100);
+      await evictDurableObject(E.HUB.get(E.HUB.idFromName(tenantIdForDev(user))));
+    }
+    expect(accepted).toBeLessThanOrEqual(12); // burst 10 + a little refill, not 3 x 10
+    // And with no socket left at all: the buckets are written to meta at the last close.
+    d.ws.close(1000, "bye");
+    await sleep(100);
+    await evictDurableObject(E.HUB.get(E.HUB.idFromName(tenantIdForDev(user))));
+    const snap = await withHub(user, (_h, st) => st.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'rl_snap'").toArray()[0]?.v);
+    expect(JSON.parse(snap!).b.phone_send).toBeDefined();
+    const p = await phone(user);
+    p.send({ t: "send", session_id: sid, text: "x", client_id: "after" });
+    const e = await waitFor(() => p.frames.find((f) => f.client_id === "after" && (f.t === "error" || f.t === "message")), "after");
+    expect(e.t).toBe("error");
+  });
+
+  it("puts OWNER_EMAILS accounts on the owner plan (roomier, still budgeted)", async () => {
+    const p = await phone("boss");
+    const st = await waitFor(() => last(p, "state"), "state");
+    expect(st.usage).toMatchObject({ plan: "owner", message_cap: PLANS.owner!.daily_messages });
+    expect(st.usage.budget.share_percent).toBe(50);
+    const q = await phone("not-boss");
+    expect((await waitFor(() => last(q, "state"), "state")).usage.plan).toBe("free");
+  });
+
+  it("counts refused daemon connects (401) as requests", async () => {
+    const { token } = await newMachine("count401");
+    const before = await withHub("count401", (hub) => { hub.wake(Date.now()); return hub.meter.today(Date.now()).requests as number; });
+    await withHub("count401", (_h, st) => st.storage.sql.exec("UPDATE machines SET token_hash = 'x'"));
+    for (let i = 0; i < 3; i++) expect(await connect("/api/daemon/ws", { authorization: `Bearer ${token}` })).toBe(401);
+    const after = await withHub("count401", (hub) => hub.meter.today(Date.now()).requests as number);
+    expect(after - before).toBe(3);
+  });
+
   it("rate limits the HTTP API per tenant with 429 + Retry-After", async () => {
     const cookie = await cookieFor("rl-http");
     await withHub("rl-http", () => {});
@@ -362,6 +528,17 @@ describe("pairing abuse protection", () => {
     for (let i = 0; i < 5; i++) expect((await start(i % 2 ? "2001:db8:7:7::1" : "2001:db8:7:7:abcd::2")).status).toBe(200);
     expect((await start("2001:db8:7:7::99")).status).toBe(429);
     expect((await start("2001:db8:7:8::1")).status).toBe(200);
+  });
+
+  it("also caps a whole IPv6 /48 (rotating through /64s doesn't help)", async () => {
+    let ok = 0;
+    for (let i = 0; i < 20; i++) {
+      const res = await start(`2001:db8:48:${(i + 1).toString(16)}::1`);
+      if (res.status === 200) ok++;
+      else expect(res.status).toBe(429);
+    }
+    expect(ok).toBe(15);
+    expect((await start("2001:db8:49:1::1")).status).toBe(200);
   });
 
   it("charges nothing for a refused check and caps everyone together per shard", async () => {

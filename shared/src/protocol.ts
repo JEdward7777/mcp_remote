@@ -170,8 +170,21 @@ export const UsageInfo = z.object({
   messages: z.number().int().nonnegative(),
   message_cap: z.number().int().nonnegative(),
   launches: z.number().int().nonnegative(),
-  /** Requests the Hub handled (WebSocket frames, connects, API calls). */
+  /** Connects and API calls the Hub handled. */
   requests: z.number().int().nonnegative(),
+  /** Inbound WebSocket frames the Hub handled (billed ~20:1 as requests). */
+  frames: z.number().int().nonnegative(),
+  rows_read: z.number().int().nonnegative(),
+  rows_written: z.number().int().nonnegative(),
+  /** Daily budget (share of each free daily limit) the counters above are checked against. */
+  budget: z.object({
+    do_requests: z.number().int().nonnegative(),
+    rows_read: z.number().int().nonnegative(),
+    rows_written: z.number().int().nonnegative(),
+    share_percent: z.number().nonnegative(),
+  }),
+  /** Set when a daily budget is used up: the reason, shown on the phone until 00:00 UTC. */
+  blocked: z.string().nullable(),
 });
 export type UsageInfo = z.infer<typeof UsageInfo>;
 

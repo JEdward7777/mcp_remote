@@ -263,8 +263,11 @@ function utcToday(): string {
 function usageText(): string {
   const u = state.usage;
   if (!u) return "";
-  const n = u.day === utcToday() ? u.messages : 0;
-  return `Today (UTC): ${n} of ${u.message_cap} messages on the ${u.plan} plan`;
+  const today = u.day === utcToday();
+  const n = today ? u.messages : 0;
+  const line = `Today (UTC): ${n} of ${u.message_cap} messages on the ${u.plan} plan`;
+  // A used-up daily budget blocks everything until midnight: say so instead of failing silently.
+  return today && u.blocked ? `${line}. ${u.blocked[0]!.toUpperCase()}${u.blocked.slice(1)}.` : line;
 }
 
 function renderStatus(): void {

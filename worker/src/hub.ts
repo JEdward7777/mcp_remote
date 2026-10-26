@@ -23,12 +23,20 @@ import {
   humanWait,
   parseFrame,
 } from "@mcp-remote/shared";
-import { ATTACHMENT_BUDGET_BYTES, DEFAULT_PLAN, type LimitName, type TenantLimits, limitsFor } from "./budget";
+import {
+  ATTACHMENT_BUDGET_BYTES,
+  DEFAULT_PLAN,
+  FREE_PLAN,
+  type LimitName,
+  type TenantLimits,
+  limitsFor,
+  resolvePlan,
+} from "./budget";
 import { timingSafeEqual } from "./crypto";
 import { Env, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH } from "./env";
 import { accountAllowed } from "./oauth";
 import { type Bucket, Limiter, type LimiterSnapshot, take } from "./ratelimit";
-import { type PendingSnap, USAGE_SCHEMA, type UsageDay, UsageMeter, msUntilUtcMidnight } from "./usage";
+import { type PendingSnap, USAGE_ADDED_COLUMNS, USAGE_SCHEMA, type UsageDay, UsageMeter, msUntilUtcMidnight } from "./usage";
 
 /**
  * Rate-limit buckets and unflushed usage counts, carried across hibernation in the attachment of
@@ -39,7 +47,10 @@ type HubSnap = { g: number; u?: PendingSnap; b?: LimiterSnapshot };
 type Attachment = ({ kind: "phone" } | { kind: "daemon"; machine_id: string }) & { s?: HubSnap };
 
 /** Result of an HTTP-facing RPC that is rate limited per tenant. */
-export type Limited<T> = { ok: true; value: T } | { ok: false; retryAfterMs: number };
+export type Limited<T> =
+  | { ok: true; value: T }
+  /** `says_when`: the error already tells when to come back (no "try again in" needed). */
+  | { ok: false; retryAfterMs: number; error: string; says_when?: boolean };
 
 /** Buckets the Hub keeps in memory (pair_approve is persisted separately in meta). */
 type MemLimit = Exclude<LimitName, "pair_approve">;
@@ -78,6 +89,9 @@ type MessageRow = {
   created_at: number;
   delivered: number;
 };
+
+/** Marker: upsertSession found nothing to change. */
+const UNCHANGED = "\u0000unchanged";
 
 /** Close codes the daemon understands. */
 export const CLOSE_REVOKED = 4001;
@@ -187,45 +201,137 @@ function launchInfo(m: MachineRow): LaunchInfo | null {
 }
 
 export class Hub extends DurableObject<Env> {
+  /**
+   * All Hub SQL goes through this wrapper: it keeps each cursor until the end of the event, when its
+   * rowsRead / rowsWritten are charged to the tenant's daily budget (settleRows). No extra statements.
+   */
   private sql: SqlStorage;
+  private readonly cursors: { rowsRead: number; rowsWritten: number }[] = [];
   private limits: TenantLimits;
   private plan = DEFAULT_PLAN;
+  private email: string | null = null;
+  private storedPlan: string | null = null;
   private readonly limiter: Limiter<MemLimit>;
   readonly meter: UsageMeter;
   private woke = false;
+  /** Set by upgrade() when it accepted a socket (that socket then carries the snapshot). */
+  private accepted = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.sql = ctx.storage.sql;
+    const raw = ctx.storage.sql;
+    this.sql = {
+      exec: (q: string, ...args: unknown[]) => {
+        const c = raw.exec(q, ...(args as SqlStorageValue[]));
+        this.cursors.push(c);
+        return c;
+      },
+    } as unknown as SqlStorage;
     this.sql.exec(SCHEMA);
     this.migrate();
     // Keepalive pings are answered by the runtime without waking the object (D5).
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
-    this.limits = limitsFor(DEFAULT_PLAN, env as unknown as Record<string, unknown>);
+    this.limits = limitsFor(DEFAULT_PLAN, this.envVars());
     this.limiter = new Limiter<MemLimit>(this.limits);
     this.meter = new UsageMeter(this.sql);
+  }
+
+  private envVars(): Record<string, unknown> {
+    return this.env as unknown as Record<string, unknown>;
   }
 
   // -------------------------------------------------------------------------
   // Per-tenant limits and usage (Phase 3, D10)
 
   /**
-   * Once per wake: pick the tenant's plan, restore buckets + unflushed usage from the newest socket
-   * attachment, and read today's usage row. Costs ~2 rows read per wake, nothing per message.
+   * Once per wake: read the tenant record (plan, email, persisted limiter snapshot: one query), pick
+   * the plan, restore buckets + unflushed usage from the newest snapshot (socket attachments or the
+   * persisted one) and read today's usage row. ~4 rows read per wake, nothing per message.
    */
-  private wake(now: number): void {
+  private wake(now: number, closing?: WebSocket): void {
     if (this.woke) return;
     this.woke = true;
-    this.plan = this.getMeta("plan") ?? DEFAULT_PLAN;
-    this.limits = limitsFor(this.plan, this.env as unknown as Record<string, unknown>);
-    this.limiter.setRates(this.limits);
+    const meta = new Map(
+      this.sql
+        .exec<{ k: string; v: string }>("SELECT k, v FROM meta WHERE k IN ('plan', 'email', 'rl_snap')")
+        .toArray()
+        .map((r) => [r.k, r.v]),
+    );
+    this.storedPlan = meta.get("plan") ?? null;
+    this.email = meta.get("email") ?? null;
+    this.applyPlan(true);
     let best: HubSnap | null = null;
-    for (const ws of this.ctx.getWebSockets()) {
-      const s = (ws.deserializeAttachment() as Attachment | null)?.s;
+    const consider = (s: HubSnap | undefined | null) => {
       if (s && typeof s.g === "number" && (!best || s.g > best.g)) best = s;
+    };
+    try {
+      const persisted = meta.get("rl_snap");
+      if (persisted) consider(JSON.parse(persisted) as HubSnap);
+    } catch {
+      /* corrupt: ignore */
     }
-    this.limiter.restore(best?.b);
-    this.meter.load(now, best);
+    for (const ws of this.ctx.getWebSockets()) consider((ws.deserializeAttachment() as Attachment | null)?.s);
+    // A socket whose close woke us is no longer listed by getWebSockets(), but may carry the newest state.
+    if (closing) consider((closing.deserializeAttachment() as Attachment | null)?.s);
+    const b = best as HubSnap | null;
+    this.limiter.restore(b?.b);
+    this.meter.load(now, b);
+  }
+
+  /** Plan = owner (OWNER_EMAILS) or the stored plan or free; selects the limits. */
+  private applyPlan(force = false): void {
+    const plan = resolvePlan(this.storedPlan, this.email, this.envVars());
+    if (!force && plan === this.plan) return;
+    this.plan = plan;
+    this.limits = limitsFor(this.plan, this.envVars());
+    this.limiter.setRates(this.limits);
+  }
+
+  /** Charge the rows of every statement run since the last call to today's usage (daily budget). */
+  private settleRows(now: number): void {
+    if (!this.cursors.length) return;
+    let r = 0;
+    let w = 0;
+    for (const c of this.cursors.splice(0)) {
+      r += c.rowsRead;
+      w += c.rowsWritten;
+    }
+    this.meter.add("rows_read", now, r);
+    this.meter.add("rows_written", now, w);
+  }
+
+  /** Start of every event (frame, connect, RPC): wake, settle earlier rows, count it. */
+  private begin(kind: "frames" | "requests", now: number): void {
+    this.wake(now);
+    this.settleRows(now);
+    this.meter.add(kind, now);
+  }
+
+  /**
+   * The tenant's daily budget (budget.ts, DailyBudget): when any part is used up, the Hub refuses work
+   * until 00:00 UTC. Returns the reason, or null.
+   */
+  private overBudget(now: number): { what: string; text: string; retryMs: number } | null {
+    const t = this.meter.today(now);
+    const b = this.limits.daily;
+    const reqs = t.requests + Math.ceil(t.frames / FREE_PLAN.wsIncomingMessagesPerBilledRequest);
+    const what =
+      reqs >= b.do_requests
+        ? `requests: ${reqs} of ${b.do_requests}`
+        : t.rows_read >= b.rows_read
+          ? `database rows read: ${t.rows_read} of ${b.rows_read}`
+          : t.rows_written >= b.rows_written
+            ? `database rows written: ${t.rows_written} of ${b.rows_written}`
+            : null;
+    if (!what) return null;
+    const retryMs = msUntilUtcMidnight(now);
+    return {
+      what,
+      retryMs,
+      text:
+        `this account's daily budget is used up (${what} per UTC day, ${this.limits.daily_share_percent}% of the free ` +
+        `plan's daily limit, "${this.plan}" plan); it resets at 00:00 UTC, in ${humanWait(retryMs)}`,
+    };
   }
 
   /**
@@ -233,9 +339,9 @@ export class Hub extends DurableObject<Env> {
    * Returns the refusal response, or null when the connect may proceed.
    */
   private connectLimited(kind: "phone" | "daemon", now: number): Response | null {
-    const wait = this.limited("connects", now);
+    const over = kind === "daemon" ? this.overBudget(now) : null; // a phone may connect to see why
+    const wait = over ? over.retryMs : this.limited("connects", now);
     if (wait === null) return null;
-    this.saveSnap(undefined, now);
     const secs = Math.ceil(wait / 1000);
     if (kind === "phone") {
       // A browser can't read an HTTP status on a failed upgrade: accept, then close with a reason.
@@ -244,7 +350,7 @@ export class Hub extends DurableObject<Env> {
       pair[1].close(CLOSE_RATE_LIMITED, `too many connections; retry in ${secs}s`);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
-    return new Response(`too many connections for this account; retry in ${secs}s`, {
+    return new Response(over ? `${over.text}; retry in ${secs}s` : `too many connections for this account; retry in ${secs}s`, {
       status: 429,
       headers: { "retry-after": String(secs) },
     });
@@ -268,29 +374,60 @@ export class Hub extends DurableObject<Env> {
     );
   }
 
-  /** Carry limiter + usage state in this socket's attachment (survives hibernation; no storage). */
+  private openSockets(except?: WebSocket): WebSocket[] {
+    return this.ctx.getWebSockets().filter((w) => w !== except && w.readyState === WebSocket.OPEN);
+  }
+
+  /**
+   * End of every event: carry limiter + usage state in a socket attachment (survives hibernation; no
+   * storage). `ws` defaults to any OPEN socket. With none open, the state stays in memory (counts are
+   * flushed at the 50-event threshold; what an eviction loses then is bounded and accepted).
+   */
   private saveSnap(ws: WebSocket | undefined, now: number): void {
-    const target = ws ?? this.ctx.getWebSockets()[0];
-    if (!target) {
-      // Nothing can carry the state across hibernation: write the counts now (rare: RPC with no sockets).
-      this.meter.flush();
-      return;
-    }
+    this.settleRows(now);
+    const target = ws ?? this.openSockets()[0];
+    if (!target) return;
     const att = target.deserializeAttachment() as Attachment | null;
     if (!att) return;
-    const u = this.meter.snapshot();
-    const snap: HubSnap = { ...u, b: this.limiter.snapshot(now) };
-    if (JSON.stringify(snap).length > ATTACHMENT_BUDGET_BYTES) delete snap.b; // never risk the attachment limit
     try {
-      target.serializeAttachment({ ...att, s: snap } satisfies Attachment);
+      target.serializeAttachment({ ...att, s: this.nextSnap(now) } satisfies Attachment);
     } catch (e) {
       console.error("could not save hub snapshot", e);
     }
   }
 
+  private nextSnap(now: number): HubSnap {
+    const snap: HubSnap = { ...this.meter.snapshot(), b: this.limiter.snapshot(now) };
+    if (JSON.stringify(snap).length > ATTACHMENT_BUDGET_BYTES) delete snap.b; // never risk the attachment limit
+    return snap;
+  }
+
+  /**
+   * A socket closed: it may have carried the newest snapshot. Move the state to another open socket;
+   * if none is left, write it down (usage row + non-full buckets in meta: at most 2 rows per last close).
+   */
+  private onSocketClosedState(ws: WebSocket, now: number): void {
+    const other = this.openSockets(ws)[0];
+    if (other) {
+      this.saveSnap(other, now);
+      return;
+    }
+    this.settleRows(now);
+    const snap = this.nextSnap(now);
+    if (snap.b && Object.keys(snap.b).length) {
+      this.sql.exec(
+        "INSERT INTO meta (k, v) VALUES ('rl_snap', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        JSON.stringify({ g: snap.g, b: snap.b }),
+      );
+    }
+    this.settleRows(now);
+    this.meter.flush();
+  }
+
   usageInfo(now = Date.now()): UsageInfo {
     this.wake(now);
     const t = this.meter.today(now);
+    const over = this.overBudget(now);
     return {
       plan: this.plan,
       day: t.day,
@@ -298,33 +435,52 @@ export class Hub extends DurableObject<Env> {
       message_cap: this.limits.daily_messages,
       launches: t.launches,
       requests: t.requests,
+      frames: t.frames,
+      rows_read: t.rows_read,
+      rows_written: t.rows_written,
+      budget: { ...this.limits.daily, share_percent: this.limits.daily_share_percent },
+      blocked: over ? over.text : null,
     };
   }
 
   /** This tenant's usage, newest day first (for the phone and Phase 4b's admin view; never cross-tenant). */
-  async usage(days = 35): Promise<Limited<{ plan: string; message_cap: number; days: UsageDay[] }>> {
+  async usage(days = 35): Promise<Limited<{ plan: string; message_cap: number; budget: UsageInfo["budget"]; days: UsageDay[] }>> {
     const now = Date.now();
-    const wait = this.httpGate(now);
-    if (wait !== null) return { ok: false, retryAfterMs: wait };
-    return { ok: true, value: { plan: this.plan, message_cap: this.limits.daily_messages, days: this.meter.history(now, days) } };
+    const refused = this.httpGate(now);
+    if (refused) return refused;
+    const value = {
+      plan: this.plan,
+      message_cap: this.limits.daily_messages,
+      budget: { ...this.limits.daily, share_percent: this.limits.daily_share_percent },
+      days: this.meter.history(now, days),
+    };
+    this.saveSnap(undefined, now);
+    return { ok: true, value };
   }
 
-  /** Counts an HTTP-facing RPC and applies the tenant's `http` bucket. */
-  private httpGate(now: number): number | null {
-    this.wake(now);
-    this.meter.add("requests", now);
-    const wait = this.limited("http", now);
+  /** Counts an HTTP-facing RPC and applies the daily budget and the tenant's `http` bucket. */
+  private httpGate(now: number): { ok: false; retryAfterMs: number; error: string; says_when?: boolean } | null {
+    this.begin("requests", now);
+    const over = this.overBudget(now);
+    const wait = over ? null : this.limited("http", now);
+    if (!over && wait === null) return null;
+    // Refusals write nothing: the state rides along in memory / the next snapshot.
     this.saveSnap(undefined, now);
-    return wait;
+    if (over) return { ok: false, retryAfterMs: over.retryMs, error: over.text, says_when: true };
+    return { ok: false, retryAfterMs: wait!, error: "too many requests for this account" };
   }
 
   /**
    * Pairing approvals: a persisted bucket (one meta row; read 1, write 1 only when allowed), so a
    * hibernation can't hand out a fresh burst to someone guessing codes.
    */
-  async allowPairApprove(now = Date.now()): Promise<{ ok: boolean; retryAfterMs: number }> {
-    this.wake(now);
-    this.meter.add("requests", now);
+  async allowPairApprove(now = Date.now()): Promise<{ ok: boolean; retryAfterMs: number; error?: string; says_when?: boolean }> {
+    this.begin("requests", now);
+    const over = this.overBudget(now);
+    if (over) {
+      this.saveSnap(undefined, now);
+      return { ok: false, retryAfterMs: over.retryMs, error: over.text, says_when: true };
+    }
     let b: Bucket | undefined;
     try {
       const raw = this.getMeta("rl_pair_approve");
@@ -358,6 +514,13 @@ export class Hub extends DurableObject<Env> {
         /* column already exists */
       }
     }
+    for (const col of USAGE_ADDED_COLUMNS) {
+      try {
+        this.sql.exec(`ALTER TABLE usage ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
+      } catch {
+        /* column already exists */
+      }
+    }
     if (!this.getMeta("msg_count_v1")) {
       // One-time backfill (per session, via the (session_id, id) index); guarded by the meta flag.
       this.sql.exec(
@@ -372,6 +535,15 @@ export class Hub extends DurableObject<Env> {
 
   async addMachine(machineId: string, name: string, tokenHash: string, email?: string): Promise<MachineRecord> {
     const now = Date.now();
+    this.begin("requests", now);
+    try {
+      return this.addMachineInner(machineId, name, tokenHash, now, email);
+    } finally {
+      this.saveSnap(undefined, now);
+    }
+  }
+
+  private addMachineInner(machineId: string, name: string, tokenHash: string, now: number, email?: string): MachineRecord {
     if (email) this.rememberEmail(email);
     this.sql.exec(
       "INSERT INTO machines (machine_id, name, token_hash, created_at) VALUES (?, ?, ?, ?)",
@@ -389,6 +561,8 @@ export class Hub extends DurableObject<Env> {
    * if it never connected, so no orphan record is left behind.
    */
   async removeUnclaimedMachine(machineId: string): Promise<boolean> {
+    const now = Date.now();
+    this.begin("requests", now);
     const n = this.sql
       .exec(
         "DELETE FROM machines WHERE machine_id = ? AND last_seen IS NULL AND NOT EXISTS (SELECT 1 FROM sessions WHERE machine_id = ?)",
@@ -396,19 +570,26 @@ export class Hub extends DurableObject<Env> {
         machineId,
       ).rowsWritten;
     if (n) this.broadcastState();
+    this.saveSnap(undefined, now);
     return n > 0;
   }
 
   async listMachines(): Promise<Limited<MachineRecord[]>> {
-    const wait = this.httpGate(Date.now());
-    if (wait !== null) return { ok: false, retryAfterMs: wait };
-    return { ok: true, value: this.machineRecords() };
+    const now = Date.now();
+    const refused = this.httpGate(now);
+    if (refused) return refused;
+    const value = this.machineRecords();
+    this.saveSnap(undefined, now);
+    return { ok: true, value };
   }
 
   async revokeMachine(machineId: string): Promise<Limited<boolean>> {
-    const wait = this.httpGate(Date.now());
-    if (wait !== null) return { ok: false, retryAfterMs: wait };
-    return { ok: true, value: this.revoke(machineId) };
+    const now = Date.now();
+    const refused = this.httpGate(now);
+    if (refused) return refused;
+    const value = this.revoke(machineId);
+    this.saveSnap(undefined, now);
+    return { ok: true, value };
   }
 
   private revoke(machineId: string): boolean {
@@ -435,23 +616,34 @@ export class Hub extends DurableObject<Env> {
 
   async snapshot(): Promise<Limited<{ machines: MachineRecord[]; sessions: SessionRecord[]; usage: UsageInfo }>> {
     const now = Date.now();
-    const wait = this.httpGate(now);
-    if (wait !== null) return { ok: false, retryAfterMs: wait };
-    return { ok: true, value: { machines: this.machineRecords(), sessions: this.sessionRecords(), usage: this.usageInfo(now) } };
+    const refused = this.httpGate(now);
+    if (refused) return refused;
+    const value = { machines: this.machineRecords(), sessions: this.sessionRecords(), usage: this.usageInfo(now) };
+    this.saveSnap(undefined, now);
+    return { ok: true, value };
   }
 
   // -------------------------------------------------------------------------
   // WebSocket upgrade (forwarded by the Worker after it authenticated the caller)
 
   override async fetch(request: Request): Promise<Response> {
+    const now = Date.now();
+    this.begin("requests", now);
+    this.accepted = false;
+    try {
+      return this.upgrade(request, now);
+    } finally {
+      // Refusals (401/403/429/...) are counted too; an accepted socket already got the snapshot.
+      if (!this.accepted) this.saveSnap(undefined, now);
+    }
+  }
+
+  private upgrade(request: Request, now: number): Response {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("expected websocket", { status: 426 });
     }
     const kind = request.headers.get(H_KIND);
     const tenant = request.headers.get(H_TENANT);
-    const now = Date.now();
-    this.wake(now);
-    this.meter.add("requests", now);
     if (tenant) this.rememberTenant(tenant);
 
     if (kind === "phone") {
@@ -464,8 +656,9 @@ export class Hub extends DurableObject<Env> {
       const server = pair[1];
       this.ctx.acceptWebSocket(server, ["phone"]);
       server.serializeAttachment({ kind: "phone" } satisfies Attachment);
-      this.saveSnap(server, now);
       this.sendPhone(server, this.stateFrame());
+      this.saveSnap(server, now);
+      this.accepted = true;
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -481,7 +674,7 @@ export class Hub extends DurableObject<Env> {
       // Sign-up gating is re-checked on every daemon connect, so removing an account from
       // ALLOWED_EMAILS also locks out its machines (D7/D9).
       const tid = tenant ?? this.getMeta("tenant") ?? "";
-      if (!accountAllowed(tid, this.getMeta("email"), this.env)) {
+      if (!accountAllowed(tid, this.email, this.env)) {
         return new Response("account is no longer allowed to sign in", { status: 403 });
       }
       // Charged only after the token checked out, so a revoked/stolen token can't use up the budget.
@@ -499,9 +692,10 @@ export class Hub extends DurableObject<Env> {
       const server = pair[1];
       this.ctx.acceptWebSocket(server, ["daemon", `m:${machineId}`]);
       server.serializeAttachment({ kind: "daemon", machine_id: machineId } satisfies Attachment);
-      this.saveSnap(server, now);
       this.sql.exec("UPDATE machines SET last_seen = ? WHERE machine_id = ?", now, machineId);
       this.sendDaemon(server, { t: "welcome", machine_id: machineId, name: row.name });
+      this.saveSnap(server, now);
+      this.accepted = true;
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -520,8 +714,7 @@ export class Hub extends DurableObject<Env> {
       return;
     }
     const now = Date.now();
-    this.wake(now);
-    this.meter.add("requests", now);
+    this.begin("frames", now);
     try {
       this.onFrame(ws, att, message, now);
     } finally {
@@ -537,6 +730,7 @@ export class Hub extends DurableObject<Env> {
       ws.close(CLOSE_RATE_LIMITED, `rate limited: too many requests; retry in ${Math.ceil(flood / 1000)}s`);
       return;
     }
+    const over = this.overBudget(now);
     if (att.kind === "phone") {
       const r = parseFrame(PhoneToHub, message);
       if (!r.ok) {
@@ -544,8 +738,24 @@ export class Hub extends DurableObject<Env> {
         else this.sendPhone(ws, { t: "error", error: r.error });
         return;
       }
+      if (over) {
+        // Every phone request costs rows; answer each with the reason (no SQL) until 00:00 UTC.
+        const f = r.value;
+        const retry_after_s = Math.ceil(over.retryMs / 1000);
+        if (f.t === "launch" || f.t === "launch_stop" || f.t === "launch_restart" || f.t === "launch_dismiss") {
+          this.sendPhone(ws, { t: "launch_result", client_id: f.client_id, ok: false, error: over.text, retry_after_s });
+        } else {
+          this.sendPhone(ws, { t: "error", error: over.text, ...(f.t === "send" && f.client_id ? { client_id: f.client_id } : {}), retry_after_s });
+        }
+        return;
+      }
       this.onPhone(ws, r.value);
     } else {
+      if (over) {
+        // The daemon waits until the hinted time (shared/link.ts); its sessions show offline meanwhile.
+        ws.close(CLOSE_RATE_LIMITED, `daily budget used up; retry in ${Math.ceil(over.retryMs / 1000)}s`);
+        return;
+      }
       if (!this.machineActive(att.machine_id)) {
         ws.close(CLOSE_REVOKED, "machine revoked");
         return;
@@ -561,10 +771,10 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, _reason: string, _wasClean: boolean): Promise<void> {
-    this.wake(Date.now());
+    const now = Date.now();
+    this.wake(now, ws);
     this.onSocketGone(ws);
-    // This socket may hold the newest snapshot: write unflushed counts now (one row; closes are rare).
-    this.meter.flush();
+    this.onSocketClosedState(ws, now);
     try {
       ws.close(code === 1005 || code === 1006 ? 1000 : code, "bye");
     } catch {
@@ -573,9 +783,10 @@ export class Hub extends DurableObject<Env> {
   }
 
   override async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
-    this.wake(Date.now());
+    const now = Date.now();
+    this.wake(now, ws);
     this.onSocketGone(ws);
-    this.meter.flush();
+    this.onSocketClosedState(ws, now);
   }
 
   // -------------------------------------------------------------------------
@@ -714,9 +925,15 @@ export class Hub extends DurableObject<Env> {
     const now = Date.now();
     switch (f.t) {
       case "hello": {
-        this.sql.exec("UPDATE sessions SET online = 0, last_seen = ? WHERE machine_id = ? AND online = 1", now, machineId);
+        // Only sessions that are no longer announced go offline; unchanged ones are not rewritten.
+        this.sql.exec(
+          "UPDATE sessions SET online = 0, last_seen = ? WHERE machine_id = ? AND online = 1 AND session_id NOT IN (SELECT value FROM json_each(?))",
+          now,
+          machineId,
+          JSON.stringify(f.sessions.map((s) => s.session_id)),
+        );
         for (const s of f.sessions) {
-          const err = this.upsertSession(machineId, s, now);
+          const { error: err } = this.upsertSession(machineId, s, now);
           if (err) this.sendDaemon(ws, { t: "error", error: err, session_id: s.session_id });
         }
         for (const s of f.sessions) this.flushPending(ws, machineId, s.session_id);
@@ -724,23 +941,23 @@ export class Hub extends DurableObject<Env> {
         return;
       }
       case "session_up": {
-        const err = this.upsertSession(machineId, f.session, now);
+        const { error: err, changed } = this.upsertSession(machineId, f.session, now);
         if (err) {
           this.sendDaemon(ws, { t: "error", error: err, session_id: f.session.session_id });
           return;
         }
         this.flushPending(ws, machineId, f.session.session_id);
-        this.broadcastState();
+        if (changed) this.broadcastState(); // a repeated, unchanged session_up costs no write or broadcast
         return;
       }
       case "session_down": {
-        this.sql.exec(
-          "UPDATE sessions SET online = 0, last_seen = ? WHERE session_id = ? AND machine_id = ?",
+        const w = this.sql.exec(
+          "UPDATE sessions SET online = 0, last_seen = ? WHERE session_id = ? AND machine_id = ? AND online = 1",
           now,
           f.session_id,
           machineId,
-        );
-        this.broadcastState();
+        ).rowsWritten;
+        if (w) this.broadcastState();
         return;
       }
       case "send": {
@@ -867,8 +1084,17 @@ export class Hub extends DurableObject<Env> {
     return { row, rowsRead };
   }
 
-  private upsertSession(machineId: string, s: SessionAnnounce, now: number): string | null {
+  /** `changed` is false when the session was already online here with the same project/cwd (no write). */
+  private upsertSession(machineId: string, s: SessionAnnounce, now: number): { error: string | null; changed: boolean } {
+    const error = this.upsertSessionInner(machineId, s, now);
+    return { error: error === UNCHANGED ? null : error, changed: error === null };
+  }
+
+  private upsertSessionInner(machineId: string, s: SessionAnnounce, now: number): string | null {
     const existing = this.getSession(s.session_id);
+    if (existing && existing.machine_id === machineId && existing.online === 1 && existing.project === s.project && existing.cwd === (s.cwd ?? null)) {
+      return UNCHANGED;
+    }
     if (existing && existing.machine_id !== machineId && this.machineActive(existing.machine_id)) {
       // Only a revoked owner gives a session id up (e.g. re-pairing a computer). Two active
       // computers announcing the same id is a configuration error: refuse it rather than
@@ -985,17 +1211,21 @@ export class Hub extends DurableObject<Env> {
   // Queries / helpers
 
   private rememberTenant(tenant: string): void {
-    // The tenant record (D10): its id and its plan, which selects the limits (only "free" exists yet;
-    // a future billing step changes this row). Both are no-ops once set.
+    // The tenant record (D10): its id and its stored plan ("free"; a future billing step changes this
+    // row; OWNER_EMAILS selects "owner" on top of it). No SQL once known.
+    if (this.woke && this.storedPlan !== null) return;
     this.sql.exec("INSERT OR IGNORE INTO meta (k, v) VALUES ('tenant', ?), ('plan', ?)", tenant, DEFAULT_PLAN);
+    this.storedPlan ??= DEFAULT_PLAN;
   }
 
   private rememberEmail(email: string): void {
-    // No write when unchanged (this runs on every phone connect).
+    if (this.woke && this.email === email) return; // runs on every phone connect: no SQL when unchanged
     this.sql.exec(
       "INSERT INTO meta (k, v) VALUES ('email', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE v IS NOT excluded.v",
       email,
     );
+    this.email = email;
+    if (this.woke) this.applyPlan(); // OWNER_EMAILS is matched by email
   }
 
   private getMeta(k: string): string | null {

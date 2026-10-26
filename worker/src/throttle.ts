@@ -118,6 +118,12 @@ export function clientKey(request: Request): string {
   return `ip6:${prefix.join(":")}::/64`;
 }
 
+/** "ip6:a:b:c:d::/64" -> "ip6:a:b:c::/48"; null for IPv4 / unknown. */
+export function ip48(key: string): string | null {
+  const m = /^ip6:([0-9a-f]+):([0-9a-f]+):([0-9a-f]+):[0-9a-f]+::\/64$/.exec(key);
+  return m ? `ip6:${m[1]}:${m[2]}:${m[3]}::/48` : null;
+}
+
 /** FNV-1a, for picking a shard. */
 export function shardOf(key: string, shards = THROTTLE_SHARDS): number {
   let h = 0x811c9dc5;
@@ -177,15 +183,17 @@ export async function checkPairStart(
     if (until > now) return { ok: false, retryAfterMs: until - now };
     knownRefusals.delete(key);
   }
-  const shard = shardOf(ip);
+  // IPv6: one site usually owns a /48 and can rotate through its /64s, so the /48 gets its own (larger)
+  // bucket in the same call; sharding by the /48 keeps both keys in one Throttle object.
+  const net48 = ip48(ip);
+  const shard = shardOf(net48 ?? ip);
   const stub = env.THROTTLE.get(env.THROTTLE.idFromName(`shard:${shard}`));
-  const r = await stub.hit(
-    [
-      { key, rate: limits.pair_start_ip },
-      { key: `ps:*`, rate: perShard(limits.pair_start_global) },
-    ],
-    now,
-  );
+  const checks: ThrottleCheck[] = [
+    { key, rate: limits.pair_start_ip },
+    { key: `ps:*`, rate: perShard(limits.pair_start_global) },
+  ];
+  if (net48) checks.push({ key: `ps:${net48}`, rate: limits.pair_start_ip48 });
+  const r = await stub.hit(checks, now);
   if (!r.ok) {
     if (knownRefusals.size >= LOCAL_MAX) knownRefusals.clear();
     knownRefusals.set(key, now + r.retryAfterMs);

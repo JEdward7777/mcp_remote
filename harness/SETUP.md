@@ -309,9 +309,45 @@ enforced in its own Hub (D10), and the endpoints anyone on the internet can call
 can wake Durable Objects. All numbers live in `worker/src/budget.ts`; the assumed Cloudflare free-plan numbers
 there are mostly **unverified** (see the checklist below).
 
-### Per-account limits (plan `free`)
+### Per-account daily budget (the real bound)
 
-A limit is a token bucket: `burst` requests at once, refilled continuously at the given rate.
+Per-minute limits alone don't bound a day (a rate x 1440 minutes is a lot), so each account also has a
+**daily budget** on what actually costs quota, as a share of each free daily limit (default **10%**):
+
+| Counted (per UTC day) | Free plan budget at 10% | Owner plan at 50% |
+| --- | --- | --- |
+| Requests: connects + API calls + inbound WebSocket frames / 20 | 10,000 | 50,000 |
+| Database rows read by the account's Hub | 500,000 | 2,500,000 |
+| Database rows written by the account's Hub | 10,000 | 50,000 |
+
+The Hub counts the rows of every statement it runs (no extra queries). Once any of these is used up, the
+account's Hub refuses work until 00:00 UTC: phone requests get "this account's daily budget is used up
+(database rows written: 10000 of 10000 per UTC day, 10% of the free plan's daily limit, "free" plan); it
+resets at 00:00 UTC, in 5 h", the daemon is disconnected with close 4029 and waits until midnight (its
+sessions show offline), API calls and daemon connects get HTTP 429 with `Retry-After`, and the phone (which can
+still connect) shows the reason under the session list. Tune with `TENANT_DAILY_SHARE_PERCENT` (1-100,
+free plan) and `OWNER_DAILY_SHARE_PERCENT` (owner plan). With the default 10%, at least ten accounts would
+each have to use up their own budget before the shared free quota runs out; ordinary use (a few hundred
+messages a day) needs a small fraction of it.
+
+### Plans: `free` and `owner`
+
+Each account record carries a `plan` (Hub `meta` row, `free` by default); it selects all limits. The `owner`
+plan is for the deployer: per-minute limits about 2-3x higher, 5,000 messages/day, and a 50% daily budget, so
+a runaway loop in your own sessions still can't take the whole quota. To get it for your account(s) without a
+code change, list the Google email(s):
+
+```sh
+npx wrangler secret put OWNER_EMAILS        # e.g. you@gmail.com (comma-separated, case-insensitive)
+```
+
+The `LIMIT_*` / `DAILY_MESSAGE_CAP` / `TENANT_DAILY_SHARE_PERCENT` env vars only change the `free` plan.
+Billing is parked (D10).
+
+### Per-minute limits (plan `free`)
+
+A limit is a token bucket: `burst` requests at once, refilled continuously at the given rate. They stop
+bursts and loops; the daily budget above bounds the day.
 
 | What | Default | Env var | Over the limit |
 | --- | --- | --- | --- |
@@ -319,26 +355,28 @@ A limit is a token bucket: `burst` requests at once, refilled continuously at th
 | Agent `send_message` (all sessions together) | `10,20/min` | `LIMIT_AGENT_SEND` | tool result: "Message NOT sent: rate limited: too many messages from your sessions (20 per minute); try again in 3s" |
 | Messages per UTC day (phone + agent) | `500` | `DAILY_MESSAGE_CAP` | "daily message limit reached (500 messages per day on the "free" plan, ...); it resets at 00:00 UTC, in 5 h" |
 | Start / stop / restart / remove from the phone | `20,20/min` | `LIMIT_LAUNCH` | "rate limited: too many start/stop requests; try again in ..." |
-| History pages | `20,60/min` | `LIMIT_HISTORY` | "rate limited: too many history requests; ..." |
-| Any phone frame | `60,120/min` | `LIMIT_PHONE_FRAMES` | socket closed with code 4029; the PWA waits the hinted time (at least 60 s) |
-| Any daemon frame (all computers together) | `200,600/min` | `LIMIT_DAEMON_FRAMES` | socket closed with 4029; the daemon waits the hinted time |
-| WebSocket connects (phones + daemons) | `20,20/min` | `LIMIT_CONNECTS` | phone: close 4029; daemon: HTTP 429 + `Retry-After` |
-| `/api/state`, `/api/machines`, `/api/usage`, revoke | `30,60/min` | `LIMIT_HTTP` | HTTP 429 + `Retry-After` |
+| History pages (up to 200 rows read each, charged to the daily rows-read budget) | `20,20/min` | `LIMIT_HISTORY` | "rate limited: too many history requests; ..." |
+| Any phone frame | `60,60/min` | `LIMIT_PHONE_FRAMES` | socket closed with code 4029; the PWA waits the hinted time (at least 60 s) |
+| Any daemon frame (all computers together) | `200,120/min` | `LIMIT_DAEMON_FRAMES` | socket closed with 4029; the daemon waits the hinted time |
+| WebSocket connects (phones + daemons) | `20,10/min` | `LIMIT_CONNECTS` | phone: close 4029; daemon: HTTP 429 + `Retry-After` |
+| `/api/state`, `/api/machines`, `/api/usage`, revoke | `30,30/min` | `LIMIT_HTTP` | HTTP 429 + `Retry-After` |
 | Pairing approvals (right or wrong code) | `5,10/h` | `LIMIT_PAIR_APPROVE` | HTTP 429 "too many pairing approvals on this account; try again in N min" |
 
 Why 500 messages/day: a message costs about 1/20 of a request (inbound WebSocket frame), a few SQLite rows
-written and a broadcast; the ~100,000 rows written/day of the free plan is the first wall at roughly
-15-20k messages/day for the whole deployment, so 500 per account leaves room for ~20-30 active accounts.
+written (message row, its index entries, the session counter, the delivery ack) and a broadcast, so 500
+messages fit well inside the account's 10,000 rows-written budget alongside connects and session changes.
 
-Each account record carries a `plan` (Hub `meta` row, `free` for everyone); it selects the limits. Only the
-`free` plan exists; the env vars above override its defaults. Billing is parked (D10).
+Session announcements only write when something changed: a repeated `session_up` for a session that is
+already online, a `session_down` for one already offline, or a reconnect `hello` with the same sessions write
+nothing; a session really flapping up/down costs about one row per change (bounded by the daily budget).
 
 ### Unauthenticated endpoints (per client IP; IPv6 by /64)
 
 | Endpoint | Default | Env var | How |
 | --- | --- | --- | --- |
 | `POST /api/pair/start` | `5,10/h` per IP | `LIMIT_PAIR_START_IP` | `Throttle` Durable Object (8 shards, persisted) |
-| `POST /api/pair/start`, everyone together | `80,120/h` | `LIMIT_PAIR_START_GLOBAL` | split evenly over the 8 shards |
+| `POST /api/pair/start` per IPv6 /48 | `15,30/h` | `LIMIT_PAIR_START_IP48` | same call (one site rotating through its /64s) |
+| `POST /api/pair/start`, everyone together | `160,240/h` | `LIMIT_PAIR_START_GLOBAL` | split evenly over the 8 shards |
 | `/api/pair/wait` | `30,120/h` per IP | `LIMIT_PAIR_WAIT_IP` | isolate memory only (best effort, free) |
 | `/auth/login`, `/auth/callback` | `30,120/h` per IP | `LIMIT_AUTH_IP` | isolate memory only (they never touch a Durable Object) |
 | Approve attempts on one pairing code | 5 | - | the code locks: "run `mcp-remote pair` on the computer again" |
@@ -374,10 +412,13 @@ Durable Objects, so new values are in effect right after it.
 
 ### Usage counters
 
-Each Hub counts its own account's messages, launches and requests (WebSocket frames, connects and API calls
-that reached the Hub) per UTC day: in memory, written as one row per 50 events, at socket close and at
-midnight; counts not yet written survive hibernation inside the WebSocket attachment. They never read another
-account's data (D9). The phone shows "Today (UTC): N of 500 messages on the free plan" under the session list;
+Each Hub counts its own account's messages, launches, requests (connects and API calls), inbound WebSocket
+frames, and database rows read and written per UTC day: in memory, written as one row per 50 events, when the
+last socket closes and at midnight; counts not yet written (and the rate-limit buckets) survive hibernation
+inside a WebSocket attachment, are moved to another open socket when the one carrying them closes, and are
+written to the database (usage row + one `meta` row for the buckets) when the last socket closes. With no
+socket open (API calls only) they stay in memory until the 50-event flush; an eviction may lose those few.
+They never read another account's data (D9). The phone shows "Today (UTC): N of 500 messages on the free plan" under the session list;
 `GET /api/usage` returns the last 35 days (ready for the Phase 4b admin view). A deploy can lose up to 49
 not-yet-written events per account.
 

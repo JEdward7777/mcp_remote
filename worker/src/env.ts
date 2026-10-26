@@ -29,6 +29,12 @@ export interface Env {
    * See budget.ts (LIMIT_ENV, PUBLIC_ENV) and harness/SETUP.md for the full list and defaults.
    */
   DAILY_MESSAGE_CAP?: string;
+  /** % of each free daily limit one free-plan account may use (default 10). */
+  TENANT_DAILY_SHARE_PERCENT?: string;
+  /** % for owner-plan accounts (default 50). */
+  OWNER_DAILY_SHARE_PERCENT?: string;
+  /** wrangler secret: comma-separated emails whose accounts run on the owner plan. */
+  OWNER_EMAILS?: string;
   [limitOverride: `LIMIT_${string}`]: string | undefined;
 }
 
