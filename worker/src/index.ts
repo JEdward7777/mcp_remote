@@ -19,7 +19,9 @@ import {
   verifySessionCookieValue,
 } from "./auth";
 import { randomToken, sha256Hex, timingSafeEqual } from "./crypto";
-import { type Env, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH } from "./env";
+import { type Env, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH, pushConfigured, pushExtraOrigins } from "./env";
+import { checkSubscription, subscriptionId } from "./webpush";
+import { z } from "zod";
 import {
   IdTokenError,
   accountAllowed,
@@ -122,6 +124,15 @@ function bodyErr(e: unknown, fallback: string): Response {
   if (e instanceof BodyError) return err(e.status, e.message);
   return err(400, e instanceof Error && e.message ? fallback : "bad request");
 }
+
+/** Body of POST /api/push/subscribe: the browser's PushSubscription.toJSON(). */
+const PushSubscribeBody = z.object({
+  endpoint: z.string().min(1).max(2048),
+  keys: z.object({ p256dh: z.string().min(1).max(200), auth: z.string().min(1).max(100) }),
+  expirationTime: z.number().nullable().optional(),
+});
+/** Body of DELETE /api/push/subscribe. */
+const PushUnsubscribeBody = z.object({ endpoint: z.string().min(1).max(2048) });
 
 /** Cookie-authenticated, state-changing requests must come from our own origin (CSRF / CSWSH). */
 function sameOrigin(request: Request, url: URL): boolean {
@@ -419,7 +430,42 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   if (!session) return err(401, "not signed in");
 
   if (path === "/api/me" && request.method === "GET") {
-    return json({ tenant: session.tid, email: session.email, name: session.name ?? null, dev: session.tid.startsWith("dev-") });
+    return json({
+      tenant: session.tid,
+      email: session.email,
+      name: session.name ?? null,
+      dev: session.tid.startsWith("dev-"),
+      // Web Push (Phase 4): the browser subscribes with this applicationServerKey; null = not configured.
+      push_key: pushConfigured(env) ? (env.VAPID_PUBLIC_KEY ?? "").trim() : null,
+    });
+  }
+
+  if (path === "/api/push/subscribe" && (request.method === "POST" || request.method === "DELETE")) {
+    if (!sameOrigin(request, url)) return err(403, "bad origin");
+    if (!pushConfigured(env)) return err(503, "notifications are not set up on this server (VAPID keys missing; see SETUP)");
+    // Everything that can be checked without the Hub is checked first (body size, shape, push service, keys).
+    if (request.method === "DELETE") {
+      let body: z.infer<typeof PushUnsubscribeBody>;
+      try {
+        body = PushUnsubscribeBody.parse(await readJson(request));
+      } catch (e) {
+        return e instanceof BodyError && e.status !== 400 ? bodyErr(e, "") : err(400, "expected {endpoint}");
+      }
+      const r = unwrap(await hubFor(env, session.tid).pushUnsubscribe(await subscriptionId(body.endpoint)));
+      return r instanceof Response ? r : json({ ok: true, ...r.value });
+    }
+    let body: z.infer<typeof PushSubscribeBody>;
+    try {
+      body = PushSubscribeBody.parse(await readJson(request));
+    } catch (e) {
+      return e instanceof BodyError && e.status !== 400 ? bodyErr(e, "") : err(400, "expected a push subscription {endpoint, keys: {p256dh, auth}}");
+    }
+    const sub = { endpoint: body.endpoint, p256dh: body.keys.p256dh, auth: body.keys.auth };
+    const bad = await checkSubscription(sub, pushExtraOrigins(env));
+    if (bad) return err(400, bad);
+    const id = await subscriptionId(sub.endpoint);
+    const r = unwrap(await hubFor(env, session.tid).pushSubscribe({ id, ...sub }, url.origin));
+    return r instanceof Response ? r : json({ ok: true, id, ...r.value });
   }
 
   if (path === "/api/ws") {

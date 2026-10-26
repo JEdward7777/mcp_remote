@@ -20,6 +20,8 @@ const COUNTERS = {
   rows_written: "rw",
   /** Daemon connects refused for bad credentials (401/403): recorded, never part of the daily budget. */
   refused: "x",
+  /** Web Push sends (outbound subrequests; capped per day by TenantLimits.daily_pushes). Phase 4. */
+  pushes: "p",
 } as const;
 
 export type UsageKind = keyof typeof COUNTERS;
@@ -39,12 +41,13 @@ CREATE TABLE IF NOT EXISTS usage (
   rows_read INTEGER NOT NULL DEFAULT 0,
   rows_written INTEGER NOT NULL DEFAULT 0,
   refused INTEGER NOT NULL DEFAULT 0,
+  pushes INTEGER NOT NULL DEFAULT 0,
   gen INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 `;
 
 /** Columns added after the table first shipped (idempotent migration, see Hub.migrate). */
-export const USAGE_ADDED_COLUMNS = ["frames", "rows_read", "rows_written", "refused"] as const;
+export const USAGE_ADDED_COLUMNS = ["frames", "rows_read", "rows_written", "refused", "pushes"] as const;
 
 export interface UsageDay extends UsageCounts {
   day: string;
@@ -53,7 +56,7 @@ export interface UsageDay extends UsageCounts {
 /** Pending (unflushed) counts for one day, as stored in a snapshot: { d: day, m: n, l: n, ... }. */
 export type PendingSnap = { d: string } & Partial<Record<(typeof COUNTERS)[UsageKind], number>>;
 
-const zero = (): UsageCounts => ({ messages: 0, launches: 0, requests: 0, frames: 0, rows_read: 0, rows_written: 0, refused: 0 });
+const zero = (): UsageCounts => ({ messages: 0, launches: 0, requests: 0, frames: 0, rows_read: 0, rows_written: 0, refused: 0, pushes: 0 });
 
 export function utcDay(now: number): string {
   return new Date(now).toISOString().slice(0, 10);

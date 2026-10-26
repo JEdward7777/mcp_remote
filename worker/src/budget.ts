@@ -53,6 +53,12 @@ export const FREE_PLAN = {
   rateLimitBindingPeriodsS: [10, 60] as const,
   /** UNVERIFIED. How long an idle Durable Object stays in memory before hibernating/evicting (~10 s). Doc: https://developers.cloudflare.com/durable-objects/reference/in-memory-state/ */
   doIdleEvictionMs: 10_000,
+  /**
+   * UNVERIFIED. Subrequests (outbound fetch) per invocation on the free plan: 50. Web Push sends are
+   * subrequests from the Hub; one event sends at most MAX_PUSH_DEVICES of them.
+   * Doc: https://developers.cloudflare.com/workers/platform/limits/#subrequests
+   */
+  subrequestsPerInvocation: 50,
   /** UNVERIFIED. Cloudflare closes idle WebSockets after ~100 s without traffic; our 30 s ping keeps them open. Doc: https://developers.cloudflare.com/workers/runtime-apis/websockets/ */
   wsIdleTimeoutMs: 100_000,
 } as const;
@@ -154,12 +160,19 @@ export interface TenantLimits {
   max_machines: number;
   /** Phone connects while the daily budget is used up (each one only gets the reason, no SQL). */
   blocked_connects: Rate;
+  /**
+   * get_location calls that have to ask the phone (a push or an in-app prompt); answers from the
+   * last-known position are free. Phase 4 (D14).
+   */
+  location: Rate;
+  /** Web Push sends per UTC day (each device counts; each is an outbound subrequest from the Hub). */
+  daily_pushes: number;
   /** Share (%) of each free daily limit this tenant may use; `daily` is derived from it. */
   daily_share_percent: number;
   daily: DailyBudget;
 }
 
-export type LimitName = Exclude<keyof TenantLimits, "daily_messages" | "daily_share_percent" | "daily" | "max_machines">;
+export type LimitName = Exclude<keyof TenantLimits, "daily_messages" | "daily_share_percent" | "daily" | "max_machines" | "daily_pushes">;
 
 const FREE_SHARE = 10;
 const OWNER_SHARE = 50;
@@ -178,6 +191,8 @@ export const PLANS: Record<string, TenantLimits> = {
     daily_messages: 500,
     max_machines: 10,
     blocked_connects: rate("5,6/h"),
+    location: rate("5,20/h"),
+    daily_pushes: 200,
     daily_share_percent: FREE_SHARE,
     daily: dailyBudget(FREE_SHARE),
   },
@@ -198,6 +213,8 @@ export const PLANS: Record<string, TenantLimits> = {
     daily_messages: 5000,
     max_machines: 30,
     blocked_connects: rate("10,12/h"),
+    location: rate("10,60/h"),
+    daily_pushes: 2000,
     daily_share_percent: OWNER_SHARE,
     daily: dailyBudget(OWNER_SHARE),
   },
@@ -218,9 +235,12 @@ export const LIMIT_ENV: Record<LimitName, string> = {
   http: "LIMIT_HTTP",
   pair_approve: "LIMIT_PAIR_APPROVE",
   blocked_connects: "LIMIT_BLOCKED_CONNECTS",
+  location: "LIMIT_LOCATION",
 };
 export const MAX_MACHINES_ENV = "MAX_MACHINES";
 export const DAILY_CAP_ENV = "DAILY_MESSAGE_CAP";
+/** Web Push sends per UTC day, free plan. */
+export const DAILY_PUSH_CAP_ENV = "DAILY_PUSH_CAP";
 /** % of each free daily limit one free-plan tenant may use (1-100). */
 export const SHARE_ENV = "TENANT_DAILY_SHARE_PERCENT";
 /** % for owner-plan tenants (1-100). */
@@ -287,6 +307,11 @@ export function limitsFor(plan: string | null | undefined, env: EnvLike): Tenant
   if (typeof cap === "string" && cap !== "") {
     if (/^\d{1,9}$/.test(cap.trim())) out.daily_messages = Number(cap.trim());
     else warnOnce(DAILY_CAP_ENV, cap);
+  }
+  const pcap = env[DAILY_PUSH_CAP_ENV];
+  if (typeof pcap === "string" && pcap !== "") {
+    if (/^\d{1,9}$/.test(pcap.trim())) out.daily_pushes = Number(pcap.trim());
+    else warnOnce(DAILY_PUSH_CAP_ENV, pcap);
   }
   out.daily_share_percent = sharePercent(env, SHARE_ENV, base.daily_share_percent);
   out.daily = dailyBudget(out.daily_share_percent);
@@ -363,3 +388,17 @@ export const THROTTLE_SHARDS = 4;
 export const USAGE_FLUSH_EVERY = 50;
 /** Days of per-tenant usage rows kept (for Phase 4b's admin view). */
 export const USAGE_KEEP_DAYS = 35;
+
+// ---------------------------------------------------------------------------
+// Web Push and location (Phase 4, D14 / D19)
+
+/** Push subscriptions (devices) kept per account; a new one beyond this replaces the oldest. */
+export const MAX_PUSH_DEVICES = 5;
+/** Last-known position is kept this long, then forgotten (D14: no history, no tracking). */
+export const LOCATION_KEEP_MS = 6 * 3600_000;
+/**
+ * A phone socket counts as "app open" for push decisions only if it is marked visible and showed a
+ * sign of life (a frame, or a keepalive ping answered by the auto-response) within this window:
+ * 2 x the 30 s ping interval + the 15 s pong deadline.
+ */
+export const PHONE_ALIVE_MS = 75_000;

@@ -185,8 +185,70 @@ export const UsageInfo = z.object({
   }),
   /** Set when a daily budget is used up: the reason, shown on the phone until 00:00 UTC. */
   blocked: z.string().nullable(),
+  /** Web Push notifications sent today and the plan's daily cap (Phase 4). */
+  pushes: z.number().int().nonnegative().optional(),
+  push_cap: z.number().int().nonnegative().optional(),
 });
 export type UsageInfo = z.infer<typeof UsageInfo>;
+
+// ---------------------------------------------------------------------------
+// On-demand location (D14) and notification settings (D19, Phase 4)
+
+/** Max length of the reason Claude gives when it asks for the user's location (shown on the phone). */
+export const MAX_LOCATION_REASON_CHARS = 200;
+/** Longest a get_location call waits for the phone (seconds). */
+export const MAX_LOCATION_TIMEOUT_S = 120;
+
+/** A position as the phone reported it. `at` = when the phone measured it (ms since epoch). */
+export const Position = z.object({
+  lat: z.number().min(-90).max(90),
+  lon: z.number().min(-180).max(180),
+  /** Radius of 68% confidence in metres, as the browser reported it (null if unknown). */
+  accuracy_m: z.number().nonnegative().max(1e7).nullable(),
+  at: z.number().int().nonnegative(),
+});
+export type Position = z.infer<typeof Position>;
+
+/**
+ * Outcome of a location request:
+ *   ok           position is set (fresh = answered this request, else last-known within max_age_s)
+ *   denied       the user declined (or the browser permission is denied)
+ *   unavailable  the phone could not get a fix
+ *   disabled     location is turned off for this account (Settings on the phone)
+ *   no_device    no open app and no push-enabled phone to ask
+ *   rate_limited too many location requests that needed the phone
+ *   timeout      nobody answered in time (set by the shim)
+ * `position` may carry the last-known position (with its age) for every status except disabled.
+ */
+export const LOCATION_STATUSES = ["ok", "denied", "unavailable", "disabled", "no_device", "rate_limited", "timeout"] as const;
+export const LocationStatus = z.enum(LOCATION_STATUSES);
+export type LocationStatus = z.infer<typeof LocationStatus>;
+export const LocationResult = z.object({
+  status: LocationStatus,
+  position: Position.nullable(),
+  /** True when `position` was measured in answer to this request. */
+  fresh: z.boolean(),
+  message: z.string().max(MAX_DETAIL_CHARS).optional(),
+});
+export type LocationResult = z.infer<typeof LocationResult>;
+/** How the Hub is asking the phone: the open app (visible), or a push notification. */
+export const LocationVia = z.enum(["app", "push"]);
+export type LocationVia = z.infer<typeof LocationVia>;
+
+/** Per-account settings the phone can change (stored in the account's Hub). */
+export const Settings = z.object({
+  /** Show the first ~100 characters of a message in the notification (lock screen). */
+  push_preview: z.boolean(),
+  /** Claude may ask for this phone's location (D14). Off: requests are refused, last-known is deleted. */
+  location: z.boolean(),
+  /** When the last-known position was measured (no coordinates are sent to the phone list). */
+  location_at: z.number().int().nullable(),
+  /** Short ids of the push subscriptions stored for this account (a phone checks that its own is listed). */
+  push_devices: z.array(z.string().max(32)).max(16),
+  /** Web Push is configured on the server (VAPID keys set). */
+  push_available: z.boolean(),
+});
+export type Settings = z.infer<typeof Settings>;
 
 /** Seconds until a rate-limited request may succeed (set on rate-limit errors). */
 const RetryAfterS = z.number().int().nonnegative().optional();
@@ -222,6 +284,23 @@ export const PhoneToHub = z.discriminatedUnion("t", [
   }),
   /** Remove an ended launch from the list. */
   z.object({ t: z.literal("launch_dismiss"), machine_id: MachineId, launch_id: LaunchId, client_id: ReqId }),
+  /** The page became visible / hidden: while no visible page is connected, the Hub sends Web Push instead. */
+  z.object({ t: z.literal("visibility"), visible: z.boolean() }),
+  z.object({ t: z.literal("settings"), push_preview: z.boolean().optional(), location: z.boolean().optional() }),
+  /**
+   * The user's answer to a location request (rid/machine_id/session_id echo the request), or a position
+   * shared on the user's own initiative (no rid). `position` is required when status is "ok".
+   */
+  z
+    .object({
+      t: z.literal("location"),
+      rid: ReqId.optional(),
+      machine_id: MachineId.optional(),
+      session_id: SessionId.optional(),
+      status: z.enum(["ok", "denied", "unavailable"]),
+      position: Position.optional(),
+    })
+    .refine((f) => f.status !== "ok" || !!f.position, "position is required when status is ok"),
 ]);
 export type PhoneToHub = z.infer<typeof PhoneToHub>;
 
@@ -231,7 +310,21 @@ export const HubToPhone = z.discriminatedUnion("t", [
     machines: z.array(MachineRecord),
     sessions: z.array(SessionRecord),
     usage: UsageInfo.optional(),
+    settings: Settings.optional(),
   }),
+  /** Claude (in session_id) asks for the phone's location; answer with a PhoneToHub "location" frame. */
+  z.object({
+    t: z.literal("location_request"),
+    rid: ReqId,
+    machine_id: MachineId,
+    session_id: SessionId,
+    project: z.string(),
+    reason: z.string().max(MAX_LOCATION_REASON_CHARS).nullable(),
+  }),
+  /** A location request was answered (by this or another phone): close its prompt. */
+  z.object({ t: z.literal("location_done"), rid: ReqId }),
+  /** Settings changed (cheaper than a full state frame). */
+  z.object({ t: z.literal("settings"), settings: Settings }),
   z.object({ t: z.literal("message"), message: MessageRecord, client_id: ReqId.optional() }),
   z.object({
     t: z.literal("history"),
@@ -280,13 +373,26 @@ export const DaemonToHub = z.discriminatedUnion("t", [
   /** Full snapshot of launched sessions; sent after hello and on every change. */
   z.object({ t: z.literal("launches"), launches: z.array(LaunchRecord).max(MAX_LAUNCHES_PER_MACHINE) }),
   z.object({ t: z.literal("launch_result"), req_id: ReqId, ok: z.boolean(), error: z.string().max(MAX_DETAIL_CHARS).optional() }),
+  /** Claude in session_id calls get_location (D14). Answered with location_wait and/or location. */
+  z.object({
+    t: z.literal("location_req"),
+    req_id: ReqId,
+    session_id: SessionId,
+    /** A last-known position at most this old (seconds) answers at once without asking the phone. */
+    max_age_s: z.number().int().min(0).max(86_400),
+    reason: z.string().max(MAX_LOCATION_REASON_CHARS).optional(),
+  }),
 ]);
 export type DaemonToHub = z.infer<typeof DaemonToHub>;
 
 export const HubToDaemon = z.discriminatedUnion("t", [
   z.object({ t: z.literal("welcome"), machine_id: MachineId, name: z.string() }),
   z.object({ t: z.literal("deliver"), session_id: SessionId, messages: z.array(MessageRecord) }),
-  z.object({ t: z.literal("sent"), req_id: ReqId, message_id: z.number().int() }),
+  /** `notify`: how the user is told (app open / push to N devices / why not), for the tool result. */
+  z.object({ t: z.literal("sent"), req_id: ReqId, message_id: z.number().int(), notify: z.string().max(MAX_DETAIL_CHARS).optional() }),
+  /** The phone is being asked (open app or push); `last` = last-known position, if any (any age). */
+  z.object({ t: z.literal("location_wait"), req_id: ReqId, via: LocationVia, last: Position.nullable() }),
+  z.object({ t: z.literal("location"), req_id: ReqId, result: LocationResult }),
   /** Re-send hello (e.g. a session id this daemon was refused may be free now). */
   z.object({ t: z.literal("resync") }),
   z.object({
@@ -326,6 +432,12 @@ export const ShimToDaemon = z.discriminatedUnion("t", [
   }),
   z.object({ t: z.literal("send"), req_id: ReqId, text: MessageText, urgency: Urgency }),
   z.object({ t: z.literal("ack"), ids: z.array(z.number().int()).min(1).max(500) }),
+  z.object({
+    t: z.literal("location_req"),
+    req_id: ReqId,
+    max_age_s: z.number().int().min(0).max(86_400),
+    reason: z.string().max(MAX_LOCATION_REASON_CHARS).optional(),
+  }),
   /** From the local CLI (same user, 0600 socket): re-read launch.json after `mcp-remote projects/config ...`. */
   z.object({ t: z.literal("reload") }),
 ]);
@@ -338,8 +450,10 @@ export const DaemonToShim = z.discriminatedUnion("t", [
   z.object({ t: z.literal("register_refused"), error: z.string() }),
   z.object({ t: z.literal("hub_status"), connected: z.boolean(), reason: z.string().max(MAX_DETAIL_CHARS).optional() }),
   z.object({ t: z.literal("deliver"), messages: z.array(MessageRecord) }),
-  z.object({ t: z.literal("sent"), req_id: ReqId, message_id: z.number().int() }),
+  z.object({ t: z.literal("sent"), req_id: ReqId, message_id: z.number().int(), notify: z.string().max(MAX_DETAIL_CHARS).optional() }),
   z.object({ t: z.literal("send_error"), req_id: ReqId, error: z.string() }),
+  z.object({ t: z.literal("location_wait"), req_id: ReqId, via: LocationVia, last: Position.nullable() }),
+  z.object({ t: z.literal("location"), req_id: ReqId, result: LocationResult }),
   z.object({ t: z.literal("error"), error: z.string() }),
   z.object({ t: z.literal("reloaded"), ok: z.boolean(), error: z.string().optional() }),
 ]);

@@ -1,5 +1,9 @@
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
+import { generateVapidKeys } from "./scripts/vapid.mjs";
+
+// A throwaway VAPID pair per test run (no private key is ever committed, not even a test one).
+const vapid = await generateVapidKeys();
 
 export default defineConfig({
   plugins: [
@@ -19,6 +23,10 @@ export default defineConfig({
           // The derived global pairing-start cap (~52/h for everyone) is tested on its own in limits.test.ts;
           // the rest of the suite starts many pairings from many fake IPs.
           LIMIT_PAIR_START_GLOBAL: "10000,10000/h",
+          // Phase 4: Web Push is configured; pushes go to an injected fetch (see push-helpers.ts).
+          VAPID_PUBLIC_KEY: vapid.publicKey,
+          VAPID_PRIVATE_KEY: vapid.privateKey,
+          VAPID_SUBJECT: "mailto:test@example.com",
         },
       },
     }),
