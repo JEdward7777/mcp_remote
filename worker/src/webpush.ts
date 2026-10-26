@@ -317,7 +317,16 @@ export interface LocationPush {
   b?: string;
 }
 
-export type PushPayload = MessagePush | LocationPush;
+/** Owner alert (Phase 4b, D13): usage thresholds, sign-up spike, waitlist. Opens the Admin page. */
+export interface AdminPush {
+  k: "a";
+  /** tag: one notification per kind of alert */
+  g: string;
+  t: string;
+  b: string;
+}
+
+export type PushPayload = MessagePush | LocationPush | AdminPush;
 
 export function messagePush(m: { session_id: string; id: number; text: string; urgency: "normal" | "urgent"; project: string }, preview: boolean): MessagePush {
   const out: MessagePush = { k: "m", s: m.session_id, u: m.urgency, i: m.id };

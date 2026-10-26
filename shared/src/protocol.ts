@@ -502,6 +502,22 @@ export const PairApproveRequest = z.object({
   machine_name: z.string().trim().min(1).max(64).optional(),
 });
 
+/**
+ * One-line install (Phase 4b): `mcp-remote pair --code <code> <url>` redeems a pairing the signed-in user
+ * started in the app (pre-approved). The answer carries the machine token directly, plus the pairing id
+ * and poll secret for the claim that follows once the token is saved.
+ */
+export const PairRedeemRequest = z.object({ code: z.string().min(16).max(40), hostname: z.string().max(128).optional() });
+export const PairRedeemResponse = z.object({
+  token: z.string(),
+  machine_id: MachineId,
+  machine_name: z.string(),
+  account: z.string(),
+  pairing_id: z.string(),
+  poll_secret: z.string(),
+});
+export type PairRedeemResponse = z.infer<typeof PairRedeemResponse>;
+
 /** Sent to the waiting daemon over the pairing WebSocket. */
 export const PairResult = z.discriminatedUnion("t", [
   z.object({

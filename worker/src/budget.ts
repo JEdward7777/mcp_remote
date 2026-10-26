@@ -151,6 +151,11 @@ export interface TenantLimits {
   http: Rate;
   /** Pairing approvals (successful or not), persisted so hibernation can't reset it. */
   pair_approve: Rate;
+  /**
+   * Pairings started by the signed-in user from the app (the one-line install, Phase 4b), persisted like
+   * pair_approve. Charged to this account instead of the global unauthenticated pair-start cap.
+   */
+  pair_start: Rate;
   /** Messages (in + out) per UTC day. */
   daily_messages: number;
   /**
@@ -188,6 +193,7 @@ export const PLANS: Record<string, TenantLimits> = {
     connects: rate("20,10/min"),
     http: rate("30,30/min"),
     pair_approve: rate("5,10/h"),
+    pair_start: rate("5,10/h"),
     daily_messages: 500,
     max_machines: 10,
     blocked_connects: rate("5,6/h"),
@@ -210,6 +216,7 @@ export const PLANS: Record<string, TenantLimits> = {
     connects: rate("40,30/min"),
     http: rate("60,120/min"),
     pair_approve: rate("10,20/h"),
+    pair_start: rate("10,20/h"),
     daily_messages: 5000,
     max_machines: 30,
     blocked_connects: rate("10,12/h"),
@@ -234,6 +241,7 @@ export const LIMIT_ENV: Record<LimitName, string> = {
   connects: "LIMIT_CONNECTS",
   http: "LIMIT_HTTP",
   pair_approve: "LIMIT_PAIR_APPROVE",
+  pair_start: "LIMIT_PAIR_START_SIGNED",
   blocked_connects: "LIMIT_BLOCKED_CONNECTS",
   location: "LIMIT_LOCATION",
 };
@@ -283,7 +291,7 @@ export function resolvePlan(stored: string | null | undefined, email: string | n
  * Limits for a plan. Free: defaults + LIMIT_* / DAILY_MESSAGE_CAP / TENANT_DAILY_SHARE_PERCENT overrides
  * (they apply to free-plan tenants only). Owner: its own defaults + OWNER_DAILY_SHARE_PERCENT. Never throws.
  */
-export function limitsFor(plan: string | null | undefined, env: EnvLike): TenantLimits {
+export function limitsFor(plan: string | null | undefined, env: EnvLike, guardShare: number | null = null): TenantLimits {
   const name = plan && PLANS[plan] ? plan : DEFAULT_PLAN;
   const base = PLANS[name]!;
   if (name === OWNER_PLAN) {
@@ -314,6 +322,9 @@ export function limitsFor(plan: string | null | undefined, env: EnvLike): Tenant
     else warnOnce(DAILY_PUSH_CAP_ENV, pcap);
   }
   out.daily_share_percent = sharePercent(env, SHARE_ENV, base.daily_share_percent);
+  // Global guard (Phase 4b): while today's deployment-wide usage is near the free limits, free accounts
+  // get a smaller share (never a larger one).
+  if (guardShare !== null && guardShare > 0) out.daily_share_percent = Math.min(out.daily_share_percent, guardShare);
   out.daily = dailyBudget(out.daily_share_percent);
   return out;
 }

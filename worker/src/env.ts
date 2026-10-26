@@ -1,5 +1,6 @@
 import type { Hub } from "./hub";
 import type { Pairing } from "./pairing";
+import type { Registry } from "./registry";
 import type { Throttle } from "./throttle";
 
 export interface Env {
@@ -7,6 +8,8 @@ export interface Env {
   PAIRING: DurableObjectNamespace<Pairing>;
   /** Sharded token buckets for unauthenticated endpoints (Phase 3). */
   THROTTLE: DurableObjectNamespace<Throttle>;
+  /** The one cross-tenant store (D13, Phase 4b): tenant metadata + counters, invites, audit. One instance. */
+  REGISTRY: DurableObjectNamespace<Registry>;
   /**
    * Optional Workers Rate Limiting binding for /api/pair/start (not configured by default: its
    * free-plan availability is UNVERIFIED, see budget.ts / SETUP.md). The Throttle DO is used either way.
@@ -21,7 +24,22 @@ export interface Env {
   /** Optional override; defaults to <origin>/auth/callback. */
   GOOGLE_REDIRECT_URI?: string;
   ALLOWED_EMAILS?: string;
+  /** "false" (default: allowlist + invites only), "waitlist" (strangers wait for approval), "true" (open up to USER_CAP). */
   OPEN_SIGNUP?: string;
+  /**
+   * Phase 4b (D12/D13), all optional; see signup.ts and harness/SETUP.md: USER_CAP, WAITLIST_MAX,
+   * GUARD_PAUSE_SIGNUPS_PERCENT, GUARD_TIGHTEN_PERCENT, GUARD_FREE_SHARE_PERCENT, ALERT_USAGE_PERCENTS,
+   * ALERT_SIGNUPS_PER_DAY, ALERT_WAITLIST, USAGE_REPORT_MINUTES.
+   */
+  USER_CAP?: string;
+  WAITLIST_MAX?: string;
+  GUARD_PAUSE_SIGNUPS_PERCENT?: string;
+  GUARD_TIGHTEN_PERCENT?: string;
+  GUARD_FREE_SHARE_PERCENT?: string;
+  ALERT_USAGE_PERCENTS?: string;
+  ALERT_SIGNUPS_PER_DAY?: string;
+  ALERT_WAITLIST?: string;
+  USAGE_REPORT_MINUTES?: string;
   /** "1" enables /auth/dev. Only ever set in .dev.vars. */
   DEV_AUTH?: string;
   /**
@@ -59,6 +77,8 @@ export const H_TENANT = "x-mr-tenant";
 export const H_MACHINE = "x-mr-machine";
 export const H_TOKEN_HASH = "x-mr-token-hash";
 export const H_EMAIL = "x-mr-email";
+/** How the account was admitted ("env" / "reg", from the signed session cookie; Phase 4b). */
+export const H_ADM = "x-mr-adm";
 
 /** VAPID keys are configured (Web Push available). */
 export function pushConfigured(env: Env): boolean {

@@ -34,17 +34,30 @@ import {
   FREE_PLAN,
   LOCATION_KEEP_MS,
   MAX_PUSH_DEVICES,
+  PAIR_START_ROWS_WRITTEN_EST,
   PHONE_ALIVE_MS,
+  PLANS,
   type LimitName,
+  type Rate,
   type TenantLimits,
   limitsFor,
   resolvePlan,
 } from "./budget";
 import { timingSafeEqual } from "./crypto";
-import { Env, H_DEV, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH, H_VIS, pushConfigured } from "./env";
+import { Env, H_ADM, H_DEV, H_EMAIL, H_KIND, H_MACHINE, H_TENANT, H_TOKEN_HASH, H_VIS, pushConfigured } from "./env";
 import { accountAllowed } from "./oauth";
 import { type Bucket, Limiter, type LimiterSnapshot, take } from "./ratelimit";
-import { type PendingSnap, USAGE_ADDED_COLUMNS, USAGE_SCHEMA, type UsageDay, UsageMeter, msUntilUtcMidnight } from "./usage";
+import {
+  type OwnerAlert,
+  REGISTRY_NAME,
+  REPORT_ROWS_READ_EST,
+  REPORT_ROWS_WRITTEN_EST,
+  type ReportAnswer,
+  type ReportCounts,
+  type UsageReport,
+} from "./registry";
+import { type Adm, type GuardState, signupConfig } from "./signup";
+import { type PendingSnap, USAGE_ADDED_COLUMNS, USAGE_SCHEMA, type UsageDay, UsageMeter, msUntilUtcMidnight, utcDay } from "./usage";
 import {
   type FetchLike,
   type PushOutcome,
@@ -107,11 +120,23 @@ interface PushJob {
 /** Result of an HTTP-facing RPC that is rate limited per tenant. */
 export type Limited<T> =
   | { ok: true; value: T }
-  /** `says_when`: the error already tells when to come back (no "try again in" needed). */
-  | { ok: false; retryAfterMs: number; error: string; says_when?: boolean };
+  /**
+   * `says_when`: the error already tells when to come back (no "try again in" needed).
+   * `disabled`: the owner disabled this account (Phase 4b): the Worker answers 403 and signs it out.
+   */
+  | { ok: false; retryAfterMs: number; error: string; says_when?: boolean; disabled?: boolean };
 
-/** Buckets the Hub keeps in memory (pair_approve is persisted separately in meta). */
-type MemLimit = Exclude<LimitName, "pair_approve">;
+/** Buckets the Hub keeps in memory (pair_approve / pair_start are persisted separately in meta). */
+type MemLimit = Exclude<LimitName, "pair_approve" | "pair_start">;
+
+/** The account's state as the Registry decided it (Phase 4b, meta 'acct'). */
+type AcctState = { s: "active" | "disabled"; a: Adm | null };
+/** Last usage report sent to the Registry (meta 'rep'): when, for which day, events counted then, blocked. */
+type RepState = { at: number; day: string; n: number; b?: boolean };
+
+export const DISABLED_TEXT = "this account has been disabled by the operator of this server";
+/** Phone socket close code: the account is disabled (the app shows that and stops reconnecting). */
+export const CLOSE_DISABLED = 4403;
 
 type MachineRow = {
   machine_id: string;
@@ -363,6 +388,18 @@ export class Hub extends DurableObject<Env> {
   private locPending: boolean | null = null;
   /** The app's origin (meta 'origin', recorded at push subscribe): default VAPID subject. */
   private origin: string | null = null;
+  /** Phase 4b: account status/admission from the Registry, this tenant's id, usage report state. */
+  private acct: AcctState = { s: "active", a: null };
+  private tenantId: string | null = null;
+  private rep: RepState | null = null;
+  private guard: GuardState | null = null;
+  /** Tests: report interval override (ms; null = never). undefined = from USAGE_REPORT_MINUTES. */
+  reportEveryMs: number | null | undefined = undefined;
+  private reporting = false;
+  /** Tests: the report in flight (resolves once its answer was applied). */
+  reportPromise: Promise<void> | null = null;
+  /** Tests: reports sent by this instance. */
+  reportsSent = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -402,7 +439,7 @@ export class Hub extends DurableObject<Env> {
     const meta = new Map(
       this.sql
         .exec<{ k: string; v: string }>(
-          "SELECT k, v FROM meta WHERE k IN ('plan', 'email', 'rl_snap', 'push_preview', 'loc_enabled', 'loc', 'origin')",
+          "SELECT k, v FROM meta WHERE k IN ('plan', 'email', 'rl_snap', 'push_preview', 'loc_enabled', 'loc', 'origin', 'tenant', 'acct', 'rep', 'guard')",
         )
         .toArray()
         .map((r) => [r.k, r.v]),
@@ -412,6 +449,10 @@ export class Hub extends DurableObject<Env> {
     this.pushPreview = meta.get("push_preview") !== "0";
     this.locationEnabled = meta.get("loc_enabled") !== "0";
     this.origin = meta.get("origin") ?? null;
+    this.tenantId = meta.get("tenant") ?? null;
+    this.acct = parseJson<AcctState>(meta.get("acct"), (v) => v.s === "active" || v.s === "disabled") ?? { s: "active", a: null };
+    this.rep = parseJson<RepState>(meta.get("rep"), (v) => typeof v.at === "number" && typeof v.day === "string" && typeof v.n === "number");
+    this.guard = parseJson<GuardState>(meta.get("guard"), (v) => typeof v.day === "string");
     try {
       const loc = meta.get("loc");
       const v = loc ? (JSON.parse(loc) as StoredPosition) : null;
@@ -440,13 +481,19 @@ export class Hub extends DurableObject<Env> {
     this.meter.load(now, b);
   }
 
-  /** Plan = owner (OWNER_EMAILS) or the stored plan or free; selects the limits. */
+  /** Plan = owner (OWNER_EMAILS) or the stored plan or free; selects the limits (and the global guard's share). */
   private applyPlan(force = false): void {
     const plan = resolvePlan(this.storedPlan, this.email, this.envVars());
     if (!force && plan === this.plan) return;
     this.plan = plan;
-    this.limits = limitsFor(this.plan, this.envVars());
+    this.limits = limitsFor(this.plan, this.envVars(), this.guardShare(Date.now()));
     this.limiter.setRates(this.limits);
+  }
+
+  /** The global guard's tightened free-plan share, if it applies today (Phase 4b). */
+  private guardShare(now: number): number | null {
+    const g = this.guard;
+    return g && g.free_share !== null && g.day === utcDay(now) ? g.free_share : null;
   }
 
   /** Charge the rows of every statement run since the last call to today's usage (daily budget). */
@@ -467,6 +514,10 @@ export class Hub extends DurableObject<Env> {
     this.wake(now);
     this.settleRows(now);
     this.meter.add(kind, now);
+    // A tightened share from the global guard ends with its UTC day.
+    if (this.guard?.free_share != null && this.guard.day !== utcDay(now) && this.limits.daily_share_percent !== limitsFor(this.plan, this.envVars()).daily_share_percent) {
+      this.applyPlan(true);
+    }
   }
 
   /**
@@ -511,20 +562,26 @@ export class Hub extends DurableObject<Env> {
     if (wait === null) return null;
     const secs = Math.ceil(wait / 1000);
     if (kind === "phone") {
-      // A browser can't read an HTTP status on a failed upgrade: accept, then close with a reason.
-      // NEVER ws.accept() a socket in a Durable Object: a non-hibernatable socket whose client ignores
-      // the close keeps the object in memory (billed duration). Accept it hibernatable, already marked
-      // closed, under its own tag (no broadcasts), so any later frame is dropped by webSocketMessage.
-      const pair = new WebSocketPair();
-      this.ctx.acceptWebSocket(pair[1], ["refused"]);
-      pair[1].serializeAttachment({ kind: "phone", closed: true } satisfies Attachment);
-      this.shut(pair[1], CLOSE_RATE_LIMITED, over ? `daily budget used up; retry in ${secs}s` : `too many connections; retry in ${secs}s`);
-      return new Response(null, { status: 101, webSocket: pair[0] });
+      return this.refusePhone(CLOSE_RATE_LIMITED, over ? `daily budget used up; retry in ${secs}s` : `too many connections; retry in ${secs}s`);
     }
     return new Response(over ? `${over.text}; retry in ${secs}s` : `too many connections for this account; retry in ${secs}s`, {
       status: 429,
       headers: { "retry-after": String(secs) },
     });
+  }
+
+  /**
+   * A browser can't read an HTTP status on a failed upgrade: accept, then close with a reason.
+   * NEVER ws.accept() a socket in a Durable Object: a non-hibernatable socket whose client ignores
+   * the close keeps the object in memory (billed duration). Accept it hibernatable, already marked
+   * closed, under its own tag (no broadcasts), so any later frame is dropped by webSocketMessage.
+   */
+  private refusePhone(code: number, reason: string): Response {
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1], ["refused"]);
+    pair[1].serializeAttachment({ kind: "phone", closed: true } satisfies Attachment);
+    this.shut(pair[1], code, reason);
+    return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
   /**
@@ -579,6 +636,7 @@ export class Hub extends DurableObject<Env> {
    */
   private saveSnap(ws: WebSocket | undefined, now: number, refusal = false): void {
     this.flushResync();
+    this.maybeReport(now);
     this.settleRows(now);
     const target = ws ?? this.openSockets()[0];
     if (!target) {
@@ -611,6 +669,7 @@ export class Hub extends DurableObject<Env> {
    */
   private onSocketClosedState(ws: WebSocket, now: number): void {
     this.flushResync();
+    this.maybeReport(now);
     const other = this.openSockets(ws)[0];
     if (other) {
       this.saveSnap(other, now);
@@ -679,8 +738,12 @@ export class Hub extends DurableObject<Env> {
   }
 
   /** Counts an HTTP-facing RPC and applies the daily budget and the tenant's `http` bucket. */
-  private httpGate(now: number): { ok: false; retryAfterMs: number; error: string; says_when?: boolean } | null {
+  private httpGate(now: number): { ok: false; retryAfterMs: number; error: string; says_when?: boolean; disabled?: boolean } | null {
     this.begin("requests", now);
+    if (this.acct.s === "disabled") {
+      this.saveSnap(undefined, now, true);
+      return { ok: false, retryAfterMs: 0, error: DISABLED_TEXT, says_when: true, disabled: true };
+    }
     const over = this.overBudget(now);
     const wait = over ? null : this.limited("http", now);
     if (!over && wait === null) return null;
@@ -695,8 +758,37 @@ export class Hub extends DurableObject<Env> {
    */
   async allowPairApprove(
     now = Date.now(),
-  ): Promise<{ ok: boolean; retryAfterMs: number; error?: string; says_when?: boolean; status?: number }> {
+  ): Promise<{ ok: boolean; retryAfterMs: number; error?: string; says_when?: boolean; status?: number; disabled?: boolean }> {
+    return this.allowPairing("rl_pair_approve", this.limits.pair_approve, now);
+  }
+
+  /**
+   * A signed-in user starts a pairing from the app (one-line install, Phase 4b): charged to this account
+   * (its own persisted bucket, daily budget and machine cap) instead of the global unauthenticated
+   * pair-start cap. The Pairing DO's writes (put + alarm + wipe) and requests are charged here too.
+   */
+  async allowPairStart(
+    now = Date.now(),
+  ): Promise<{ ok: boolean; retryAfterMs: number; error?: string; says_when?: boolean; status?: number; disabled?: boolean }> {
+    const r = await this.allowPairing("rl_pair_start", this.limits.pair_start, now);
+    if (r.ok) {
+      this.meter.add("rows_written", now, PAIR_START_ROWS_WRITTEN_EST);
+      this.meter.add("requests", now, 2); // Pairing DO: init, and redeem/wipe later
+      this.saveSnap(undefined, now);
+    }
+    return r;
+  }
+
+  private async allowPairing(
+    key: "rl_pair_approve" | "rl_pair_start",
+    rate: Rate,
+    now: number,
+  ): Promise<{ ok: boolean; retryAfterMs: number; error?: string; says_when?: boolean; status?: number; disabled?: boolean }> {
     this.begin("requests", now);
+    if (this.acct.s === "disabled") {
+      this.saveSnap(undefined, now, true);
+      return { ok: false, status: 403, retryAfterMs: 0, error: DISABLED_TEXT, says_when: true, disabled: true };
+    }
     const over = this.overBudget(now);
     if (over) {
       this.saveSnap(undefined, now, true);
@@ -704,21 +796,18 @@ export class Hub extends DurableObject<Env> {
     }
     let b: Bucket | undefined;
     try {
-      const raw = this.getMeta("rl_pair_approve");
+      const raw = this.getMeta(key);
       const v = raw ? (JSON.parse(raw) as Bucket) : undefined;
       if (v && typeof v.t === "number" && typeof v.at === "number") b = v;
     } catch {
       /* corrupt: start full */
     }
-    const r = take(b, this.limits.pair_approve, now);
+    const r = take(b, rate, now);
     if (!r.ok) {
       this.saveSnap(undefined, now, true);
       return { ok: false, retryAfterMs: r.retryAfterMs };
     }
-    this.sql.exec(
-      "INSERT INTO meta (k, v) VALUES ('rl_pair_approve', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-      JSON.stringify(r.bucket),
-    );
+    this.sql.exec("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", key, JSON.stringify(r.bucket));
     // Machine cap (bounds what any single call can cost, D10). Revoked computers without sessions are
     // invisible on the phone and only kept as rows: drop them first (writes only when there are any).
     this.sql.exec(
@@ -799,6 +888,7 @@ export class Hub extends DurableObject<Env> {
 
   private addMachineInner(machineId: string, name: string, tokenHash: string, now: number, email?: string): MachineRecord | { error: string } {
     if (email) this.rememberEmail(email);
+    if (this.acct.s === "disabled") return { error: DISABLED_TEXT };
     // Checked again here (allowPairApprove checked first): concurrent approvals must not exceed the cap.
     const machines = this.countMachines();
     if (machines >= this.limits.max_machines) return { error: this.machineCapText(machines) };
@@ -1124,6 +1214,9 @@ export class Hub extends DurableObject<Env> {
 
     if (kind === "phone") {
       // The Worker already checked the session cookie and Origin.
+      const adm = request.headers.get(H_ADM);
+      if (adm === "env" || adm === "reg") this.rememberAdm(adm);
+      if (this.acct.s === "disabled") return this.refusePhone(CLOSE_DISABLED, "account disabled");
       const limited = this.connectLimited(kind, now);
       if (limited) return limited;
       const email = request.headers.get(H_EMAIL);
@@ -1161,7 +1254,8 @@ export class Hub extends DurableObject<Env> {
       // Sign-up gating is re-checked on every daemon connect, so removing an account from
       // ALLOWED_EMAILS also locks out its machines (D7/D9).
       const tid = tenant ?? this.getMeta("tenant") ?? "";
-      if (!accountAllowed(tid, this.email, this.env)) {
+      // Disabled by the owner (Phase 4b): 403, which the daemon treats like a revocation (exit 3).
+      if (this.acct.s === "disabled" || !accountAllowed(tid, this.email, this.env, this.acct.a ?? undefined)) {
         this.credentialRefused = true;
         return new Response("account is no longer allowed to sign in", { status: 403 });
       }
@@ -1242,6 +1336,11 @@ export class Hub extends DurableObject<Env> {
   }
 
   private onFrame(ws: WebSocket, att: Attachment, message: string | ArrayBuffer, now: number): void {
+    if (this.acct.s === "disabled") {
+      // Normally closed when the account was disabled; a socket that slipped through goes now.
+      this.shut(ws, att.kind === "phone" ? CLOSE_DISABLED : CLOSE_REVOKED, "account disabled");
+      return;
+    }
     // Coarse per-tenant frame budget: a client that floods is disconnected (it reconnects later,
     // after at least the hinted wait; see shared/link.ts).
     const flood = this.limited(att.kind === "phone" ? "phone_frames" : "daemon_frames", now);
@@ -2032,11 +2131,148 @@ export class Hub extends DurableObject<Env> {
   // Queries / helpers
 
   private rememberTenant(tenant: string): void {
-    // The tenant record (D10): its id and its stored plan ("free"; a future billing step changes this
-    // row; OWNER_EMAILS selects "owner" on top of it). No SQL once known.
-    if (this.woke && this.storedPlan !== null) return;
+    // The tenant record (D10): its id and its stored plan ("free"; the owner's Admin page or a future
+    // billing step changes this row; OWNER_EMAILS selects "owner" on top of it). No SQL once known.
+    if (this.woke && this.storedPlan !== null && this.tenantId !== null) return;
     this.sql.exec("INSERT OR IGNORE INTO meta (k, v) VALUES ('tenant', ?), ('plan', ?)", tenant, DEFAULT_PLAN);
     this.storedPlan ??= DEFAULT_PLAN;
+    this.tenantId ??= tenant;
+  }
+
+  /** How the account was admitted (from the signed session cookie): only written when it changes. */
+  private rememberAdm(adm: Adm): void {
+    if (this.acct.a === adm) return;
+    this.setAcct({ s: this.acct.s, a: adm });
+  }
+
+  private setAcct(next: AcctState): void {
+    const wasDisabled = this.acct.s === "disabled";
+    this.acct = next;
+    this.setMeta("acct", JSON.stringify(next));
+    if (next.s === "disabled" && !wasDisabled) {
+      // Everything stops: daemons get 4001 (they exit with code 3, as for a revoked machine), phones 4403.
+      this.pushQueue.length = 0;
+      for (const ws of this.ctx.getWebSockets()) {
+        const a = ws.deserializeAttachment() as Attachment | null;
+        if (!a || a.closed) continue;
+        this.shut(ws, a.kind === "daemon" ? CLOSE_REVOKED : CLOSE_DISABLED, "account disabled");
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Registry (Phase 4b, D13): account state from the owner, usage reports, owner alerts
+
+  /** The owner changed this account in Admin (disable / enable / plan). Not charged to the budget's refusals. */
+  async setAccount(a: { status: string; adm: Adm; plan: string }): Promise<void> {
+    const now = Date.now();
+    this.wake(now);
+    this.settleRows(now);
+    this.applyAccount(a);
+    this.saveSnap(undefined, now);
+  }
+
+  private applyAccount(a: { status: string; adm: Adm; plan: string }): void {
+    const s: AcctState["s"] = a.status === "disabled" ? "disabled" : "active";
+    if (s !== this.acct.s || a.adm !== this.acct.a) this.setAcct({ s, a: a.adm });
+    if (PLANS[a.plan] && a.plan !== this.storedPlan) {
+      this.setMeta("plan", a.plan);
+      this.storedPlan = a.plan;
+      this.applyPlan(true);
+    }
+  }
+
+  /**
+   * Report this tenant's usage to the Registry when due: at most once per USAGE_REPORT_MINUTES while
+   * something is counted, once when a new UTC day starts (with the final numbers of the last one), and
+   * once when the daily budget runs out. Never per message. Each report costs one Registry request and
+   * a few rows there, charged to this tenant, plus one meta row here.
+   */
+  private maybeReport(now: number): void {
+    if (this.reporting || !this.woke || !this.tenantId || this.acct.s === "disabled") return;
+    const every = this.reportEveryMs !== undefined ? this.reportEveryMs : signupConfig(this.envVars()).reportEveryMs;
+    if (every === null) return;
+    const today = utcDay(now);
+    const events = (t: UsageDay) => t.requests + t.frames;
+    const rep = this.rep;
+    const dayChanged = rep !== null && rep.day !== today;
+    if (!dayChanged && rep !== null && events(this.meter.today(now)) <= rep.n) return; // nothing new
+    const blocked = this.overBudget(now) !== null;
+    if (blocked && rep && rep.day === today && rep.b) return; // reported the block already
+    if (rep && !dayChanged && !blocked && now - rep.at < every) return;
+    this.reporting = true;
+    try {
+      this.meter.add("requests", now);
+      this.meter.add("rows_read", now, REPORT_ROWS_READ_EST);
+      this.meter.add("rows_written", now, REPORT_ROWS_WRITTEN_EST);
+      const machines = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM machines WHERE revoked_at IS NULL").one().n;
+      const sessions = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM sessions").one().n;
+      const counts = (u: UsageDay): ReportCounts => ({
+        do_requests: u.requests + Math.ceil(u.frames / FREE_PLAN.wsIncomingMessagesPerBilledRequest),
+        messages: u.messages,
+        launches: u.launches,
+        pushes: u.pushes,
+        rows_read: u.rows_read,
+        rows_written: u.rows_written,
+        machines,
+        sessions,
+      });
+      let prev: UsageReport["prev"];
+      if (dayChanged && rep) {
+        const old = this.meter.history(now).find((d) => d.day === rep.day);
+        if (old) prev = { day: rep.day, counts: counts(old) };
+      }
+      this.settleRows(now);
+      const t = this.meter.today(now);
+      const next: RepState = { at: now, day: today, n: events(t), ...(blocked ? { b: true } : {}) };
+      this.setMeta("rep", JSON.stringify(next));
+      this.rep = next;
+      const payload: UsageReport = { tid: this.tenantId, email: this.email, plan: this.storedPlan ?? DEFAULT_PLAN, day: today, counts: counts(t), prev };
+      this.reportsSent++;
+      const p = this.env.REGISTRY.get(this.env.REGISTRY.idFromName(REGISTRY_NAME))
+        .report(payload)
+        .then((ans) => this.applyAnswer(ans as ReportAnswer))
+        .catch((e: unknown) => console.warn(`usage report failed: ${e instanceof Error ? e.message : String(e)}`))
+        .finally(() => {
+          this.reporting = false;
+        });
+      this.reportPromise = p;
+      this.ctx.waitUntil(p);
+    } catch (e) {
+      this.reporting = false;
+      throw e;
+    }
+  }
+
+  /** The Registry's answer: repair account state / plan drift and take the global guard's state. */
+  private applyAnswer(ans: ReportAnswer): void {
+    const now = Date.now();
+    this.wake(now);
+    this.settleRows(now);
+    this.applyAccount(ans);
+    const g = ans.guard;
+    if (g && typeof g.day === "string" && JSON.stringify(g) !== JSON.stringify(this.guard)) {
+      this.setMeta("guard", JSON.stringify(g));
+      const before = this.guardShare(now);
+      this.guard = g;
+      if (this.guardShare(now) !== before) this.applyPlan(true);
+    }
+    this.settleRows(now);
+  }
+
+  /** An owner alert from the Registry (usage thresholds, sign-up spike, waitlist): Web Push to every device. */
+  async ownerAlert(a: OwnerAlert): Promise<{ sent: number; text: string }> {
+    const now = Date.now();
+    this.begin("requests", now);
+    if (this.acct.s === "disabled") return { sent: 0, text: "account disabled" };
+    const r = this.queuePush(
+      { k: "a", g: a.tag.slice(0, 32), t: a.title.slice(0, 80), b: a.body.slice(0, 200) },
+      { ttl: 24 * 3600, urgency: "high" },
+      now,
+    );
+    this.saveSnap(undefined, now);
+    if (this.pushQueue.length) await this.drainPushes();
+    return r;
   }
 
   private rememberEmail(email: string): void {
@@ -2047,6 +2283,12 @@ export class Hub extends DurableObject<Env> {
     );
     this.email = email;
     if (this.woke) this.applyPlan(); // OWNER_EMAILS is matched by email
+  }
+
+  /** Tests and admin: is this account disabled? */
+  isDisabled(): boolean {
+    this.wake(Date.now());
+    return this.acct.s === "disabled";
   }
 
   private getMeta(k: string): string | null {
@@ -2175,5 +2417,15 @@ export class Hub extends DurableObject<Env> {
     } catch {
       /* closing */
     }
+  }
+}
+
+function parseJson<T>(raw: string | undefined | null, ok: (v: T) => boolean): T | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as T;
+    return v && typeof v === "object" && ok(v) ? v : null;
+  } catch {
+    return null;
   }
 }

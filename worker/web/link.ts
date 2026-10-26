@@ -49,7 +49,12 @@ export interface PhoneLinkDeps {
   onDown: () => void;
   /** Cookie gone / account no longer allowed: back to the sign-in screen. */
   onSignedOut: () => void;
+  /** The owner disabled this account (close 4403, Phase 4b): stop; no reconnects. */
+  onDisabled?: () => void;
 }
+
+/** Close code the Hub uses for a disabled account (hub.ts CLOSE_DISABLED). */
+export const CLOSE_DISABLED = 4403;
 
 export class PhoneLink {
   private ws: SocketLike | null = null;
@@ -179,6 +184,11 @@ export class PhoneLink {
     if (this.stopped) return;
     if (code === 1008 || code === 4401) {
       this.d.onSignedOut();
+      return;
+    }
+    if (code === CLOSE_DISABLED && this.d.onDisabled) {
+      this.stopped = true;
+      this.d.onDisabled();
       return;
     }
     const hints: ReconnectHints = {};

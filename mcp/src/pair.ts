@@ -2,7 +2,7 @@
 // (no polling) until a signed-in phone approves it, then stores the machine token.
 import { hostname } from "node:os";
 import WebSocket from "ws";
-import { PairResult, PairStartResponse, backoffDelay, parseFrame } from "@mcp-remote/shared";
+import { PairRedeemResponse, PairResult, PairStartResponse, backoffDelay, parseFrame } from "@mcp-remote/shared";
 import { normalizeWorkerUrl, saveConfig, wsUrl } from "./config";
 import { log } from "./log";
 
@@ -11,6 +11,42 @@ export interface PairOutcome {
   machine_id: string;
   machine_name: string;
   account: string;
+}
+
+/** Error text from a JSON `{error}` body, else the raw body. */
+async function errorText(r: Response): Promise<string> {
+  const body = await r.text();
+  try {
+    return (JSON.parse(body) as { error?: string }).error ?? body;
+  } catch {
+    return body;
+  }
+}
+
+/**
+ * `mcp-remote pair --code XXXX-XXXX-XXXX-XXXX <url>` (Phase 4b one-line install): the signed-in user
+ * started this pairing in the app, so it is already approved; redeeming it returns the machine token.
+ */
+export async function pairWithCode(rawUrl: string, code: string, opts: { name?: string } = {}): Promise<PairOutcome> {
+  const url = normalizeWorkerUrl(rawUrl);
+  const c = code.trim().toUpperCase();
+  if (!/^[A-Z0-9]{4}(-?[A-Z0-9]{4}){3}$/.test(c)) throw new Error("the code looks wrong: expected XXXX-XXXX-XXXX-XXXX (copy the whole install command from the app)");
+  const r = await fetch(`${url}/api/pair/redeem`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code: c, hostname: (opts.name ?? hostname()).slice(0, 128) }),
+  });
+  if (!r.ok) {
+    const msg = await errorText(r);
+    if (r.status === 404 || r.status === 409) throw new Error(`${msg} (HTTP ${r.status})`);
+    if (r.status === 429) throw new Error(`the server refused this pairing for now: ${msg} (HTTP 429)`);
+    throw new Error(`pairing failed: HTTP ${r.status} ${msg}`);
+  }
+  const res = PairRedeemResponse.parse(await r.json());
+  // Saved first; if this fails the pairing stays unclaimed and its expiry removes the machine again.
+  const saved = saveConfig({ url, token: res.token, machine_id: res.machine_id, machine_name: res.machine_name, account: res.account });
+  await claim(url, { code: c, pairing_id: res.pairing_id, poll_secret: res.poll_secret, expires_at: 0 });
+  return { configPath: saved, machine_id: res.machine_id, machine_name: res.machine_name, account: res.account };
 }
 
 export async function pair(

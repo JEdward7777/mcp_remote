@@ -1,5 +1,6 @@
 // Google OAuth 2.0 / OIDC, authorization-code flow with PKCE (D7).
 import { b64urlDecode, b64urlDecodeText, b64urlEncode, randomToken } from "./crypto";
+import { envAllowed } from "./signup";
 
 export const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 export const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -148,17 +149,19 @@ export async function exchangeCode(opts: {
 /**
  * Re-check gating for an existing tenant (cookie or machine token), so removing an email from
  * ALLOWED_EMAILS takes effect without waiting for the 30-day cookie to expire. Dev tenants
- * (only mintable with DEV_AUTH) are not subject to the Google allowlist.
+ * (only mintable with DEV_AUTH) are not subject to the Google allowlist. Accounts the Registry
+ * admitted (invite, user cap, owner approval: `adm` "reg", Phase 4b) are governed by the Registry
+ * instead (the owner disables them in Admin; their Hub enforces it).
  */
 export function accountAllowed(
   tid: string,
   email: string | null | undefined,
-  env: { ALLOWED_EMAILS?: string | undefined; OPEN_SIGNUP?: string | undefined },
+  env: { ALLOWED_EMAILS?: string | undefined; OPEN_SIGNUP?: string | undefined; OWNER_EMAILS?: string | undefined },
+  adm?: "env" | "reg",
 ): boolean {
   if (tid.startsWith("dev-")) return true;
-  if (env.OPEN_SIGNUP === "true") return true;
-  if (!email) return false;
-  return isAllowed({ email, email_verified: true }, env.ALLOWED_EMAILS, env.OPEN_SIGNUP);
+  if (adm === "reg") return true;
+  return envAllowed(email, env as Record<string, unknown>);
 }
 
 /** Sign-up gating (Phase 1): OPEN_SIGNUP=true, or the verified email is in ALLOWED_EMAILS. */

@@ -20,18 +20,23 @@
     "bindings": [
       { "name": "HUB", "class_name": "Hub" },
       { "name": "PAIRING", "class_name": "Pairing" },
-      { "name": "THROTTLE", "class_name": "Throttle" }
+      { "name": "THROTTLE", "class_name": "Throttle" },
+      { "name": "REGISTRY", "class_name": "Registry" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Hub", "Pairing"] },
-    { "tag": "v2", "new_sqlite_classes": ["Throttle"] }
+    { "tag": "v2", "new_sqlite_classes": ["Throttle"] },
+    { "tag": "v3", "new_sqlite_classes": ["Registry"] }
   ],
   // Non-secret settings. GOOGLE_CLIENT_ID and ALLOWED_EMAILS are set with `wrangler secret put`
   // (see harness/SETUP.md) so personal data stays out of the repo; don't also list them here.
   "vars": {
-    // "true" lets any verified Google account sign up; otherwise only ALLOWED_EMAILS can.
+    // Who may sign up (Phase 4b, harness/SETUP.md step 4): "false" = ALLOWED_EMAILS, OWNER_EMAILS and
+    // invite links only; "waitlist" = everyone else waits for your approval in Admin; "true" = open
+    // sign-up, auto-approved until USER_CAP active accounts (default 10), then the waitlist.
     "OPEN_SIGNUP": "false"
+    // , "USER_CAP": "10"
     // Per-tenant and abuse limits (Phase 3) have safe defaults in src/budget.ts. To tune one, add it
     // here, e.g. "LIMIT_PHONE_SEND": "10,20/min" or "DAILY_MESSAGE_CAP": "500" (see harness/SETUP.md).
     // OWNER_EMAILS (your account on the roomier "owner" plan) is set with `wrangler secret put`.

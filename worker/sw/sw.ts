@@ -74,6 +74,7 @@ interface Payload {
   b?: string;
   r?: string;
   t?: string;
+  g?: string;
 }
 
 function clip(s: unknown, n: number): string | undefined {
@@ -128,6 +129,17 @@ async function show(d: Payload | null): Promise<void> {
       data: { url: `/#/s/${d.s}` },
       ...(urgent ? { vibrate: [200, 100, 200, 100, 200] } : {}),
     } as NotificationOptions);
+    return;
+  }
+  if (d?.k === "a") {
+    // Owner alert (Phase 4b): usage thresholds, sign-up spike, waitlist. Opens the Admin page.
+    await reg.showNotification(clip(d.t, 80) ?? "mcp remote admin", {
+      body: clip(d.b, 200) ?? "",
+      tag: `admin:${(clip(d.g, 32) ?? "alert").replace(/[^A-Za-z0-9_-]/g, "")}`,
+      icon: ICON,
+      badge: BADGE,
+      data: { url: "/#/admin" },
+    });
     return;
   }
   // Unknown payload: a push must always show something (userVisibleOnly).

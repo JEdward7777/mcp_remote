@@ -7,3 +7,9 @@
 
 /sw.js
   Cache-Control: no-cache
+
+/dl/mcp-remote.json
+  Cache-Control: no-cache
+
+/dl/*.tgz
+  Cache-Control: public, max-age=31536000, immutable

@@ -9,3 +9,4 @@ worker/public/app.js.map
 worker/public/sw.js
 *.log
 .e2e/
+worker/public/dl/

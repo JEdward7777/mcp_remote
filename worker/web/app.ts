@@ -15,7 +15,10 @@ import type {
 import { backoffDelay } from "@mcp-remote/shared/backoff";
 import { parseRetryAfter, realClock } from "@mcp-remote/shared/link";
 import { linkify } from "@mcp-remote/shared/links";
+import { buildAdmin, type AdminView } from "./admin";
+import { $, h, nodes, toast } from "./dom";
 import { type AuthCheck, PhoneLink, type SocketLike } from "./link";
+import { buildInstall, type InstallView } from "./onboard";
 import {
   canInstall,
   checkForUpdate,
@@ -41,6 +44,8 @@ interface Me {
   dev: boolean;
   /** VAPID public key for Web Push; null when the server has no keys configured. */
   push_key?: string | null;
+  /** OWNER_EMAILS: show the Admin tab (every admin API call is checked on the server again). */
+  owner?: boolean;
 }
 
 /** A location request from a session (D14) waiting for the user's Share / Not now. */
@@ -90,30 +95,6 @@ const pendingSends = new Map<string, { sid: string; text: string }>();
 /** Launch requests waiting for the daemon's answer; their buttons stay disabled meanwhile. */
 const pendingLaunchOps = new Map<string, { machine: string; launch: string | null }>();
 
-const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => {
-  const el = document.querySelector<T>(sel);
-  if (!el) throw new Error(`missing ${sel}`);
-  return el;
-};
-
-function h<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  props: Record<string, string> = {},
-  ...children: (Node | string | null | undefined)[]
-): HTMLElementTagNameMap[K] {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k === "class") el.className = v;
-    else el.setAttribute(k, v);
-  }
-  for (const c of children) if (c !== null && c !== undefined) el.append(c);
-  return el;
-}
-
-function nodes(...items: (Node | string | null | undefined)[]): (Node | string)[] {
-  return items.filter((x): x is Node | string => x !== null && x !== undefined);
-}
-
 function fmtTime(ms: number | null): string {
   if (!ms) return "";
   const d = new Date(ms);
@@ -149,7 +130,7 @@ function send(frame: PhoneToHub): boolean {
 /** Before each reconnect: a Worker-only request (no Durable Object) that tells signed-out / throttled apart. */
 async function checkAuth(): Promise<AuthCheck> {
   const r = await fetch("/api/me");
-  if (r.status === 401) return "signed_out";
+  if (r.status === 401 || r.status === 403) return "signed_out";
   if (r.status === 429) return { rateLimited: true, retryAfterMs: parseRetryAfter(r.headers.get("retry-after")) };
   if (r.status >= 500) return { serverError: true, retryAfterMs: parseRetryAfter(r.headers.get("retry-after")) };
   return "ok";
@@ -200,6 +181,7 @@ const link = new PhoneLink({
     renderStatus();
   },
   onSignedOut: () => void boot(),
+  onDisabled: () => renderBlocked("This account has been disabled by the operator of this server.", "Ask them to enable it again. Your computers were disconnected too."),
 });
 
 // Android: a backgrounded PWA's socket may be dead or half-open when it comes back.
@@ -425,13 +407,6 @@ window.addEventListener("hashchange", () => {
 
 // ---------------------------------------------------------------------------
 // Rendering
-
-function toast(msg: string): void {
-  const t = $("#toast");
-  t.textContent = msg;
-  t.hidden = false;
-  window.setTimeout(() => (t.hidden = true), 4000);
-}
 
 function utcToday(): string {
   return new Date().toISOString().slice(0, 10);
@@ -668,7 +643,7 @@ function updateSessions(v: SessionsView): void {
   const blocked = state.usage?.blocked && state.usage.day === utcToday() ? state.usage.blocked : null;
   v.empty.textContent = blocked
     ? `Unavailable until 00:00 UTC: ${blocked}.`
-    : "No computers paired yet. Open Machines to pair one.";
+    : "No computers paired yet. Open Machines -> Add a computer: one command to paste, and that computer is paired.";
   v.usage.textContent = usageText();
   v.usage.hidden = !state.usage;
 
@@ -861,14 +836,22 @@ const drafts = new Map<string, string>();
 interface MachinesView {
   root: HTMLElement;
   list: HTMLElement;
+  install: InstallView;
 }
 
 function buildMachines(): MachinesView {
   const root = h("section", { class: "machines" });
+  const install = buildInstall({ first: !state.machines.some((m) => !m.revoked) });
   const form = h("form", { class: "pair" });
   const code = h("input", { name: "code", placeholder: "ABCD-EFGH", autocomplete: "off", autocapitalize: "characters", required: "" });
   const name = h("input", { name: "machine_name", placeholder: "Name (optional)", maxlength: "64" });
-  form.append(h("h2", {}, "Pair a computer"), h("p", { class: "muted" }, "Run `mcp-remote pair <url>` on the computer and enter the code it prints."), code, name, h("button", { type: "submit" }, "Approve"));
+  form.append(
+    h("h2", {}, "Or: approve a code"),
+    h("p", { class: "muted" }, "Already installed? Run `mcp-remote pair <url>` on the computer and enter the 8-character code it prints."),
+    code,
+    name,
+    h("button", { type: "submit" }, "Approve"),
+  );
   form.onsubmit = async (ev) => {
     ev.preventDefault();
     const body: Record<string, string> = { code: code.value };
@@ -887,8 +870,8 @@ function buildMachines(): MachinesView {
     }
   };
   const list = h("div", { class: "machine-list" });
-  root.append(form, h("h2", {}, "Computers"), list);
-  return { root, list };
+  root.append(install.root, form, h("h2", {}, "Computers"), list);
+  return { root, list, install };
 }
 
 /** True if another active machine with the same name was paired later (likely a re-pair). */
@@ -897,6 +880,7 @@ function newerSameName(m: MachineRecord): boolean {
 }
 
 function updateMachines(v: MachinesView): void {
+  v.install.update(state.machines);
   const active = state.machines.filter((m) => !m.revoked);
   const rows: Node[] = [];
   if (active.length === 0) rows.push(h("p", { class: "empty" }, "None yet."));
@@ -1136,14 +1120,24 @@ let settingsView: SettingsView | null = null;
 let threadView: ThreadView | null = null;
 let machinesView: MachinesView | null = null;
 let sessionsView: SessionsView | null = null;
+let adminView: AdminView | null = null;
 
 function render(_force = false): void {
   const main = document.querySelector("#main");
   if (!main || !state.me) return;
   renderBanners();
   const sid = currentSession();
-  const view = sid ? `s:${sid}` : location.hash === "#/machines" ? "machines" : location.hash === "#/settings" ? "settings" : "sessions";
+  const view = sid
+    ? `s:${sid}`
+    : location.hash === "#/machines"
+      ? "machines"
+      : location.hash === "#/settings"
+        ? "settings"
+        : location.hash === "#/admin" && state.me.owner
+          ? "admin"
+          : "sessions";
   if (view !== "settings") settingsView = null;
+  if (view !== "admin") adminView = null;
   if (sid) sessionsView = null;
   for (const tab of document.querySelectorAll<HTMLAnchorElement>("nav a")) {
     tab.classList.toggle("active", (tab.dataset.view ?? "") === (sid ? "sessions" : view));
@@ -1159,6 +1153,17 @@ function render(_force = false): void {
     return;
   }
   threadView = null;
+  if (view === "admin") {
+    sessionsView = null;
+    machinesView = null;
+    settingsView = null;
+    if (changed || !adminView) {
+      adminView = buildAdmin();
+      main.replaceChildren(adminView.root);
+      void adminView.refresh();
+    }
+    return;
+  }
   if (view === "settings") {
     sessionsView = null;
     machinesView = null;
@@ -1187,15 +1192,37 @@ function render(_force = false): void {
   updateSessions(sessionsView);
 }
 
+/** `/?invite=<token>`: an invite link (Phase 4b). Checked by the Worker (signature + expiry only). */
+function inviteToken(): string | null {
+  const t = new URL(location.href).searchParams.get("invite");
+  return t && t.length <= 512 ? t : null;
+}
+
 function renderSignedOut(): void {
   const app = $("#app");
   const local = ["localhost", "127.0.0.1"].includes(location.hostname);
+  const invite = inviteToken();
+  const note = h("p", { class: "muted" }, "Talk to your coding sessions from your phone.");
+  const signIn = h("a", { class: "button", href: invite ? `/auth/login?invite=${encodeURIComponent(invite)}` : "/auth/login" }, "Sign in with Google");
+  if (invite) {
+    void fetch(`/api/invite?token=${encodeURIComponent(invite)}`)
+      .then((r) => r.json() as Promise<{ valid?: boolean; expires_at?: number }>)
+      .then((j) => {
+        note.textContent = j.valid
+          ? "You're invited: sign in with Google to join (no waitlist)."
+          : "This invite link is not valid any more (expired or changed). You can still sign in.";
+        if (!j.valid) signIn.setAttribute("href", "/auth/login");
+      })
+      .catch(() => {});
+  }
   const devForm = local
     ? h(
         "form",
         { class: "dev", action: "/auth/dev", method: "get" },
         h("p", { class: "muted" }, "Local dev sign-in (needs DEV_AUTH=1 in .dev.vars):"),
         h("input", { name: "user", placeholder: "alice", pattern: "[a-z0-9_-]{1,32}", required: "" }),
+        invite ? h("input", { type: "hidden", name: "invite", value: invite }) : null,
+        h("label", { class: "muted" }, h("input", { type: "checkbox", name: "gate", value: "1" }), " apply sign-up gating (cap, waitlist)"),
         h("button", { type: "submit" }, "Dev sign-in"),
       )
     : null;
@@ -1205,8 +1232,8 @@ function renderSignedOut(): void {
       { class: "signin" },
       h("img", { src: "/favicon.svg", alt: "", width: "64", height: "64" }),
       h("h1", {}, "mcp remote"),
-      h("p", { class: "muted" }, "Talk to your coding sessions from your phone."),
-      h("a", { class: "button", href: "/auth/login" }, "Sign in with Google"),
+      note,
+      signIn,
       devForm,
     ),
   );
@@ -1246,11 +1273,62 @@ function renderShell(): void {
       h("a", { href: "#/", "data-view": "sessions" }, "Sessions"),
       h("a", { href: "#/machines", "data-view": "machines" }, "Machines"),
       h("a", { href: "#/settings", "data-view": "settings" }, "Settings"),
+      state.me?.owner ? h("a", { href: "#/admin", "data-view": "admin" }, "Admin") : null,
     ),
     h("div", { id: "banners" }),
     h("main", { id: "main" }),
   );
   renderStatus();
+}
+
+/** Waitlisted (Phase 4b): a friendly waiting screen. Opening the app again re-checks. */
+function renderWaitlist(email: string, since: number): void {
+  const again = h("button", { type: "button" }, "Check again");
+  again.onclick = () => void boot();
+  $("#app").replaceChildren(
+    h(
+      "div",
+      { class: "signin waitlist" },
+      h("img", { src: "/favicon.svg", alt: "", width: "64", height: "64" }),
+      h("h1", {}, "You're on the waitlist"),
+      h(
+        "p",
+        {},
+        "Thanks for signing up! This server is full right now, so new accounts wait for its owner's approval. " +
+          "You'll get in as soon as a spot is free: just open this page again.",
+      ),
+      h("p", { class: "muted small" }, `Signed in as ${email}, waiting since ${new Date(since).toLocaleDateString()}.`),
+      again,
+      signOutButton(),
+    ),
+  );
+}
+
+/** Disabled (or otherwise not allowed): say so, stop reconnecting, offer sign-out. */
+function renderBlocked(title: string, detail: string): void {
+  link.stop();
+  state.me = null;
+  $("#app").replaceChildren(
+    h(
+      "div",
+      { class: "signin" },
+      h("img", { src: "/favicon.svg", alt: "", width: "64", height: "64" }),
+      h("h1", {}, "mcp remote"),
+      h("p", {}, title),
+      h("p", { class: "muted small" }, detail),
+      signOutButton(),
+    ),
+  );
+}
+
+function signOutButton(): HTMLElement {
+  const b = h("button", { type: "button", class: "ghost" }, "Sign out");
+  b.onclick = async () => {
+    await fetch("/auth/logout", { method: "POST", headers: { accept: "application/json" } }).catch(() => null);
+    location.hash = "";
+    void boot();
+  };
+  return b;
 }
 
 let bootTimer: number | undefined;
@@ -1262,7 +1340,11 @@ async function boot(): Promise<void> {
   if (!r || !r.ok) {
     state.me = null;
     if (r && r.status === 401) renderSignedOut();
-    else {
+    else if (r && r.status === 403) {
+      const j = (await r.json().catch(() => ({}))) as { waitlisted?: boolean; disabled?: boolean; email?: string; since?: number; error?: string };
+      if (j.waitlisted) renderWaitlist(j.email ?? "", j.since ?? Date.now());
+      else renderBlocked(j.error ?? "This account can't use this server right now.", "Sign out and sign in again to see why.");
+    } else {
       // The app shell itself comes from the service worker's cache, so this also shows offline.
       const offline = !navigator.onLine || !r;
       $("#app").replaceChildren(
@@ -1278,7 +1360,9 @@ async function boot(): Promise<void> {
     }
     return;
   }
-  state.me = (await r.json()) as Me;
+  state.me = (await r.json()) as Me & { approved?: boolean };
+  if ((state.me as { approved?: boolean }).approved) toast("You're in: your account was approved.");
+  if (inviteToken()) history.replaceState(null, "", `/${location.hash}`);
   renderShell();
   render(true);
   deviceId = await currentDeviceId().catch(() => null);

@@ -4,6 +4,7 @@ import { build } from "esbuild";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { buildDl } from "./scripts/dl.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 await build({
@@ -47,3 +48,6 @@ await build({
   logLevel: "warning",
   define: { __SW_VERSION__: JSON.stringify(version), __SHELL__: JSON.stringify(SHELL) },
 });
+
+// The CLI tarball for the app's one-line install (public/dl/, Phase 4b).
+buildDl();

@@ -3,6 +3,8 @@ import { b64urlDecodeText, b64urlEncode, hmacSign, hmacVerify, randomToken } fro
 
 export const SESSION_COOKIE = "__Host-mr_session";
 export const OAUTH_COOKIE = "__Host-mr_oauth";
+/** Phase 4b: a waitlisted account's cookie (only lets /api/me re-check the status; never a session). */
+export const WAIT_COOKIE = "__Host-mr_wait";
 export const SESSION_TTL_S = 30 * 24 * 3600;
 
 /** Tenant ids are derived from the identity provider subject (D9). Never contain '.'. */
@@ -21,6 +23,12 @@ export interface SessionClaims {
   tid: string;
   email: string;
   name?: string;
+  /**
+   * How the account was admitted (Phase 4b): "env" = ALLOWED_EMAILS / OWNER_EMAILS, re-checked against
+   * the env vars on every request; "reg" = by the Registry (invite, user cap, owner approval). Cookies
+   * from before Phase 4b have none and are treated as "env".
+   */
+  adm?: "env" | "reg";
   iat: number;
   exp: number;
 }
@@ -34,7 +42,8 @@ function isSessionClaims(x: unknown): x is SessionClaims {
     typeof o.email === "string" &&
     typeof o.iat === "number" &&
     typeof o.exp === "number" &&
-    (o.name === undefined || typeof o.name === "string")
+    (o.name === undefined || typeof o.name === "string") &&
+    (o.adm === undefined || o.adm === "env" || o.adm === "reg")
   );
 }
 
@@ -58,7 +67,7 @@ export async function verifyBlob(secret: string, purpose: string, value: string)
 
 export async function makeSessionCookieValue(
   secret: string,
-  c: { tid: string; email: string; name?: string },
+  c: { tid: string; email: string; name?: string; adm?: "env" | "reg" },
   now = Date.now(),
 ): Promise<string> {
   const iat = Math.floor(now / 1000);
@@ -75,6 +84,48 @@ export async function verifySessionCookieValue(
   if (!isSessionClaims(c)) return null;
   if (c.exp * 1000 <= now) return null;
   return c;
+}
+
+// ---------------------------------------------------------------------------
+// Waitlist cookie (Phase 4b): who is waiting. Signed for its own purpose, so it is never a session.
+
+export interface WaitClaims {
+  tid: string;
+  email: string;
+  name?: string;
+  iat: number;
+  exp: number;
+}
+
+export async function makeWaitCookieValue(secret: string, c: { tid: string; email: string; name?: string }, now = Date.now()): Promise<string> {
+  const iat = Math.floor(now / 1000);
+  return signBlob(secret, "waitlist", { ...c, iat, exp: iat + SESSION_TTL_S } satisfies WaitClaims);
+}
+
+export async function verifyWaitCookieValue(secret: string, value: string, now = Date.now()): Promise<WaitClaims | null> {
+  const c = (await verifyBlob(secret, "waitlist", value)) as WaitClaims | null;
+  if (!c || typeof c.tid !== "string" || !c.tid || typeof c.email !== "string" || typeof c.exp !== "number") return null;
+  if (c.name !== undefined && typeof c.name !== "string") return null;
+  return c.exp * 1000 > now ? c : null;
+}
+
+// ---------------------------------------------------------------------------
+// Invite links (Phase 4b): `/?invite=<token>`, token = signed { i: invite id, e: expiry (s) }. The
+// signature lets the Worker refuse forged or expired links without waking the Registry; whether the
+// invite is still open (not revoked, uses left) is decided by the Registry at sign-in.
+
+export const INVITE_ID_RE = /^[A-Za-z0-9_-]{16,32}$/;
+
+export async function makeInviteToken(secret: string, id: string, expiresAt: number): Promise<string> {
+  return signBlob(secret, "invite", { i: id, e: Math.floor(expiresAt / 1000) });
+}
+
+export async function verifyInviteToken(secret: string, token: string, now = Date.now()): Promise<{ id: string; expiresAt: number } | null> {
+  if (token.length > 512) return null;
+  const v = (await verifyBlob(secret, "invite", token)) as { i?: unknown; e?: unknown } | null;
+  if (!v || typeof v.i !== "string" || !INVITE_ID_RE.test(v.i) || typeof v.e !== "number") return null;
+  if (v.e * 1000 <= now) return null;
+  return { id: v.i, expiresAt: v.e * 1000 };
 }
 
 // ---------------------------------------------------------------------------

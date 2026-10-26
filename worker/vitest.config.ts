@@ -29,6 +29,9 @@ export default defineConfig({
           VAPID_PUBLIC_KEY: vapid.publicKey,
           VAPID_PRIVATE_KEY: vapid.privateKey,
           VAPID_SUBJECT: "mailto:test@example.com",
+          // Phase 4b: Hubs report usage to the Registry only in the tests that turn it on (hub.reportEveryMs),
+          // so the cost assertions of earlier phases stay exact.
+          USAGE_REPORT_MINUTES: "off",
         },
       },
     }),

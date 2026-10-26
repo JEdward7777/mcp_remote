@@ -7,11 +7,12 @@ import { runClaude } from "./run-claude";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { log, setLogPrefix } from "./log";
-import { pair } from "./pair";
+import { pair, pairWithCode } from "./pair";
 import { runShim } from "./shim";
 
 const USAGE = `usage:
   mcp-remote pair <worker-url> [--name <machine name>]   pair this computer with your account
+  mcp-remote pair --code <code> <worker-url>            pair with an install code from the app (Machines)
   mcp-remote daemon                                     run the per-computer daemon
   mcp-remote shim                                       stdio MCP channel server (Claude Code runs this)
 
@@ -42,15 +43,19 @@ async function main(argv: string[]): Promise<void> {
   switch (cmd) {
     case "pair": {
       setLogPrefix("mcp-remote pair");
-      const url = rest.find((a) => !a.startsWith("--"));
       const ni = rest.indexOf("--name");
       const name = ni >= 0 ? rest[ni + 1] : undefined;
+      const ci = rest.indexOf("--code");
+      const code = ci >= 0 ? rest[ci + 1] : undefined;
+      if (ci >= 0 && (!code || code.startsWith("--"))) throw new Error("--code needs the code from the app\n\n" + USAGE);
+      const url = rest.find((a, i) => !a.startsWith("--") && (ni < 0 || i !== ni + 1) && (ci < 0 || i !== ci + 1));
       if (!url) throw new Error("missing <worker-url>\n\n" + USAGE);
-      const out = await pair(url, name ? { name } : {});
+      const out = code ? await pairWithCode(url, code, name ? { name } : {}) : await pair(url, name ? { name } : {});
       process.stderr.write(
         `Paired "${out.machine_name}" to ${out.account}.\nSaved ${out.configPath}\n` +
           `If this computer was paired before, revoke its old entry on the phone (Machines) so its session ids are freed.\n` +
-          `Next: run \`mcp-remote daemon\` (restart it if it was already running).\n`,
+          `Next: \`mcp-remote install-service\` (runs the daemon as a user service) and \`mcp-remote setup-claude\`\n` +
+          `(or run \`mcp-remote daemon\` in a terminal; restart it if it was already running).\n`,
       );
       return;
     }

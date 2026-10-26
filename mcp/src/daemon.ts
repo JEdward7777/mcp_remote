@@ -456,7 +456,7 @@ export class Daemon {
         );
       } else if (res.statusCode === 403) {
         revoked = true;
-        log("server says this account is no longer allowed to sign in (removed from the sign-up list).");
+        log("server says this account is no longer allowed (removed from the sign-up list, or disabled by the server's operator).");
       } else {
         log(`server refused websocket: HTTP ${res.statusCode}`);
       }
@@ -589,7 +589,10 @@ export class Daemon {
         } satisfies DaemonToShim);
       }
       if (wasReady) this.broadcastShims({ t: "hub_status", connected: false });
-      if (code === 4001) revoked = true;
+      if (code === 4001) {
+        revoked = true;
+        log(`server closed the connection: ${reason.toString() || "machine revoked"}`);
+      }
       if (revoked) {
         log("this machine can no longer connect; daemon exiting. Pair again with `mcp-remote pair <url>`.");
         this.fatal(EXIT_REVOKED);
