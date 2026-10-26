@@ -77,3 +77,10 @@
   remembered parent; fresh = --session-id, resume = --resume, "resume last" = --continue --fork-session --session-id
   with fork_pending until transcript exists; launched env strips only nested-session markers; secrets in daemon-loaded
   0600 service.env (limited syntax); exit codes 3 revoked / 4 duplicate token / 5 unusable settings.
+- D23 (accepted, made during Phase 3 build) Limits: all free-plan numbers in worker/src/budget.ts (most UNVERIFIED,
+  desk checklist); per-tenant token buckets carried in WS attachments (+ rl_snap row on last close); per-tenant daily
+  budgets = share of free limits (free 10%, owner 50%) on requests / rows read / rows written, metered via SQL cursor
+  wrapper, refusal until 00:00 UTC; plans via meta.plan, owner via OWNER_EMAILS; machine cap free 10 / owner 30;
+  Throttle DO (4 shards) for unauthenticated pair-start, global cap derived from FREE_PLAN; pairing wait socket
+  held by the Worker (DO never sees client frames), claim via authenticated POST; DOs never use ws.accept();
+  closed sockets' frames dropped before any work; history GC batched, capped at 50% of rows_written.
