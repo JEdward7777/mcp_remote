@@ -874,6 +874,7 @@ async function handleAdmin(request: Request, env: Env, url: URL, session: Sessio
     }
     const r = await reg.act(actor, action);
     if (r.ok && action.t === "enable") disabledTenants.delete(tid);
+    if (r.ok) waitChecks.delete(tid); // an approved account gets in on its next /api/me (this isolate at once)
     return r.ok ? json(r) : err(r.status, r.error);
   }
 

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocketServer } from "ws";
-import { pair } from "../src/pair";
+import { pair, pairWithCode } from "../src/pair";
 
 let dir: string;
 let server: Server;
@@ -22,6 +22,21 @@ beforeEach(async () => {
       received.push(`claim ${u.searchParams.get("code")} ${u.searchParams.get("pairing_id")} ${req.headers.authorization}`);
       res.setHeader("content-type", "application/json");
       res.end('{"ok":true}');
+      return;
+    }
+    if (req.method === "POST" && req.url === "/api/pair/redeem") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        received.push(`redeem ${body}`);
+        res.setHeader("content-type", "application/json");
+        if (JSON.parse(body).code === "ZZZZ-ZZZZ-ZZZZ-ZZZZ") {
+          res.statusCode = 404;
+          res.end('{"error":"unknown or expired code; get a new install command from the app (Machines)"}');
+          return;
+        }
+        res.end(JSON.stringify({ token: "mrm1.a.b.c.d", machine_id: "m2", machine_name: "laptop", account: "me@x", pairing_id: "pid2", poll_secret: "sec2" }));
+      });
       return;
     }
     if (req.method === "POST" && req.url === "/api/pair/start") {
@@ -49,6 +64,24 @@ afterEach(async () => {
   await new Promise<void>((r) => wss.close(() => r()));
   await new Promise<void>((r) => server.close(() => r()));
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe("pair --code (one-line install, Phase 4b)", () => {
+  it("redeems the pre-approved code, saves the config, then claims", async () => {
+    process.env.MCP_REMOTE_CONFIG_DIR = join(dir, "cfg");
+    const out = await pairWithCode(base, "abcd-efgh-jkmn-pqrs", { name: "laptop" });
+    expect(existsSync(out.configPath)).toBe(true);
+    expect(out).toMatchObject({ machine_id: "m2", machine_name: "laptop", account: "me@x" });
+    expect(received[0]).toBe('redeem {"code":"ABCD-EFGH-JKMN-PQRS","hostname":"laptop"}');
+    expect(received[1]).toBe("claim ABCD-EFGH-JKMN-PQRS pid2 Bearer sec2");
+  });
+
+  it("refuses a malformed code locally and explains an unknown one", async () => {
+    process.env.MCP_REMOTE_CONFIG_DIR = join(dir, "cfg");
+    await expect(pairWithCode(base, "ABCD-EFGH")).rejects.toThrow(/XXXX-XXXX-XXXX-XXXX/);
+    await expect(pairWithCode(base, "ZZZZ-ZZZZ-ZZZZ-ZZZZ")).rejects.toThrow(/unknown or expired code.*HTTP 404/);
+    expect(existsSync(join(dir, "cfg", "config.json"))).toBe(false);
+  });
 });
 
 describe("pair", () => {

@@ -6,7 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { connect as netConnect, createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -209,6 +209,15 @@ async function verifyJwt(jwt, k) {
 
 const toolText = (r) => r?.content?.[0]?.text ?? "";
 
+/** /auth/dev with gating (?gate=1) and an optional invite token: returns the cookies it set. */
+async function gatedLogin(base, user, invite) {
+  const q = new URLSearchParams({ user, gate: "1", ...(invite ? { invite } : {}) });
+  const r = await fetch(`${base}/auth/dev?${q}`, { redirect: "manual" });
+  const sc = r.headers.getSetCookie?.() ?? [r.headers.get("set-cookie") ?? ""];
+  const pick = (name) => sc.map((c) => new RegExp(`(${name}=[^;]+)`).exec(c)?.[1]).find((v) => v && !v.endsWith("="));
+  return { status: r.status, session: pick("__Host-mr_session"), wait: pick("__Host-mr_wait"), body: r.status === 302 ? "" : await r.text() };
+}
+
 async function devLogin(base, user) {
   const r = await fetch(`${base}/auth/dev?user=${user}`, { redirect: "manual" });
   const sc = r.headers.get("set-cookie") ?? "";
@@ -326,6 +335,16 @@ async function main() {
       // Only honored with DEV_AUTH=1: lets the Hub push to the local fake push service.
       "--var",
       `PUSH_EXTRA_ORIGINS:${pushBase}`,
+      // Phase 4b: open sign-up with a tiny user cap (plain dev sign-ins bypass gating; ?gate=1 ones don't),
+      // an owner for the Admin API, and a usage report on every event (default: every 15 min).
+      "--var",
+      "OPEN_SIGNUP:true",
+      "--var",
+      "USER_CAP:1",
+      "--var",
+      "OWNER_EMAILS:owner@dev.local",
+      "--var",
+      "USAGE_REPORT_MINUTES:0",
       "--show-interactive-dev-session=false",
       "--log-level",
       "info",
@@ -870,6 +889,119 @@ async function main() {
     check("once the fork was saved, Restart + resume reopens exactly it (--resume <fork id>)", idOf(f3, "--resume") === idOf(f2, "--session-id"), JSON.stringify(f3));
     await op({ t: "launch_stop", launch_id: fid }, "stop fork 3");
     await waitFor(() => launchOf(fid)?.state === "exited", { timeout: 15_000, what: "fork stopped 3" });
+  }
+
+  // --- Phase 4b: waitlist, invites, admin, one-line install, disabling an account ------------
+  logStep("Phase 4b: sign-up gating, admin, one-line install");
+  {
+    const owner = await devLogin(base, "owner");
+    const meOwner = await (await api(base, owner, "/api/me")).json();
+    check("the owner's /api/me says owner (shows the Admin tab)", meOwner.owner === true, JSON.stringify(meOwner));
+    const meAlice = await (await api(base, alice, "/api/me")).json();
+    check("a non-owner's /api/me says owner: false", meAlice.owner === false, JSON.stringify(meAlice));
+    const nonOwner = await api(base, alice, "/api/admin/overview");
+    check("a non-owner gets 403 from the admin API", nonOwner.status === 403, String(nonOwner.status));
+    const adminPage = await fetch(`${base}/admin`, { redirect: "manual" });
+    check("/admin opens the app's Admin view (#/admin)", adminPage.status === 302 && adminPage.headers.get("location") === "/#/admin", String(adminPage.status));
+
+    // Waitlist -> approve -> use. USER_CAP is 1 and several accounts exist already.
+    const wl = await gatedLogin(base, "wanda");
+    check("over the user cap a new sign-up gets only a waitlist cookie", wl.status === 302 && !!wl.wait && !wl.session, JSON.stringify(wl));
+    const wlMe = await fetch(`${base}/api/me`, { headers: { cookie: wl.wait } });
+    const wlBody = await wlMe.json();
+    check("a waitlisted account sees the waiting status (/api/me 403 waitlisted)", wlMe.status === 403 && wlBody.waitlisted === true && wlBody.email === "wanda@dev.local", JSON.stringify(wlBody));
+    const wlState = await fetch(`${base}/api/state`, { headers: { cookie: wl.wait } });
+    check("a waitlisted account can't use the API", wlState.status === 401, String(wlState.status));
+    const waiting = await (await api(base, owner, "/api/admin/tenants?status=waitlisted")).json();
+    check("the owner sees the waitlisted account in Admin", waiting.tenants?.some((t) => t.tid === "dev-wanda" && t.email === "wanda@dev.local"), JSON.stringify(waiting).slice(0, 300));
+    const ap = await api(base, owner, "/api/admin/tenants/dev-wanda/approve", { method: "POST", body: "{}" });
+    check("the owner approves with one call", ap.ok, String(ap.status));
+    const wlMe2 = await fetch(`${base}/api/me`, { headers: { cookie: wl.wait } });
+    const wanda = /(__Host-mr_session=[^;]+)/.exec(wlMe2.headers.getSetCookie().join("\n"))?.[1];
+    check("after approval the waiting page's /api/me signs the account in", wlMe2.status === 200 && !!wanda && (await wlMe2.json()).approved === true, String(wlMe2.status));
+
+    // One-line install: the signed-in user starts the pairing (charged to the account), the computer redeems it.
+    const dl = await (await fetch(`${base}/dl/mcp-remote.json`)).json();
+    const tgz = Buffer.from(await (await fetch(`${base}${dl.path}`)).arrayBuffer());
+    const tgzPath = join(tmp, dl.file);
+    writeFileSync(tgzPath, tgz);
+    const listing = execFileSync("tar", ["tzf", tgzPath], { encoding: "utf8" });
+    check(
+      "the CLI tarball is served as a static asset, version-pinned, sha256 as published, with dist/cli.js",
+      dl.file === `mcp-remote-${dl.version}-${dl.sha256.slice(0, 8)}.tgz` && createHash("sha256").update(tgz).digest("hex") === dl.sha256 && /package\/dist\/cli\.js/.test(listing),
+      JSON.stringify(dl),
+    );
+    const ss = await api(base, wanda, "/api/pair/start-signed", { method: "POST", body: "{}" });
+    const ssBody = await ss.json();
+    check("a signed-in user gets a pre-approved install code", ss.ok && /^[A-Z2-9]{4}(-[A-Z2-9]{4}){3}$/.test(ssBody.code) && ssBody.url === base, JSON.stringify(ssBody));
+    const wandaDir = join(tmp, "wanda-box");
+    const pw = spawnLogged("pair-code", process.execPath, [CLI, "pair", "--code", ssBody.code, base, "--name", "wanda-box"], {
+      env: { ...process.env, MCP_REMOTE_CONFIG_DIR: wandaDir },
+    });
+    await waitFor(() => pw.exitCode !== null, { timeout: 15_000, what: "pair --code" });
+    check("`mcp-remote pair --code` pairs without any approval step", pw.exitCode === 0 && /Paired "wanda-box" to wanda@dev\.local/.test(pw.output), pw.output.slice(-300));
+    const again = spawnLogged("pair-code2", process.execPath, [CLI, "pair", "--code", ssBody.code, base], { env: { ...process.env, MCP_REMOTE_CONFIG_DIR: join(tmp, "wanda-2") } });
+    await waitFor(() => again.exitCode !== null, { timeout: 15_000, what: "second pair --code" });
+    check("an install code works once", again.exitCode !== 0 && /unknown or expired code|already used/.test(again.output), again.output.slice(-300));
+    const pWanda = await phone(base, wanda);
+    const dWanda = spawnLogged("daemon-wanda", process.execPath, [CLI, "daemon"], { env: { ...process.env, MCP_REMOTE_CONFIG_DIR: wandaDir } });
+    await waitFor(() => pWanda.state?.machines.find((m) => m.name === "wanda-box")?.online, { timeout: 15_000, what: "wanda's daemon online" });
+    check("the approved account uses the service: its computer is online on its phone", true);
+
+    // Invite link sign-up (skips the waitlist; max uses enforced).
+    const inv = await (await api(base, owner, "/api/admin/invites", { method: "POST", body: JSON.stringify({ days: 1, max_uses: 1, note: "e2e" }) })).json();
+    const token = new URL(inv.invite.link).searchParams.get("invite");
+    const invCheck = await (await fetch(`${base}/api/invite?token=${encodeURIComponent(token)}`)).json();
+    check("an invite link checks out on the sign-in page", invCheck.valid === true, JSON.stringify(invCheck));
+    const iv = await gatedLogin(base, "ivan", token);
+    const ivMe = iv.session ? await (await api(base, iv.session, "/api/me")).json() : null;
+    check("signing up through an invite link skips the waitlist", !!iv.session && !iv.wait && ivMe?.tenant === "dev-ivan", JSON.stringify(iv));
+    const iv2 = await gatedLogin(base, "ines", token);
+    check("a used-up invite (max uses 1) falls back to the waitlist", !!iv2.wait && !iv2.session, JSON.stringify(iv2));
+
+    // Admin view numbers (usage reports on every event in this run).
+    pa.send({ t: "refresh" });
+    await sleep(300);
+    pa.send({ t: "refresh" });
+    const ov = await waitFor(
+      async () => {
+        const o = await (await api(base, owner, "/api/admin/overview")).json();
+        return o.top?.some((t) => t.tid === "dev-alice" && t.messages > 0) ? o : null;
+      },
+      { timeout: 10_000, what: "alice in the admin overview" },
+    );
+    const aliceRow = ov.top.find((t) => t.tid === "dev-alice");
+    check(
+      "admin overview: today's totals, sign-ups, DAU and top accounts with their emails",
+      ov.totals.do_requests > 0 && ov.totals.rows_written > 0 && ov.days[0].signups >= 5 && ov.days[0].dau >= 2 && aliceRow.email === "alice@dev.local" && aliceRow.machines >= 1 && ov.counts.waitlisted >= 1,
+      JSON.stringify({ totals: ov.totals, day: ov.days[0], alice: aliceRow, counts: ov.counts }),
+    );
+    check("admin overview compares against the free plan's daily limits", ov.limits.do_requests === 100000 && ov.level.percent > 0 && ov.level.percent < 50, JSON.stringify(ov.level));
+
+    // Disabling an account: its daemon exits with code 3, its phone is told, its API calls are refused.
+    const dis = await api(base, owner, "/api/admin/tenants/dev-wanda/disable", { method: "POST", body: "{}" });
+    check("the owner disables an account", dis.ok, String(dis.status));
+    await waitFor(() => dWanda.exitCode !== null, { timeout: 15_000, what: "wanda's daemon to exit" });
+    check("a disabled account's daemon exits with code 3", dWanda.exitCode === 3, `exit ${dWanda.exitCode}: ${dWanda.output.slice(-300)}`);
+    // The Hub closed the phone socket (4403): the client is closing (wrangler dev's proxy may keep TCP open a while).
+    await waitFor(() => pWanda.ws.readyState >= WebSocket.CLOSING, { timeout: 5_000, what: "wanda's phone closed" });
+    const ph2 = await rawWs(base, "/api/ws", { Cookie: wanda, Origin: base });
+    await waitFor(() => ph2.closed || ph2.status !== 101, { what: "disabled phone refused" });
+    check("a disabled account's phone is refused with close code 4403 (the app shows 'disabled', no reconnect loop)", ph2.status === 403 || ph2.closed?.code === 4403, JSON.stringify({ status: ph2.status, closed: ph2.closed }));
+    ph2.s.destroy();
+    const disState = await api(base, wanda, "/api/state");
+    check("a disabled account's API calls are refused (403 disabled)", disState.status === 403 && (await disState.json()).disabled === true, String(disState.status));
+    const dWanda2 = spawnLogged("daemon-wanda2", process.execPath, [CLI, "daemon"], { env: { ...process.env, MCP_REMOTE_CONFIG_DIR: wandaDir } });
+    await waitFor(() => dWanda2.exitCode !== null, { timeout: 15_000, what: "disabled daemon to give up" });
+    check("a disabled account's daemon is refused on reconnect (exit 3)", dWanda2.exitCode === 3 && /disabled/.test(dWanda2.output), dWanda2.output.slice(-300));
+    const reSign = await gatedLogin(base, "wanda");
+    check("a disabled account can't sign in again", reSign.status === 403 && /disabled/.test(reSign.body), JSON.stringify(reSign).slice(0, 300));
+    const audit = await (await api(base, owner, "/api/admin/audit")).json();
+    check(
+      "owner actions are in the audit log",
+      ["disable", "invite_create", "approve"].every((a) => audit.audit.some((x) => x.action === a && x.actor === "owner@dev.local")),
+      JSON.stringify(audit.audit.map((a) => a.action)),
+    );
   }
 
   // --- per-tenant limits (Phase 3) -----------------------------------------------------------
