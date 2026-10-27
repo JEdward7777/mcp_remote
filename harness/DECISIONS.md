@@ -97,3 +97,10 @@
   adm (env | reg); Hubs report every 15 min (charged to tenant); guard pauses auto-approval at 80% and lowers free
   share to 5% at 90% for the UTC day; owner alerts at 50%/80%; signed-in pairing with 16-char codes bypasses the
   anonymous global cap; mcp-remote tarball served from /dl with sha256, no pipe-to-shell.
+- D26 (accepted, made during Phase 5 build) Codex: opt-in per computer (`agents`), agent per project/launch;
+  each phone message batch = one `codex exec [resume <thread>|--last] --json -- … -` turn under run-codex in the
+  dedicated tmux server; prompt via 0600 file → stdin only; shim injected per turn via `-c mcp_servers.*` with
+  env_vars forwarding and default_tools_approval_mode="approve"; one turn at a time, mid-turn messages batched
+  (≤20 msgs / 40k chars); final answer forwarded only if Codex never called send_message; daemon-originated
+  messages go through a persisted outbox (≤3/session, paced, at-least-once); `--last` refused when it could
+  collide with another Codex session in the same folder; extra args allowlisted.

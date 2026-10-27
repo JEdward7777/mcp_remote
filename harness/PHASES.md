@@ -1,10 +1,12 @@
 # Phases
 
 ## To do
-- [ ] Phase 5 (in progress): Codex backend (user approved 2026-10-27)
 - [ ] Desk session: deploy + work through harness/SETUP.md "verify at the desk" checklist (needs the user)
 
 ## Completed
+- [x] Phase 5: Codex backend via daemon-driven `codex exec [resume] --json` turns, per-turn shim with
+      auto-approved tools, persisted outbox, agent choice per project/launch. Ratchet: 2 review rounds (minors only);
+      round-2 fixes verified by orchestrator. Final: 374/374 tests, e2e 161/161. Real Codex untested (desk checklist).
 - [x] Phase 4b: Sign-up gating (cap/waitlist/invites), Registry DO (metadata + counters only), global guard,
       owner /admin with audit log, owner alerts, signed-in one-line install (D12, D13). Ratchet: 1 review round
       (2 minor), fixes verified by orchestrator. Final: 333/333 tests, e2e 139/139.
