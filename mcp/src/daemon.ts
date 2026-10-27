@@ -46,6 +46,8 @@ const REPLACED_DELAY_MS = 30_000;
 /** A connection that lived this long without being replaced resets the streak. */
 const STABLE_AFTER_MS = 5 * 60_000;
 const SEND_TIMEOUT_MS = 15_000;
+/** Spacing of queued daemon status messages after a reconnect (the free plan allows ~10 agent messages/min). */
+const OUTBOX_PACE_MS = 6_000;
 
 interface ShimEntry {
   conn: LineConn<ShimToDaemon>;
@@ -99,6 +101,8 @@ export interface DaemonOptions {
   /** Reconnect backoff profile and randomness (tests make them deterministic). */
   reconnect?: ReconnectProfile;
   random?: () => number;
+  /** Spacing of queued daemon status messages after a reconnect (tests shorten it). */
+  outboxPaceMs?: number;
   /** Observes every scheduled reconnect (tests). */
   onReconnectScheduled?: (delayMs: number, hints: ReconnectHints) => void;
 }
@@ -114,6 +118,7 @@ export class Daemon {
   private attempt = 0;
   private reqSeq = 0;
   private reconnectTimer: NodeJS.Timeout | undefined;
+  private outboxTimer: NodeJS.Timeout | undefined;
   private heartbeat: Heartbeat | null = null;
   /** Why we are not connected, when the server said so (429 / 4029): passed on to send_message errors. */
   private offlineReason: string | null = null;
@@ -167,6 +172,7 @@ export class Daemon {
     // Launched tmux sessions keep running; the next daemon re-adopts them from launches.json.
     this.launcher?.dispose();
     clearTimeout(this.reconnectTimer);
+    clearTimeout(this.outboxTimer);
     for (const p of this.locPending.values()) clearTimeout(p.timer);
     this.locPending.clear();
     this.heartbeat?.stop();
@@ -464,9 +470,18 @@ export class Daemon {
     return true;
   }
 
-  /** After hello: status messages that could not be sent before (daemon was offline, or restarted). */
-  private flushOutboxes(): void {
-    for (const sid of this.launcher?.outboxSessions() ?? []) this.launcher!.flushOutbox(sid);
+  /**
+   * After hello (and after a rate-limit refusal's delay): status messages that could not be sent before, paced
+   * one per OUTBOX_PACE_MS so a backlog (up to 3 per session) stays under the Hub's per-minute agent_send burst.
+   */
+  private flushOutboxes(delayMs = 0): void {
+    if (this.outboxTimer || this.stopped) return;
+    this.outboxTimer = setTimeout(() => {
+      this.outboxTimer = undefined;
+      if (this.stopped || !this.hubReady) return;
+      if (this.launcher?.flushOne()) this.flushOutboxes(this.opts.outboxPaceMs ?? OUTBOX_PACE_MS);
+    }, delayMs);
+    this.outboxTimer.unref?.();
   }
 
   /** Full session list; also clears refusals so they are retried (the Hub re-refuses if still taken). */
@@ -597,6 +612,8 @@ export class Daemon {
       log(`connected to ${this.opts.config.url}`);
       this.sendHello();
       this.sendLaunchInfo();
+      clearTimeout(this.outboxTimer); // a reconnect retries now, not after an earlier refusal's delay
+      this.outboxTimer = undefined;
       this.flushOutboxes();
       this.broadcastShims({ t: "hub_status", connected: true });
       // Half-open detection: the Hub's auto-response answers "ping" without waking the Durable
@@ -688,9 +705,14 @@ export class Daemon {
               if (p.shim) p.shim.send({ t: "send_error", req_id: p.shimReqId, error: f.error } satisfies DaemonToShim);
               else if (p.outbox) {
                 log(`server refused a status message: ${f.error}`);
-                // Rate limited / budget: try again after the next hello; anything else won't get better.
-                if (f.retry_after_s !== undefined) this.launcher?.outboxRetry(p.outbox.id);
-                else this.launcher?.outboxDone(p.outbox.sessionId, p.outbox.id);
+                // Rate limited / budget: try again once the server says it may work (capped at 6 h; a reconnect
+                // tries earlier). Anything else won't get better.
+                if (f.retry_after_s !== undefined) {
+                  this.launcher?.outboxRetry(p.outbox.id);
+                  clearTimeout(this.outboxTimer);
+                  this.outboxTimer = undefined;
+                  this.flushOutboxes(Math.min(f.retry_after_s, 6 * 3600) * 1000 + 500);
+                } else this.launcher?.outboxDone(p.outbox.sessionId, p.outbox.id);
               }
               return;
             }

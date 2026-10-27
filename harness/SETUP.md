@@ -439,7 +439,8 @@ running turn's summary; between turns there is no process at all).
 
    The phone's Start picker shows an agent menu when the computer offers both, preset to the project's agent;
    launches and sessions carry a "Codex" badge. On a computer where only one agent is enabled (e.g.
-   `config set agents codex`), every project starts with that one, whatever its own `agent` says.
+   `config set agents codex`), every project starts with that one agent, even a project added with
+   `--agent claude` (and the phone shows it that way).
 
 How it behaves:
 
@@ -453,7 +454,11 @@ How it behaves:
   queued when a session stops stay undelivered and arrive after Restart.
 - **Status messages survive outages**: the fallback answer and the failure notices below come from the daemon
   itself. If it can't reach the server at that moment (a turn ended while the daemon was stopped, a network
-  blip), they wait in `launches.json` (at most 3 per session, newest kept) and are sent after it reconnects.
+  blip), they wait in `launches.json` (at most 3 per session, newest kept) and are sent after it reconnects,
+  one every 6 s so a backlog stays under the per-minute message limit (a rate-limit refusal is retried after
+  the delay the server names). Delivery is at-least-once: if the connection drops after the server stored one but
+  before its answer arrived, it is sent again and shows up twice in the thread (rare; no deduplication, which would
+  cost the server a lookup per message).
 - **Failures**: a failed turn is reported on the phone as a short `[mcp-remote] ...` message (normal urgency;
   the session stays running: a turn failing is not the session ending, and there is no auto-restart). An
   authentication failure (401 / not logged in), a non-git folder or a missing `codex` also set **needs you at

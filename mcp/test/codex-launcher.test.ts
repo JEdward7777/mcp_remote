@@ -479,3 +479,56 @@ describe("codex launches: review round 1", () => {
     expect(readFileSync(s.argv[s.argv.indexOf("--prompt-file") + 1]!, "utf8")).toContain("keep me");
   });
 });
+
+describe("codex launches: review round 2", () => {
+  it("Restart runs a follow-up that was queued behind the killed turn (scenario A)", async () => {
+    const l = make();
+    await l.init();
+    const id = await startCodex(l);
+    l.deliver(id, [msg(id, "long job")]);
+    await waitFor(() => tmux.spawns.length === 1, "turn 1");
+    l.deliver(id, [msg(id, "follow-up")]);
+    expect((await l.restart(id, true)).ok).toBe(true);
+    const s = await waitFor(() => tmux.spawns[1], "turn after restart");
+    expect(readFileSync(s.argv[s.argv.indexOf("--prompt-file") + 1]!, "utf8")).toContain("follow-up");
+  });
+
+  it("Restart after fixing a problem runs the messages kept meanwhile (scenario B)", async () => {
+    const l = make();
+    await l.init();
+    const id = await startCodex(l);
+    cfg = LaunchConfig.parse({ ...cfg, codex_path: null });
+    const saved = process.env.PATH;
+    process.env.PATH = join(dir, "nowhere");
+    try {
+      await l.reload();
+      l.deliver(id, [msg(id, "kept")]);
+      await waitFor(() => rec(l, id).state === "needs_attention", "attention");
+    } finally {
+      process.env.PATH = saved;
+    }
+    cfg = LaunchConfig.parse({ ...cfg, codex_path: "/opt/fake/codex" });
+    expect((await l.restart(id, true)).ok).toBe(true);
+    const s = await waitFor(() => tmux.spawns[0], "turn after restart");
+    expect(readFileSync(s.argv[s.argv.indexOf("--prompt-file") + 1]!, "utf8")).toContain("kept");
+  });
+
+  it("flushOne sends a single waiting status message at a time (paced flushing after hello)", async () => {
+    connected = false;
+    const l = make();
+    await l.init();
+    const id = await startCodex(l);
+    for (const t of ["a", "b"]) {
+      l.deliver(id, [msg(id, t)]);
+      await waitFor(() => tmux.sessions.has(id), "turn " + t);
+      endTurn(id, { code: 1, error: t });
+      await waitFor(() => !tmux.sessions.has(id), "done " + t);
+    }
+    connected = true;
+    expect(l.flushOne()).toBe(true);
+    expect(notes).toHaveLength(1);
+    expect(l.flushOne()).toBe(true);
+    expect(l.flushOne()).toBe(false); // both in flight
+    expect(notes).toHaveLength(2);
+  });
+});

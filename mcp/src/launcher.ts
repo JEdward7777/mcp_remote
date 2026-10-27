@@ -416,6 +416,8 @@ export class Launcher {
     } finally {
       e.busy = false;
     }
+    // startCodex's own maybeStartTurn ran while busy; messages already queued go now.
+    if (e.agent === "codex") void this.maybeStartTurn(e);
     return e.state === "failed" ? { ok: false, error: e.detail ?? "failed to start" } : { ok: true, launch_id: id };
   }
 
@@ -480,6 +482,9 @@ export class Launcher {
     } finally {
       e.busy = false;
     }
+    // startCodex's own maybeStartTurn ran while busy: a follow-up queued before the restart, or messages kept
+    // while it needed attention, go now.
+    if (e.agent === "codex") void this.maybeStartTurn(e);
     return e.state === "failed" ? { ok: false, error: e.detail ?? "failed to start" } : { ok: true, launch_id: e.launch_id };
   }
 
@@ -1175,15 +1180,25 @@ export class Launcher {
     return this.entries.filter((e) => e.outbox.length).map((e) => e.session_id);
   }
 
-  /** Hand waiting status messages of a session to the daemon (each once until outboxRetry). */
-  flushOutbox(sessionId: string): void {
+  /** Hand waiting status messages of a session to the daemon (each once until outboxRetry); returns how many. */
+  flushOutbox(sessionId: string, limit = Infinity): number {
     const e = this.get(sessionId);
-    if (!e || !this.o.onNotify) return;
+    if (!e || !this.o.onNotify) return 0;
+    let n = 0;
     for (const item of e.outbox) {
+      if (n >= limit) break;
       if (this.inflight.has(item.id)) continue;
-      if (!this.o.onNotify(e.session_id, item)) return; // not connected: all of it waits for the next hello
+      if (!this.o.onNotify(e.session_id, item)) break; // not connected: all of it waits for the next hello
       this.inflight.add(item.id);
+      n++;
     }
+    return n;
+  }
+
+  /** Send ONE waiting status message (of any session); false when none is left to send. Used for paced flushing. */
+  flushOne(): boolean {
+    for (const sid of this.outboxSessions()) if (this.flushOutbox(sid, 1)) return true;
+    return false;
   }
 
   /** The Hub answered (stored it, or refused it for good): forget it. */
