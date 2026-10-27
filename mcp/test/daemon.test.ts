@@ -727,9 +727,10 @@ describe("daemon codex sessions (Phase 5)", () => {
     await waitFor(() => hubFrames.find((f) => f.t === "send" && /turn failed \(exit 2\): boom/.test(f.text)), "failure message");
 
     // A reconnect re-announces it in hello.
+    const hellos = hubFrames.filter((f) => f.t === "hello").length;
     hubSockets[0]!.terminate();
     await waitFor(() => hubSockets.length === 2, "reconnected");
-    const hello = await waitFor(() => [...hubFrames].reverse().find((f) => f.t === "hello"), "hello");
+    const hello = await waitFor(() => hubFrames.filter((f) => f.t === "hello").length > hellos && [...hubFrames].reverse().find((f) => f.t === "hello"), "new hello");
     expect(hello.sessions.map((s: any) => s.session_id)).toContain(id);
 
     // Stop: session goes down.

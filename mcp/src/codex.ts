@@ -47,7 +47,7 @@ export type CodexMode = z.infer<typeof CodexMode>;
 
 export const CODEX_MODE_HELP: Record<CodexMode, string> = {
   "read-only": "Codex may read files and run read-only commands; no edits (sandbox_mode=read-only)",
-  "workspace-write": "edits and commands inside the project folder, no network, in Codex's sandbox (like --full-auto)",
+  "workspace-write": "edits and commands inside the project folder, in Codex's sandbox (network off unless your Codex config allows it)",
   "danger-full-access": "no sandbox for commands Codex runs (sandbox_mode=danger-full-access); isolated machines only",
   bypass: "--dangerously-bypass-approvals-and-sandbox: no sandbox and no approvals at all; externally sandboxed machines only",
 };

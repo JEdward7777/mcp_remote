@@ -29,6 +29,7 @@ let acks: { sid: string; ids: number[] }[];
 let notes: { sid: string; text: string; urgency: Urgency }[];
 let launchers: Launcher[];
 let loginProblem: string | null;
+let changes: number;
 
 beforeEach(() => {
   dir = realpathSync(mkdtempSync(join(tmpdir(), "mcpr-cx-")));
@@ -41,6 +42,7 @@ beforeEach(() => {
   notes = [];
   launchers = [];
   loginProblem = null;
+  changes = 0;
   cfg = LaunchConfig.parse({
     roots: [join(dir, "code")],
     claude_path: "/opt/fake/claude",
@@ -59,7 +61,7 @@ afterEach(() => {
 function make(): Launcher {
   const l = new Launcher({
     loadConfig: () => cfg,
-    onChange: () => {},
+    onChange: () => changes++,
     tmux,
     tickMs: 10,
     livenessMs: 20,
@@ -179,6 +181,23 @@ describe("codex launches", () => {
     expect(prompt).not.toContain("msg-one");
     expect(notes).toEqual([]); // Codex messaged the phone itself: nothing extra
     expect(rec(l, id).state).toBe("running");
+  });
+
+  it("a normal turn costs no launches report (the Hub is not told about turn start/end)", async () => {
+    const l = make();
+    await l.init();
+    const id = await startCodex(l);
+    const before = changes;
+    l.deliver(id, [msg(id, "q")]);
+    await waitFor(() => tmux.spawns.length === 1, "turn");
+    endTurn(id, { final: "x", sends: 1 });
+    await waitFor(() => !tmux.sessions.has(id), "turn processed");
+    await sleep(30);
+    expect(changes).toBe(before);
+    // ...but it is persisted locally (a restarted daemon must know a turn is running).
+    l.deliver(id, [msg(id, "q2")]);
+    await waitFor(() => tmux.spawns.length === 2, "turn 2");
+    expect(JSON.parse(readFileSync(join(dir, "launches.json"), "utf8")).launches[0].turn_at).toBeTypeOf("number");
   });
 
   it("forwards the final answer only when Codex never used send_message (fallback)", async () => {

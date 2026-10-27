@@ -583,6 +583,22 @@ export class Launcher {
     this.changed();
   }
 
+  /**
+   * Like set(), but the Hub and the phones only hear about it when the public record changes: a Codex turn
+   * starting or ending normally costs no launches frame (one Hub row write each), only local state.
+   */
+  private setQuiet(e: Entry, patch: Partial<Entry>): void {
+    const before = JSON.stringify({ ...LaunchRecord.parse(e), updated_at: 0 });
+    Object.assign(e, patch);
+    if (patch.detail !== undefined) e.detail = clip(patch.detail);
+    if (JSON.stringify({ ...LaunchRecord.parse(e), updated_at: 0 }) !== before) {
+      this.set(e, {});
+      return;
+    }
+    this.saveState();
+    this.ensureLiveness();
+  }
+
   private changed(): void {
     this.saveState();
     this.ensureLiveness();
@@ -1167,7 +1183,7 @@ export class Launcher {
     e.handed = [...(e.handed ?? []), ...batch.map((m) => m.id)].slice(-2000);
     this.o.onAck?.(e.session_id, batch.map((m) => m.id));
     log(`${e.launch_id}: Codex turn with ${batch.length} message(s)${resume ? ` (resume ${resume})` : " (new conversation)"}`);
-    this.set(e, { turn_at: Date.now() });
+    this.setQuiet(e, { turn_at: Date.now() });
   }
 
   /** One liveness look at a Codex launch: is its turn over (or over time)? */
@@ -1213,7 +1229,9 @@ export class Launcher {
       e.codex_thread = sum.thread_id;
       e.codex_last = false;
     }
-    const tail = `${sum?.error ?? ""}\n${sum?.stderr_tail ?? ""}\n${screen}`;
+    // Classify from what Codex itself reported (turn errors, its stderr); the pane (which also shows the
+    // agent's own words and commands) only when run-codex left no record.
+    const tail = rec ? `${sum?.error ?? ""}\n${sum?.stderr_tail ?? ""}` : screen;
     const lastErr = clip(lastLine((sum?.error ?? sum?.stderr_tail ?? screen).split("\n").filter((l) => !/^Pane is dead|^\[mcp-remote\]/.test(l.trim())).join("\n")) ?? null);
     log(`${e.launch_id}: Codex turn ended${code !== null ? ` with code ${code}` : ""}${sum?.completed ? " (completed)" : ""}`);
     if (code === 0 && sum?.completed && !timedOut) {
@@ -1221,7 +1239,7 @@ export class Launcher {
         // Codex answered in its final message instead of using send_message: the user would see nothing.
         this.o.onNotify?.(e.session_id, `${sum.final}`.slice(0, MAX_TEXT_CHARS), "normal");
       }
-      this.set(e, { state: "running", exit_code: null, detail: null });
+      this.setQuiet(e, { state: "running", exit_code: null, detail: null });
     } else if (timedOut) {
       this.codexProblem(e, `the Codex turn ran longer than ${Math.round(this.cfg.codex_turn_timeout_s / 60)} min and was stopped`, false);
     } else if (sum?.auth || (!sum?.completed && AUTH_RE.test(tail))) {

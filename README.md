@@ -1,6 +1,6 @@
 # mcp_remote
 
-Talk to your Claude Code sessions from your phone.
+Talk to your Claude Code (and OpenAI Codex) sessions from your phone.
 
 ```
 Android PWA  <--wss-->  Cloudflare Worker (workers.dev)  -->  per-user Hub Durable Object
@@ -18,6 +18,11 @@ Android PWA  <--wss-->  Cloudflare Worker (workers.dev)  -->  per-user Hub Durab
   It can also **start, restart and stop Claude Code sessions from the phone** (D6): only in folders you allowlist
   (`mcp-remote projects add <dir>`), in the permission mode you choose (D18), each in its own tmux session.
   `mcp-remote install-service` runs it as a systemd user unit / launchd agent.
+- **Codex** (Phase 5, optional): the same phone experience with OpenAI's Codex CLI as the agent
+  (`mcp-remote setup-codex`, then pick Codex per project or in the phone's Start picker). Codex has no channels,
+  so the daemon runs one `codex exec` / `codex exec resume <thread>` turn per phone message (messages arriving
+  meanwhile are queued into the next turn), prompt on stdin, in the user's chosen sandbox mode; Codex replies
+  through the same shim's `send_message`. See `harness/SETUP.md` step 15.
 - **Shim** (`mcp-remote shim`): Claude Code spawns one per session. It is a
   [channel](https://code.claude.com/docs/en/channels-reference) MCP server: phone messages arrive in the session
   as `<channel>` events, and Claude replies with the `send_message` tool, choosing an urgency
@@ -63,9 +68,10 @@ deployment and desktop setup.
 | `worker/icons/icon.svg`, `worker/scripts/icons.mjs` | the one icon source and the offline renderer that makes every PNG/ICO from it |
 | `worker/public/` | static assets: `index.html`, `style.css`, manifest, icons, `_headers` (CSP) |
 | `worker/test/` | vitest tests running inside workerd (`@cloudflare/vitest-plugin`) |
-| `mcp/src/` | `mcp-remote` CLI: `pair`, `daemon`, `shim`, plus remote launch: `launcher.ts` (lifecycle), `tmux.ts` (argv-only tmux driver), `dialogs.ts` (startup dialog detection), `launch-config.ts` (allowlist), `desk.ts` (`projects`, `config`, `setup-claude`, `attach`), `service.ts` (`install-service`) |
+| `mcp/src/` | `mcp-remote` CLI: `pair`, `daemon`, `shim`, plus remote launch: `launcher.ts` (lifecycle, incl. Codex turns), `tmux.ts` (argv-only tmux driver), `dialogs.ts` (startup dialog detection), `launch-config.ts` (allowlist), `desk.ts` (`projects`, `config`, `setup-claude`, `setup-codex`, `attach`), `service.ts` (`install-service`), `codex.ts` (Codex argv, prompt, `--json` events, `run-codex` wrapper) |
 | `mcp/test/` | daemon routing, config, launcher lifecycle, tmux, dialog fixtures (`fixtures/`, captured from Claude Code), service files |
 | `scripts/fake-claude.mjs` | stand-in for `claude` in the e2e (shows the dev-channels warning, runs the shim) |
+| `scripts/fake-codex.mjs` | stand-in for `codex` in the e2e (`exec` / `exec resume --json`, `login status`, `mcp add/list`; runs the shim like Codex) |
 | `scripts/e2e.mjs` | end-to-end test against a real local `wrangler dev` (incl. a local fake push service and a simulated phone sharing its location) |
 | `harness/` | plan, decisions, phases, setup guide, session logs |
 
@@ -76,7 +82,7 @@ npm ci                 # install (a lockfile is committed; see note below)
 npm run typecheck      # tsc --noEmit, strict, every package (worker, PWA, service worker, mcp, shared)
 npm test               # unit + workerd integration tests
 npm run e2e            # builds, starts wrangler dev locally, pairs a daemon, drives two shims, and launches
-                       # a fake claude in tmux from a fake phone (needs tmux 3.2+)
+                       # a fake claude and a fake codex in tmux from a fake phone (needs tmux 3.2+)
 npm run dev -w worker  # local Worker on http://localhost:8787 (copy worker/.dev.vars.example to .dev.vars)
 npm run vapid          # print a VAPID key pair for Web Push (see harness/SETUP.md step 5)
 npm run icons -w worker  # re-render the icon set from worker/icons/icon.svg

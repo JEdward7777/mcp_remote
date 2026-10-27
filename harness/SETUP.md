@@ -362,6 +362,116 @@ restart are never typed into. Auto-restart (off by default) restarts a crashed s
 exit) with growing delays, resuming the conversation, and gives up after 5 crashes in a row (a run longer than
 10 minutes resets the count); a clean exit or **Stop** is never restarted.
 
+## 15. Codex sessions from the phone (Phase 5)
+
+The phone works the same whichever agent runs: session list, thread, urgency, push, location and map links.
+Only the computer side differs. OpenAI's Codex CLI has nothing like Claude Code's channels (an MCP server
+cannot push input into a running Codex session), so the daemon drives Codex itself: **each phone message
+starts one non-interactive Codex turn** in the project folder,
+
+```
+codex exec --json [mode flags] -c mcp_servers.mcp-remote.* ... -- -                    (first message: new conversation)
+codex exec resume --json [mode flags] -c mcp_servers.mcp-remote.* ... -- <thread id> -  (every later one)
+```
+
+and Codex answers through the same `mcp-remote` shim (`send_message` with an urgency, `get_location`,
+`map_link`). Messages that arrive while a turn runs wait and go into the next turn together (one turn at a
+time per session). The message text travels only through a 0600 file the turn's wrapper reads (and deletes)
+as Codex's stdin; it is never a command-line argument, never passes through a shell and never through tmux
+keys. Turns run in the session's tmux session on the dedicated server (`mcp-remote attach mr-<id>` shows a
+running turn's summary; between turns there is no process at all).
+
+1. Install and log in (checked with codex-cli 0.164.0):
+
+   ```sh
+   npm i -g @openai/codex          # or: brew install --cask codex
+   codex login                     # ChatGPT sign-in, or API key: printenv OPENAI_API_KEY | codex login --with-api-key
+   codex login status
+   ```
+
+   If you rely on an API key in the environment instead of a stored login, the daemon needs it too: put it in
+   `~/.config/mcp-remote/service.env` (step 11). The daemon passes `OPENAI_API_KEY`, `CODEX_API_KEY` and
+   `CODEX_HOME` through untouched.
+
+2. Enable Codex on the computer:
+
+   ```sh
+   mcp-remote setup-codex --dry-run      # what it would do
+   mcp-remote setup-codex                # checks codex + login, registers the shim, enables Codex launches
+   ```
+
+   It runs `codex mcp add mcp-remote -- <node> <cli.js> shim` (Codex writes its own `config.toml`; the file is
+   backed up to `config.toml.bak-<time>` first), is a no-op when the same registration exists, refuses to replace a
+   different `mcp-remote` entry without `--force`, and adds `codex` to the agents the phone may start
+   (`agents` in `launch.json`). `--no-register` skips the `config.toml` part: phone launches don't need it,
+   because the daemon passes the shim to every turn with `-c mcp_servers.mcp-remote.{command,args,env_vars,...}`
+   (Codex starts MCP servers with only HOME, PATH, USER and a few more variables; `env_vars` forwards the
+   session's id and token). In Codex sessions you start yourself the registered shim stays **dormant** (no tools,
+   nothing on the phone): Codex doesn't forward `MCP_REMOTE_*` variables, and its command line has no channels flag.
+
+3. Pick the mode Codex turns run in (D18; `mcp-remote config modes` lists them):
+
+   ```sh
+   mcp-remote config set codex-mode workspace-write
+   ```
+
+   `read-only` / `workspace-write` / `danger-full-access` are Codex's sandbox modes (`-c sandbox_mode=...`, which
+   both `exec` and `exec resume` accept); `bypass` is `--dangerously-bypass-approvals-and-sandbox` (externally
+   sandboxed machines only). Approvals are always `never` (`-c approval_policy="never"`, Codex's headless default):
+   nobody could answer a prompt from the phone, so a command the sandbox blocks fails and Codex is told so.
+   Unset (`config unset codex-mode`), no sandbox is passed and your Codex config decides.
+   Other keys: `codex-path`, `codex-extra-args` (only `-m/--model`, `-c` for keys mcp-remote doesn't manage,
+   `--enable`, `--disable`, `--strict-config`, `--ignore-rules`; everything else is refused), `codex-turn-timeout`
+   (seconds, default 3600: a longer turn is stopped and reported), `codex-skip-git-check on` (Codex refuses
+   folders that aren't git repositories unless `--skip-git-repo-check`; off by default, the phone tells you when
+   it happens), `codex-final-message fallback|never` (below).
+
+4. Choose the agent per project, or per start on the phone:
+
+   ```sh
+   mcp-remote projects add ~/code/api --agent codex     # this project starts Codex by default
+   mcp-remote config set default-agent codex            # default for root folders and projects without --agent
+   ```
+
+   The phone's Start picker shows an agent menu when the computer offers both, preset to the project's agent;
+   launches and sessions carry a "Codex" badge.
+
+How it behaves:
+
+- **Start** creates the session at once (online on the phone, no process yet). If `codex login status` says
+  "Not logged in" the session shows **needs you at the desk** with the fix; it still takes messages.
+- **Replies**: Codex is told (in the first turn's prompt and in the shim's instructions) that the user only sees
+  `send_message`. If a turn ends successfully and Codex never called it, its final answer is forwarded as a
+  normal message (`codex-final-message fallback`, the default; `never` drops it), so a question never goes
+  unanswered. Nothing else of a turn (commands, reasoning) reaches the phone (D17).
+- **Delivered ticks** appear when a turn takes the message (the daemon acknowledges it then). Messages still
+  queued when a session stops stay undelivered and arrive after Restart.
+- **Failures**: a failed turn is reported on the phone as a short `[mcp-remote] ...` message (normal urgency;
+  the session stays running: a turn failing is not the session ending, and there is no auto-restart). An
+  authentication failure (401 / not logged in), a non-git folder or a missing `codex` also set **needs you at
+  the desk**; the next successful turn clears it. A conversation Codex can't find any more (`no rollout found`)
+  is dropped and the next message starts a new one.
+- **Stop** kills the running turn (tmux ends it; `run-codex` passes SIGHUP to the whole process group) and ends
+  the session. **Restart** = new conversation with the next message; **Restart + resume** = the same Codex
+  thread. "resume last conversation" on a new start = `codex exec resume --last` (the folder's most recent Codex
+  conversation; refused while another Codex session runs in that folder, since they would share it).
+- **Daemon restart**: sessions come back by themselves; a turn that was running keeps running in tmux, its shim
+  reconnects to the new daemon (its reply still reaches the phone), and its result is picked up. Messages not yet
+  handed to a turn are redelivered by the Hub.
+- Cost on the free plan: the same Worker traffic per message as a Claude Code session (message in, ack, reply);
+  turns don't update the launch record unless something went wrong.
+
+Known gaps vs Claude Code:
+
+- No live session: each message is a separate `codex exec` turn (Codex keeps the context through `resume`, but
+  every turn re-reads it, so it is slower to start, and each turn costs a model call even for "ok, thanks").
+- You can't type into a phone-started Codex session at the desk (there is no interactive process); use
+  `codex resume <thread id>` at the desk yourself (the thread id is in `~/.config/mcp-remote/launches.json`).
+- No way yet to interrupt only the running turn from the phone without ending the session (Stop, then Restart +
+  resume).
+- `codex queue --thread <id> --message <text>` and `codex app-server` exist in 0.164.0 and might allow
+  messaging a live interactive session later; not used (experimental, undocumented semantics).
+
 ## Sign-up, admin and alerts (Phase 4b)
 
 ### Who gets in (precedence)
@@ -793,6 +903,29 @@ Phase 4b (sign-up, Registry, admin, one-line install) adds these; `developers.cl
 - [ ] On a real deploy: `npm i -g https://<app>/dl/...tgz` installs on Linux and macOS (Node 22+), then
       `mcp-remote pair --code ...` pairs; the Admin page and its numbers load on an Android phone; an owner alert
       push arrives and opens Admin; a waitlisted Google account sees the waiting page and gets in after approval.
+
+Phase 5 (Codex) adds these. Everything about Codex was checked against codex-cli 0.164.0 without any login or
+credentials and with the network cut off (`unshare -n`), so no request ever reached OpenAI:
+
+- [ ] With a real login, a phone message to a Codex session runs a turn and Codex calls `send_message` (the
+      e2e uses `scripts/fake-codex.mjs`, which follows the documented event format); check `mcp-remote attach`
+      during a turn and that the reply arrives with the chosen urgency.
+- [ ] Codex really surfaces the `--json` events as in `codex-rs/exec/src/exec_events.rs` for a logged-in turn
+      (`item.completed` with `agent_message` / `mcp_tool_call` and `turn.completed`); the offline run matched
+      for `thread.started`, `turn.started`, `error`, error items.
+- [ ] The wording of a real authentication failure (expired login, wrong API key): `AUTH_RE` in
+      `mcp/src/codex.ts` assumes "401" / "Unauthorized" / "not logged in" etc.; without credentials 0.164.0 did
+      not fail fast offline (it kept reconnecting), so this was never seen. Also whether `codex login status`
+      reports an `OPENAI_API_KEY`-only setup as logged in (the daemon skips the check when such a key is set).
+- [ ] The MCP server Codex starts for a turn is a descendant of the `codex exec` process (the daemon refuses a
+      turn shim that is not below the tmux pane), i.e. `exec` does not hand MCP servers to the shared
+      background app-server daemon.
+- [ ] `exec resume --last` picks the folder's most recent conversation (help: "cwd filtering" unless `--all`),
+      and how it fails when there is none (the daemon guesses "no ... session/thread/conversation").
+- [ ] A shell command Codex runs inside `workspace-write` gets SIGHUP with the process group when you press
+      Stop (Codex may start commands in their own process group or sandbox; a survivor would keep running).
+- [ ] Which `CODEX_*` variables Codex sets for the commands it runs (the daemon strips `CODEX_THREAD_ID`,
+      `CODEX_SANDBOX*` etc. when started from inside Codex; list taken from binary strings).
 
 Also on the first `npx wrangler deploy` after Phase 3: it applies migration `v2` (new `Throttle` class);
 wrangler should say so. Phase 4 needs no migration (new tables are created by the Hub itself). Phase 4b applies

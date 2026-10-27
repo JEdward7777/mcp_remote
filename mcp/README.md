@@ -20,7 +20,13 @@ Remote launch (Phase 2, D6/D18):
 - `mcp-remote projects list | add <dir> [--name n] | add-root <dir> | remove <dir|name|id>` - the allowlist in
   `launch.json` (0600). The Hub/phone only ever see `{id, name}`; ids are hashes of the real path.
 - `mcp-remote config get | modes | set <key> <value> | unset <key>` - `permission-mode`, `claude-path`,
-  `extra-args`, `max-sessions`, `auto-restart`, `tmux-path`, `server-name`, `startup-timeout`.
+  `extra-args`, `max-sessions`, `auto-restart`, `tmux-path`, `server-name`, `startup-timeout`; Codex:
+  `agents`, `default-agent`, `codex-path`, `codex-mode` (read-only | workspace-write | danger-full-access | bypass),
+  `codex-extra-args` (allowlisted), `codex-skip-git-check`, `codex-turn-timeout`, `codex-final-message`.
+- `mcp-remote projects add <dir> --agent codex` - the project starts Codex unless the phone picks another agent.
+- `mcp-remote setup-codex [--force] [--dry-run] [--no-register]` - enable Codex launches; checks `codex` and
+  `codex login status`, backs up `config.toml` and runs `codex mcp add mcp-remote -- <node> <cli.js> shim`
+  (no-op when already registered).
 - `mcp-remote setup-claude [--scope user|local] [--force] [--dry-run]` - `claude mcp add mcp-remote --scope user -- <node> <cli.js> shim`.
 - `mcp-remote attach mr-<id>` - attach to a launched session (`tmux -L mcp-remote attach -t mr-<id>`).
 - `mcp-remote install-service [--dry-run] [--no-start]` / `uninstall-service` - systemd user unit / launchd agent.
@@ -36,6 +42,18 @@ it reads the screen with `capture-pane` to spot Claude Code's dialogs, and answe
 warning for its own server, matched by its exact full-screen layout. Re-adopted sessions are never read or typed
 into. State is kept in `launches.json` (including pending auto-restarts) so a restarted daemon re-adopts running
 sessions.
+
+Codex (Phase 5): a Codex launch has no long-running process. The daemon announces the session itself and runs
+each batch of phone messages as one turn: `tmux -L mcp-remote new-session ... -- node cli.js run-codex
+--status-file <run>/mr-<id>.exit --prompt-file <run>/mr-<id>.prompt -- codex exec [resume] --json [--last]
+[-c approval_policy="never"] [-c sandbox_mode=... | --dangerously-bypass-approvals-and-sandbox]
+-c mcp_servers.mcp-remote.{command,args,env_vars,enabled,startup_timeout_sec,tool_timeout_sec}=... [extra] -- [<thread>] -`.
+`run-codex` feeds the prompt file (0600, deleted once opened) to Codex's stdin, summarises the JSONL events in the
+pane, records exit status + thread id + final answer + auth/other errors in the status file, and pings the daemon
+(`turn_end` on the socket). The shim Codex starts gets `MCP_REMOTE_SESSION_ID`, `MCP_REMOTE_LAUNCH_TOKEN`,
+`MCP_REMOTE_SOCKET`, `MCP_REMOTE_CONFIG_DIR` and `MCP_REMOTE_AGENT=codex` through `env_vars`, registers as that
+turn's shim (`register.agent = "codex"`; refused when no turn of that session runs), declares no channel
+capability, and offers the same tools. The daemon acks a message when a turn takes it and reports failed turns.
 
 Env: `MCP_REMOTE_CONFIG_DIR`, `MCP_REMOTE_SOCKET`, `MCP_REMOTE_SESSION_ID`, `MCP_REMOTE_LAUNCH_TOKEN` (set by the
 daemon for launched sessions), `MCP_REMOTE_FATAL_EXIT_ZERO=1` (exit 0 instead of 3/4/5; used by the launchd agent), `MCP_REMOTE_ACTIVATE=1` (shim
