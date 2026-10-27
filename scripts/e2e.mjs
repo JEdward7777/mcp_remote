@@ -18,6 +18,7 @@ import { generateVapidKeys } from "../worker/scripts/vapid.mjs";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI = join(root, "mcp", "dist", "cli.js");
 const FAKE_CLAUDE = join(root, "scripts", "fake-claude.mjs");
+const FAKE_CODEX = join(root, "scripts", "fake-codex.mjs");
 const TMUX_SOCKET = `mr-e2e-${process.pid}`;
 const HAVE_TMUX = (() => {
   try {
@@ -429,7 +430,13 @@ async function main() {
     FAKE_CLAUDE_LOG: fakeLog,
     FAKE_CLAUDE_SHIM_CLI: CLI,
     CLAUDE_CONFIG_DIR: join(tmp, "claude-config"), // where the fake (and the daemon's check) keep transcripts
+    // Phase 5: the fake codex's state, its log, and Codex's config dir (setup-codex backs config.toml up).
+    FAKE_CODEX_HOME: join(tmp, "fake-codex-home"),
+    FAKE_CODEX_LOG: join(tmp, "fake-codex.log"),
+    CODEX_HOME: join(tmp, "codex-home"),
   };
+  delete daemonEnv.OPENAI_API_KEY;
+  delete daemonEnv.CODEX_API_KEY;
   const daemon = spawnLogged("daemon", process.execPath, [CLI, "daemon"], { env: daemonEnv });
   await waitFor(() => /connected to/.test(daemon.output), { timeout: 15_000, what: "daemon to connect" });
   const sockStat = statSync(join(machineDir, "daemon.sock"));
@@ -889,6 +896,132 @@ async function main() {
     check("once the fork was saved, Restart + resume reopens exactly it (--resume <fork id>)", idOf(f3, "--resume") === idOf(f2, "--session-id"), JSON.stringify(f3));
     await op({ t: "launch_stop", launch_id: fid }, "stop fork 3");
     await waitFor(() => launchOf(fid)?.state === "exited", { timeout: 15_000, what: "fork stopped 3" });
+
+    // --- Codex backend (Phase 5) ------------------------------------------------------------
+    logStep("codex: setup-codex (fake codex), a codex project, phone launch");
+    const codexLogFile = daemonEnv.FAKE_CODEX_LOG;
+    const codexEvents = () =>
+      existsSync(codexLogFile) ? readFileSync(codexLogFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+    const runCli = (name, args) => {
+      const p = spawnLogged(name, process.execPath, [CLI, ...args], { env: daemonEnv });
+      return waitFor(() => p.exitCode !== null && p, { what: name, timeout: 20_000 });
+    };
+    mkdirSync(daemonEnv.CODEX_HOME, { recursive: true });
+    writeFileSync(join(daemonEnv.CODEX_HOME, "config.toml"), 'model = "o3"\n');
+    await runCli("cfg-codex", ["config", "set", "codex-path", FAKE_CODEX]);
+    await runCli("cfg-mode", ["config", "set", "codex-mode", "workspace-write"]);
+    const badExtra = await runCli("cfg-bad", ["config", "set", "codex-extra-args", "-s", "danger-full-access"]);
+    check("codex-extra-args refuses a managed flag (-s)", badExtra.exitCode !== 0 && /not allowed/.test(badExtra.output), badExtra.output);
+    const dry = await runCli("setup-codex-dry", ["setup-codex", "--dry-run"]);
+    check("setup-codex --dry-run prints `codex mcp add` and changes nothing", dry.exitCode === 0 && /mcp add mcp-remote/.test(dry.output) && !existsSync(join(daemonEnv.FAKE_CODEX_HOME, "mcp.json")), dry.output);
+    const sc = await runCli("setup-codex", ["setup-codex"]);
+    const bak = (await import("node:fs")).readdirSync(daemonEnv.CODEX_HOME).filter((f) => f.startsWith("config.toml.bak-"));
+    check(
+      "setup-codex backs up config.toml, registers the shim with codex mcp add, enables Codex and reloads the daemon",
+      sc.exitCode === 0 && bak.length === 1 && /Registered the shim with Codex/.test(sc.output) && /daemon reloaded/.test(sc.output) &&
+        JSON.parse(readFileSync(join(daemonEnv.FAKE_CODEX_HOME, "mcp.json"), "utf8"))[0]?.transport?.args?.at(-1) === "shim",
+      sc.output,
+    );
+    const sc2 = await runCli("setup-codex-2", ["setup-codex"]);
+    check("setup-codex is idempotent (second run: nothing to change, no new backup)", sc2.exitCode === 0 && /nothing to change/.test(sc2.output) && /already enabled/.test(sc2.output), sc2.output);
+    const deltaDir = join(tmp, "codex-projects", "delta");
+    mkdirSync(join(deltaDir, ".git"), { recursive: true });
+    await runCli("add-delta", ["projects", "add", deltaDir, "--agent", "codex"]);
+    const delta = await waitFor(() => mstate()?.launch?.projects.find((p) => p.name === "delta"), { what: "delta advertised" });
+    check("phone sees the codex project with its agent and the computer's agents", delta.agent === "codex" && JSON.stringify(mstate().launch.agents) === '["claude","codex"]', JSON.stringify(mstate().launch));
+
+    const cRefused = await op({ t: "launch", project_id: "p000000000000000", continue: false, agent: "codex" }, "codex refusal");
+    check("codex launch of a non-allowlisted project id is refused", cRefused.ok === false && /allowlist/.test(cRefused.error ?? ""), JSON.stringify(cRefused));
+
+    const cs = await op({ t: "launch", project_id: delta.id, continue: false }, "codex launch");
+    const CL = await waitFor(() => cs.ok && mstate().launch.launches.find((l) => l.project_id === delta.id && l.state === "running"), { what: "codex running", timeout: 20_000 });
+    const cid = CL.launch_id;
+    const csess = await waitFor(() => sessionOf(pa, cid)?.online && sessionOf(pa, cid), { what: "codex session online" });
+    check("a Codex session is running and online on the phone with no process yet (agent codex)", CL.agent === "codex" && csess.project === "delta" && !tmuxHas(cid), JSON.stringify(CL));
+
+    logStep("codex: phone message -> codex exec turn -> send_message reaches the phone");
+    const hostileText = "-x --dangerously-bypass-approvals-and-sandbox $(touch pwned) `id` #(touch pwned2); it's";
+    pa.send({ t: "send", session_id: cid, text: hostileText });
+    const creply = await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.session_id === cid && f.message.direction === "out"), { what: "codex reply", timeout: 30_000 });
+    check("phone message -> Codex turn -> send_message reply on the phone", creply.message.text === `codex: ${hostileText}`, creply.message.text);
+    const t1 = codexEvents().filter((e) => e.event === "start");
+    check(
+      "the turn ran `codex exec --json ... -- -` in the project, prompt on stdin, never in argv; shim got its env through env_vars",
+      t1.length === 1 && t1[0].cwd === deltaDir && t1[0].argv.slice(0, 2).join(" ") === "exec --json" && t1[0].argv.at(-1) === "-" &&
+        !t1[0].argv.join(" ").includes("pwned") && t1[0].overrides["mcp_servers.mcp-remote.env_vars"]?.includes("MCP_REMOTE_LAUNCH_TOKEN") &&
+        t1[0].overrides.sandbox_mode === "workspace-write" && t1[0].codex_markers.length === 0,
+      JSON.stringify(t1[0]),
+    );
+    check("hostile message text ran nothing", !existsSync(join(deltaDir, "pwned")) && !existsSync(join(deltaDir, "pwned2")));
+    await waitFor(() => pa.frames.find((f) => f.t === "delivered" && f.session_id === cid), { what: "delivered tick", timeout: 10_000 });
+    check("the message is marked delivered once the turn took it", true);
+    await waitFor(() => !tmuxHas(cid), { what: "turn 1 tmux gone", timeout: 20_000 });
+    const thread1 = codexEvents().find((e) => e.event === "turn") && JSON.parse(readFileSync(join(daemonEnv.FAKE_CODEX_HOME, "threads.json"), "utf8"));
+    const threadId = Object.keys(thread1)[0];
+
+    logStep("codex: messages sent during a turn are queued and run as the next turn (resumed)");
+    pa.send({ t: "send", session_id: cid, text: "slow one" });
+    await waitFor(() => codexEvents().filter((e) => e.event === "turn").length === 2, { what: "slow turn started", timeout: 20_000 });
+    pa.send({ t: "send", session_id: cid, text: "two" });
+    pa.send({ t: "send", session_id: cid, text: "three" });
+    await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.text === "codex: two | three"), { what: "batched reply", timeout: 40_000 });
+    const turns = codexEvents().filter((e) => e.event === "turn");
+    const cstarts = codexEvents().filter((e) => e.event === "start");
+    check(
+      "one turn at a time: the queued messages ran together as the next turn, resuming the same thread",
+      turns.length === 3 && JSON.stringify(turns[2].texts) === '["two","three"]' && cstarts[2].argv[1] === "resume" && cstarts[2].argv.at(-2) === threadId &&
+        pa.frames.findIndex((f) => f.t === "message" && f.message.text === "codex: slow one") < pa.frames.findIndex((f) => f.t === "message" && f.message.text === "codex: two | three"),
+      JSON.stringify(turns.map((t) => t.texts)),
+    );
+
+    logStep("codex: final answer without send_message is forwarded; a failed turn is reported");
+    pa.send({ t: "send", session_id: cid, text: "final-only please" });
+    const fin = await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.session_id === cid && f.message.text === "final answer for: final-only please"), { what: "fallback final", timeout: 30_000 });
+    check("Codex's final answer reaches the phone when it never used send_message", !!fin && fin.message.urgency === "normal");
+    pa.send({ t: "send", session_id: cid, text: "fail now" });
+    const failMsg = await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.session_id === cid && /turn failed/.test(f.message.text)), { what: "fail note", timeout: 30_000 });
+    check("a failed turn is reported on the phone and the session stays online", /simulated failure/.test(failMsg.message.text) && launchOf(cid).state === "running" && sessionOf(pa, cid)?.online, failMsg.message.text);
+
+    logStep("codex: daemon restart during a turn; the turn's shim reconnects to the new daemon");
+    pa.send({ t: "send", session_id: cid, text: "slow across restart" });
+    await waitFor(() => codexEvents().filter((e) => e.event === "turn").length === 6 && tmuxHas(cid), { what: "slow turn 2", timeout: 20_000 });
+    liveDaemon.kill("SIGTERM");
+    await waitFor(() => liveDaemon.exitCode !== null || liveDaemon.signalCode !== null, { what: "daemon stopped" });
+    liveDaemon = spawnLogged("daemonC", process.execPath, [CLI, "daemon"], { env: daemonEnv });
+    const late = await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.text === "codex: slow across restart"), { what: "reply after daemon restart", timeout: 45_000 });
+    await waitFor(() => sessionOf(pa, cid)?.online && !tmuxHas(cid), { what: "codex online after restart", timeout: 20_000 });
+    check("a turn survives a daemon restart (re-adopted) and its reply reaches the phone", !!late && launchOf(cid).state === "running");
+
+    logStep("codex: stop mid-turn kills the turn's process group; Restart + resume continues the thread");
+    pa.send({ t: "send", session_id: cid, text: "hang forever" });
+    await waitFor(() => codexEvents().some((e) => e.event === "turn" && e.texts.at(-1) === "hang forever") && tmuxHas(cid), { what: "hanging turn", timeout: 20_000 });
+    const hangPid = codexEvents().filter((e) => e.event === "start").at(-1).pid;
+    const cstop = await op({ t: "launch_stop", launch_id: cid }, "codex stop");
+    await waitFor(() => launchOf(cid)?.state === "exited" && !sessionOf(pa, cid)?.online, { what: "codex stopped", timeout: 15_000 });
+    check(
+      "stop kills the running turn (SIGHUP via the process group), ends tmux, takes the session offline",
+      cstop.ok && !tmuxHas(cid) && launchOf(cid).detail === "stopped from the phone" && codexEvents().some((e) => e.event === "signal" && e.pid === hangPid),
+      JSON.stringify(launchOf(cid)),
+    );
+    const cr = await op({ t: "launch_restart", launch_id: cid, continue: true }, "codex restart");
+    await waitFor(() => launchOf(cid)?.state === "running" && sessionOf(pa, cid)?.online, { what: "codex running again", timeout: 15_000 });
+    pa.send({ t: "send", session_id: cid, text: "after restart" });
+    await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.text === "codex: after restart"), { what: "reply after restart", timeout: 30_000 });
+    check("Restart + resume continues the same Codex thread", cr.ok && codexEvents().filter((e) => e.event === "start").at(-1).argv.at(-2) === threadId);
+
+    logStep("codex: not logged in -> needs_attention with the fix");
+    writeFileSync(join(daemonEnv.FAKE_CODEX_HOME, "logged-out"), "");
+    pa.send({ t: "send", session_id: cid, text: "are you there" });
+    const authMsg = await waitFor(() => pa.frames.find((f) => f.t === "message" && f.message.session_id === cid && /codex login/.test(f.message.text)), { what: "auth note", timeout: 30_000 });
+    await waitFor(() => launchOf(cid)?.state === "needs_attention", { what: "needs_attention", timeout: 10_000 });
+    check("an authentication failure puts the session in needs_attention and tells the phone to run `codex login`", !!authMsg && /codex login/.test(launchOf(cid).detail ?? ""), JSON.stringify(launchOf(cid)));
+    await op({ t: "launch_stop", launch_id: cid }, "stop before login check");
+    const cr2 = await op({ t: "launch_restart", launch_id: cid, continue: true }, "restart logged out");
+    await waitFor(() => launchOf(cid)?.state === "needs_attention", { what: "login check at start", timeout: 15_000 });
+    check("a (re)start while Codex is logged out shows needs_attention right away (codex login status)", cr2.ok && /not logged in/.test(launchOf(cid).detail ?? ""), JSON.stringify(launchOf(cid)));
+    rmSync(join(daemonEnv.FAKE_CODEX_HOME, "logged-out"), { force: true });
+    await op({ t: "launch_stop", launch_id: cid }, "final codex stop");
+    await waitFor(() => launchOf(cid)?.state === "exited", { what: "final codex stop", timeout: 15_000 });
   }
 
   // --- Phase 4b: waitlist, invites, admin, one-line install, disabling an account ------------
