@@ -1,7 +1,7 @@
 # Phases
 
 ## To do
-- [ ] Phase 5: Codex backend (nice-to-have; awaiting go-ahead)
+- [ ] Phase 5 (in progress): Codex backend (user approved 2026-10-27)
 - [ ] Desk session: deploy + work through harness/SETUP.md "verify at the desk" checklist (needs the user)
 
 ## Completed
