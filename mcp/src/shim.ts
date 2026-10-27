@@ -23,6 +23,7 @@ import { LineConn } from "./ipc";
 import { log, setLogPrefix } from "./log";
 import { activation, ancestors, cmdlineOf } from "./proc";
 import { GetLocationArgs, INSTRUCTIONS, SERVER_NAME, SendArgs, TOOLS, formatLocation, mapLinkTool } from "./tools";
+import { CODEX_INSTRUCTIONS } from "./codex";
 
 export { INSTRUCTIONS, SERVER_NAME } from "./tools";
 
@@ -47,6 +48,9 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   // Set by the daemon for phone-launched sessions (it links this shim to the launch).
   const launchToken = process.env.MCP_REMOTE_LAUNCH_TOKEN?.slice(0, 64) || undefined;
   const act = activation(process.env, cmdlineOf(process.ppid));
+  // Started by Codex for one phone-driven turn (the daemon sets MCP_REMOTE_AGENT=codex and Codex forwards it):
+  // no channel capability (Codex has none; the daemon hands phone messages to Codex as the turn's prompt).
+  const codexTurn = process.env.MCP_REMOTE_AGENT === "codex" && !!launchToken;
   setLogPrefix(`mcp-remote shim ${project}/${sessionId.slice(0, 8)}`);
   const sockPath = opts.socket ?? socketPath();
 
@@ -55,13 +59,15 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   const server = new Server(
     { name: SERVER_NAME, version: "0.1.0" },
     act.active
-      ? {
-          capabilities: {
-            experimental: { "claude/channel": {} },
-            tools: {},
-          },
-          instructions: INSTRUCTIONS,
-        }
+      ? codexTurn
+        ? { capabilities: { tools: {} }, instructions: CODEX_INSTRUCTIONS }
+        : {
+            capabilities: {
+              experimental: { "claude/channel": {} },
+              tools: {},
+            },
+            instructions: INSTRUCTIONS,
+          }
       : { capabilities: { tools: {} } },
   );
 
@@ -159,6 +165,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
             hubReason = f.connected ? null : (f.reason ?? null);
             return;
           case "deliver":
+            if (codexTurn) return; // never sent to a turn shim; the daemon owns the session's inbound messages
             // Serialize so channel events keep the Hub's order.
             deliverChain = deliverChain.then(() => deliver(f.messages)).catch((e) => log("deliver failed:", e));
             return;
@@ -344,7 +351,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
   );
   // There is no reliable way for the server to tell whether Claude Code registered it as a
   // channel; without the flag, phone messages are dropped silently by Claude Code. Say so loudly.
-  if (act.active) log(
+  if (act.active && !codexTurn) log(
     `NOTE: phone messages only reach Claude if this session was started with ` +
       `\`claude --dangerously-load-development-channels server:<name of this server in .mcp.json>\` ` +
       `(e.g. server:${SERVER_NAME}). Without it, messages are handed to Claude Code and silently dropped.`,

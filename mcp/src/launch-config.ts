@@ -5,7 +5,8 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
-import { MAX_LAUNCHES_PER_MACHINE, MAX_PROJECTS_PER_MACHINE, type ProjectInfo } from "@mcp-remote/shared";
+import { AGENTS, Agent, MAX_LAUNCHES_PER_MACHINE, MAX_PROJECTS_PER_MACHINE, type ProjectInfo } from "@mcp-remote/shared";
+import { CodexFinal, CodexMode, codexExtraArgsIssues } from "./codex";
 import { configDir, ensureConfigDir } from "./config";
 
 /**
@@ -77,7 +78,12 @@ const ExtraArg = z
   .refine((a) => !a.endsWith(";"), "an argument may not end with ';' (tmux would read it as a command separator)")
   .refine((a) => !/[\0\n\r]/.test(a), "no control characters");
 
-export const ProjectEntry = z.object({ path: z.string().min(1).max(1024), name: z.string().min(1).max(128).optional() });
+export const ProjectEntry = z.object({
+  path: z.string().min(1).max(1024),
+  name: z.string().min(1).max(128).optional(),
+  /** Agent this project starts with (default: default_agent). */
+  agent: Agent.optional(),
+});
 
 export const LaunchConfig = z.object({
   /** Explicit project folders. */
@@ -114,6 +120,35 @@ export const LaunchConfig = z.object({
   server_name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).default("mcp-remote"),
   /** Seconds to wait for Claude Code to start the shim before reporting needs_attention. */
   startup_timeout_s: z.number().int().min(10).max(600).default(90),
+
+  // --- Codex (Phase 5) ---
+  /** Agents the phone may start on this computer. Codex is opt-in (`mcp-remote setup-codex`). */
+  agents: z
+    .array(Agent)
+    .min(1)
+    .max(AGENTS.length)
+    .default(["claude"])
+    .transform((a) => [...new Set(a)]),
+  /** Agent for projects without their own `agent` (roots' sub-folders, and projects added without --agent). */
+  default_agent: Agent.default("claude"),
+  /** Absolute path to the codex binary; null = look up `codex` on PATH. */
+  codex_path: z.string().min(1).max(1024).nullable().default(null),
+  /** Sandbox for Codex turns (D18); null = pass none (Codex's own config / default applies). */
+  codex_mode: CodexMode.nullable().default(null),
+  /** Extra flags for every Codex turn (allowlisted: -m/--model, -c (unmanaged keys), --enable, --disable, ...). */
+  codex_extra_args: z
+    .array(ExtraArg)
+    .max(32)
+    .default([])
+    .superRefine((args, ctx) => {
+      for (const message of codexExtraArgsIssues(args)) ctx.addIssue({ code: "custom", message });
+    }),
+  /** Pass --skip-git-repo-check (Codex refuses non-git folders without it). Off: Codex's check applies. */
+  codex_skip_git_repo_check: z.boolean().default(false),
+  /** A Codex turn running longer than this is stopped (seconds). */
+  codex_turn_timeout_s: z.number().int().min(60).max(86_400).default(3600),
+  /** Final answer of a turn in which Codex sent nothing: forward it to the phone (fallback) or drop it. */
+  codex_final_message: CodexFinal.default("fallback"),
 });
 export type LaunchConfig = z.infer<typeof LaunchConfig>;
 
@@ -166,6 +201,7 @@ export function projectIdFor(realPath: string): string {
 export interface ResolvedProject extends ProjectInfo {
   path: string;
   source: "explicit" | "root";
+  agent: Agent;
 }
 
 function realDir(p: string): string | null {
@@ -193,18 +229,18 @@ export function resolveProjects(cfg: LaunchConfig): ResolvedProject[] {
   const out: ResolvedProject[] = [];
   const seen = new Set<string>();
   const names = new Map<string, number>();
-  const add = (path: string, name: string, source: ResolvedProject["source"]) => {
+  const add = (path: string, name: string, source: ResolvedProject["source"], agent: Agent = cfg.default_agent) => {
     if (seen.has(path) || out.length >= MAX_PROJECTS_PER_MACHINE) return;
     seen.add(path);
     let n = name.slice(0, 120) || path;
     const k = names.get(n) ?? 0;
     names.set(n, k + 1);
     if (k > 0) n = `${n}-${k + 1}`;
-    out.push({ id: projectIdFor(path), name: n, path, source });
+    out.push({ id: projectIdFor(path), name: n, path, source, agent });
   };
   for (const p of cfg.projects) {
     const real = realDir(p.path);
-    if (real) add(real, p.name ?? basename(real), "explicit");
+    if (real) add(real, p.name ?? basename(real), "explicit", p.agent ?? cfg.default_agent);
   }
   for (const root of cfg.roots) {
     const realRoot = realDir(root);

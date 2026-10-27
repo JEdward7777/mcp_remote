@@ -13,6 +13,7 @@ import {
   type LocationResult,
   MAX_LOCATION_TIMEOUT_S,
   MAX_SESSIONS_PER_MACHINE,
+  MAX_TEXT_CHARS,
   PING_INTERVAL_MS,
   PONG_TIMEOUT_MS,
   PROTOCOL_VERSION,
@@ -21,6 +22,7 @@ import {
   ShimToDaemon,
   type DaemonToShim,
   type SessionAnnounce,
+  type Urgency,
   humanWait,
   parseFrame,
   parseRetryAfter,
@@ -57,9 +59,18 @@ interface ShimEntry {
 }
 
 interface PendingSend {
-  shim: LineConn<ShimToDaemon>;
+  /** null: a status message from the daemon itself (Codex sessions); the answer is only logged. */
+  shim: LineConn<ShimToDaemon> | null;
   shimReqId: string;
   timer: NodeJS.Timeout;
+}
+
+/** A Codex session the daemon announces itself (Phase 5), and the shim of its running turn, if any. */
+interface AgentSession {
+  session: SessionAnnounce;
+  refused: string | null;
+  turnShim: LineConn<ShimToDaemon> | null;
+  turnToken: string | undefined;
 }
 
 /** A get_location call waiting for the phone (kept across Hub reconnects: the answer is routed by machine). */
@@ -92,6 +103,8 @@ export interface DaemonOptions {
 
 export class Daemon {
   private readonly shims = new Map<string, ShimEntry>();
+  /** Active Codex launches by session id (kept in sync with the launcher). */
+  private readonly agentSessions = new Map<string, AgentSession>();
   private readonly pending = new Map<string, PendingSend>();
   private readonly locPending = new Map<string, PendingLocation>();
   private ws: WebSocket | null = null;
@@ -120,8 +133,15 @@ export class Daemon {
             loadConfig: loadLaunchConfig,
             // Launched shims must find this daemon whatever config dir they would otherwise use.
             extraEnv: { MCP_REMOTE_SOCKET: this.socket },
+            onAck: (session_id, ids) => {
+              for (let i = 0; i < ids.length; i += 500) this.toHub({ t: "ack", session_id, ids: ids.slice(i, i + 500) });
+            },
+            onNotify: (session_id, text, urgency) => this.daemonSend(session_id, text, urgency),
             ...(opts.launcher ?? {}),
-            onChange: (launches) => this.toHub({ t: "launches", launches }),
+            onChange: (launches) => {
+              this.syncAgentSessions();
+              this.toHub({ t: "launches", launches });
+            },
           });
   }
 
@@ -233,9 +253,37 @@ export class Daemon {
               "shim (a claude started inside a phone-launched session?)",
           );
         }
+        const agentSession = this.agentSessions.get(sid);
+        if (agentSession && f.launch_token && agentSession.turnShim && agentSession.turnToken === f.launch_token) {
+          // Same turn's token while its shim is connected: a nested codex/claude inherited the environment.
+          return refuse(
+            `session "${sid}" is already connected; this process inherited its MCP_REMOTE_SESSION_ID ` +
+              "and MCP_REMOTE_LAUNCH_TOKEN (an agent started inside a phone-launched session?)",
+          );
+        }
         const link = this.launcher?.shimRegister(sid, f.launch_token, f.ancestors) ?? "none";
         if (link === "reject") {
           return refuse(`session id "${sid}" belongs to a phone-launched session; only the shim that session starts can use it`);
+        }
+        if (link === "turn") {
+          // The shim of a running Codex turn: it can message the phone (send_message, get_location); the
+          // session itself is the daemon's (already announced), so nothing is announced or delivered here.
+          const a = this.agentSessions.get(sid);
+          if (!a) return refuse(`session "${sid}" is not active`);
+          if (a.turnShim) {
+            a.turnShim.send({ t: "register_refused", error: "superseded by a newer turn" } satisfies DaemonToShim);
+            a.turnShim.close();
+          }
+          a.turnShim = conn;
+          a.turnToken = f.launch_token;
+          sessionId = sid;
+          log(`turn shim up: ${a.session.project} (${sid})`);
+          conn.send({
+            t: "registered",
+            hub_connected: this.hubReady,
+            ...(!this.hubReady && this.offlineReason ? { reason: this.offlineReason } : {}),
+          } satisfies DaemonToShim);
+          return;
         }
         const existing = this.shims.get(sid);
         if (existing && link === "linked") {
@@ -249,7 +297,7 @@ export class Daemon {
               "(MCP_REMOTE_SESSION_ID?). Only one session can use an id at a time; give each project its own id or unset it",
           );
         }
-        if (this.shims.size >= MAX_SESSIONS_PER_MACHINE) {
+        if (this.shims.size + this.agentSessions.size >= MAX_SESSIONS_PER_MACHINE) {
           if (link === "linked") this.launcher?.shimDown(sid);
           return refuse(`too many live sessions on this computer (max ${MAX_SESSIONS_PER_MACHINE})`);
         }
@@ -262,6 +310,11 @@ export class Daemon {
           ...(!this.hubReady && this.offlineReason ? { reason: this.offlineReason } : {}),
         } satisfies DaemonToShim);
         this.toHub({ t: "session_up", session: f.session });
+        return;
+      }
+      if (f.t === "turn_end") {
+        this.launcher?.turnEnded(f.session_id, f.launch_token);
+        conn.close();
         return;
       }
       if (f.t === "reload") {
@@ -280,11 +333,12 @@ export class Daemon {
           } satisfies DaemonToShim);
           return;
         }
-        const refused = this.shims.get(sessionId)?.refused;
+        const refused = this.refusedFor(sessionId);
         if (refused) {
           conn.send({ t: "send_error", req_id: f.req_id, error: `the server refused this session: ${refused}` } satisfies DaemonToShim);
           return;
         }
+        this.launcher?.noteSend(sessionId);
         const hubReq = `r${++this.reqSeq}`;
         const timer = setTimeout(() => {
           if (this.pending.delete(hubReq)) {
@@ -296,6 +350,8 @@ export class Daemon {
         return;
       }
       if (f.t === "ack") {
+        // A turn shim never gets deliveries; only the daemon acknowledges a Codex session's messages.
+        if (this.agentSessions.get(sessionId)?.turnShim === conn) return;
         this.toHub({ t: "ack", session_id: sessionId, ids: f.ids });
         return;
       }
@@ -310,7 +366,7 @@ export class Daemon {
           fail(`the mcp-remote daemon is not connected to the server right now${this.offlineReason ? `: ${this.offlineReason}` : ""}`);
           return;
         }
-        const refused = this.shims.get(sessionId)?.refused;
+        const refused = this.refusedFor(sessionId);
         if (refused) {
           fail(`the server refused this session: ${refused}`);
           return;
@@ -342,6 +398,13 @@ export class Daemon {
           this.locPending.delete(k);
         }
       }
+      const a = sessionId ? this.agentSessions.get(sessionId) : undefined;
+      if (a && a.turnShim === conn) {
+        a.turnShim = null;
+        a.turnToken = undefined;
+        log(`turn shim down: ${sessionId}`);
+        this.launcher?.shimDown(sessionId!);
+      }
       if (sessionId && this.shims.get(sessionId)?.conn === conn) {
         const launched = this.shims.get(sessionId)?.launched;
         this.shims.delete(sessionId);
@@ -354,12 +417,54 @@ export class Daemon {
 
   private broadcastShims(frame: DaemonToShim): void {
     for (const s of this.shims.values()) s.conn.send(frame);
+    for (const a of this.agentSessions.values()) a.turnShim?.send(frame);
+  }
+
+  private refusedFor(sessionId: string): string | null {
+    return this.shims.get(sessionId)?.refused ?? this.agentSessions.get(sessionId)?.refused ?? null;
+  }
+
+  /** Announce / retire the daemon's own (Codex) sessions after every launcher change. */
+  private syncAgentSessions(): void {
+    const now = new Map((this.launcher?.agentSessions() ?? []).map((s) => [s.session_id, s]));
+    for (const [sid, a] of this.agentSessions) {
+      if (now.has(sid)) continue;
+      this.agentSessions.delete(sid);
+      a.turnShim?.close();
+      this.toHub({ t: "session_down", session_id: sid });
+    }
+    for (const [sid, session] of now) {
+      const a = this.agentSessions.get(sid);
+      if (a) {
+        a.session = session;
+        continue;
+      }
+      this.agentSessions.set(sid, { session, refused: null, turnShim: null, turnToken: undefined });
+      this.toHub({ t: "session_up", session });
+    }
+  }
+
+  /** A status message to the phone from the daemon itself (Codex sessions); best effort. */
+  private daemonSend(sessionId: string, text: string, urgency: Urgency): void {
+    if (!this.hubReady) {
+      log(`could not tell the phone (not connected): ${text.slice(0, 200)}`);
+      return;
+    }
+    const hubReq = `r${++this.reqSeq}`;
+    const timer = setTimeout(() => this.pending.delete(hubReq), SEND_TIMEOUT_MS);
+    this.pending.set(hubReq, { shim: null, shimReqId: "", timer });
+    this.toHub({ t: "send", req_id: hubReq, session_id: sessionId, text: text.slice(0, MAX_TEXT_CHARS), urgency });
   }
 
   /** Full session list; also clears refusals so they are retried (the Hub re-refuses if still taken). */
   private sendHello(): void {
     for (const s of this.shims.values()) s.refused = null;
-    this.toHub({ t: "hello", v: PROTOCOL_VERSION, sessions: [...this.shims.values()].map((s) => s.session) });
+    for (const a of this.agentSessions.values()) a.refused = null;
+    this.toHub({
+      t: "hello",
+      v: PROTOCOL_VERSION,
+      sessions: [...[...this.shims.values()].map((s) => s.session), ...[...this.agentSessions.values()].map((a) => a.session)].slice(0, MAX_SESSIONS_PER_MACHINE),
+    });
   }
 
   /** Re-read launch.json and re-advertise; returns an error text when launching is unavailable. */
@@ -374,7 +479,7 @@ export class Daemon {
   private sendLaunchInfo(): void {
     if (!this.launcher) return;
     const i = this.launcher.info();
-    this.toHub({ t: "projects", projects: i.projects, available: i.available, launch_error: i.launch_error, max_sessions: i.max_sessions });
+    this.toHub({ t: "projects", projects: i.projects, available: i.available, launch_error: i.launch_error, max_sessions: i.max_sessions, agents: i.agents });
     this.toHub({ t: "launches", launches: this.launcher.records() });
   }
 
@@ -382,7 +487,13 @@ export class Daemon {
     const l = this.launcher;
     let r: { ok: boolean; error?: string };
     if (!l) r = { ok: false, error: "remote launch is disabled on this computer" };
-    else if (f.t === "launch") r = await l.launch(f.project_id, { continue: f.continue, ...(f.auto_restart !== undefined ? { auto_restart: f.auto_restart } : {}) });
+    else if (f.t === "launch") {
+      r = await l.launch(f.project_id, {
+        continue: f.continue,
+        ...(f.auto_restart !== undefined ? { auto_restart: f.auto_restart } : {}),
+        ...(f.agent ? { agent: f.agent } : {}),
+      });
+    }
     else if (f.t === "launch_stop") r = await l.stop(f.launch_id);
     else if (f.t === "launch_restart") r = await l.restart(f.launch_id, f.continue);
     else r = await l.dismiss(f.launch_id);
@@ -516,6 +627,10 @@ export class Daemon {
           void this.onLaunchFrame(f);
           return;
         case "deliver": {
+          if (this.launcher?.isAgentSession(f.session_id)) {
+            this.launcher.deliver(f.session_id, f.messages);
+            return;
+          }
           const shim = this.shims.get(f.session_id);
           // If the shim is gone the Hub keeps the messages undelivered and resends on session_up.
           if (shim) shim.conn.send({ t: "deliver", messages: f.messages } satisfies DaemonToShim);
@@ -526,7 +641,7 @@ export class Daemon {
           if (!p) return;
           clearTimeout(p.timer);
           this.pending.delete(f.req_id);
-          p.shim.send({
+          p.shim?.send({
             t: "sent",
             req_id: p.shimReqId,
             message_id: f.message_id,
@@ -554,7 +669,8 @@ export class Daemon {
             if (p) {
               clearTimeout(p.timer);
               this.pending.delete(f.req_id);
-              p.shim.send({ t: "send_error", req_id: p.shimReqId, error: f.error } satisfies DaemonToShim);
+              if (p.shim) p.shim.send({ t: "send_error", req_id: p.shimReqId, error: f.error } satisfies DaemonToShim);
+              else log(`server refused a status message: ${f.error}`);
               return;
             }
           }
@@ -563,6 +679,8 @@ export class Daemon {
             // so it shows up in Claude Code's MCP logs. A later hello (reconnect/resync) retries.
             const entry = this.shims.get(f.session_id);
             if (entry) entry.refused = f.error;
+            const agent = this.agentSessions.get(f.session_id);
+            if (agent) agent.refused = f.error;
             entry?.conn.send({ t: "error", error: `server refused this session: ${f.error}` } satisfies DaemonToShim);
             log(`server refused session ${f.session_id}: ${f.error}`);
             return;
@@ -582,7 +700,7 @@ export class Daemon {
       for (const [k, p] of this.pending) {
         clearTimeout(p.timer);
         this.pending.delete(k);
-        p.shim.send({
+        p.shim?.send({
           t: "send_error",
           req_id: p.shimReqId,
           error: "connection to the server dropped; the message may not have been delivered",

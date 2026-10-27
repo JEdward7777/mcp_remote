@@ -80,7 +80,16 @@ export const LAUNCH_STATES = ["starting", "running", "needs_attention", "exited"
 export const LaunchState = z.enum(LAUNCH_STATES);
 export type LaunchState = z.infer<typeof LaunchState>;
 
-export const ProjectInfo = z.object({ id: ProjectId, name: Short(128) });
+/**
+ * Coding agent a phone-launched session runs (Phase 5): Claude Code (interactive, in tmux, phone messages
+ * as channel events) or OpenAI Codex (one `codex exec` turn per phone message batch, driven by the daemon).
+ */
+export const AGENTS = ["claude", "codex"] as const;
+export const Agent = z.enum(AGENTS);
+export type Agent = z.infer<typeof Agent>;
+
+/** `agent`: the agent this project starts with unless the phone picks another (absent = claude). */
+export const ProjectInfo = z.object({ id: ProjectId, name: Short(128), agent: Agent.optional() });
 export type ProjectInfo = z.infer<typeof ProjectInfo>;
 
 export const LaunchRecord = z.object({
@@ -99,6 +108,8 @@ export const LaunchRecord = z.object({
   restarts: z.number().int().nonnegative(),
   started_at: z.number().int(),
   updated_at: z.number().int(),
+  /** Which agent runs this session (absent in reports from older daemons = claude). */
+  agent: Agent.default("claude"),
 });
 export type LaunchRecord = z.infer<typeof LaunchRecord>;
 
@@ -110,6 +121,8 @@ export const LaunchInfo = z.object({
   available: z.boolean(),
   launch_error: z.string().max(MAX_DETAIL_CHARS).nullable(),
   max_sessions: z.number().int().nonnegative(),
+  /** Agents this computer can launch (absent from older daemons = claude only). */
+  agents: z.array(Agent).max(AGENTS.length).optional(),
 });
 export type LaunchInfo = z.infer<typeof LaunchInfo>;
 
@@ -297,6 +310,8 @@ export const PhoneToHub = z.discriminatedUnion("t", [
     project_id: ProjectId,
     continue: z.boolean(),
     auto_restart: z.boolean().optional(),
+    /** Agent to run (default: the project's agent); the daemon refuses agents it has not enabled. */
+    agent: Agent.optional(),
     client_id: ReqId,
   }),
   z.object({ t: z.literal("launch_stop"), machine_id: MachineId, launch_id: LaunchId, client_id: ReqId }),
@@ -393,6 +408,7 @@ export const DaemonToHub = z.discriminatedUnion("t", [
     available: z.boolean(),
     launch_error: z.string().max(MAX_DETAIL_CHARS).nullable(),
     max_sessions: z.number().int().nonnegative(),
+    agents: z.array(Agent).max(AGENTS.length).optional(),
   }),
   /** Full snapshot of launched sessions; sent after hello and on every change. */
   z.object({ t: z.literal("launches"), launches: z.array(LaunchRecord).max(MAX_LAUNCHES_PER_MACHINE) }),
@@ -426,6 +442,7 @@ export const HubToDaemon = z.discriminatedUnion("t", [
     project_id: ProjectId,
     continue: z.boolean(),
     auto_restart: z.boolean().optional(),
+    agent: Agent.optional(),
   }),
   z.object({ t: z.literal("launch_stop"), req_id: ReqId, launch_id: LaunchId }),
   z.object({ t: z.literal("launch_restart"), req_id: ReqId, launch_id: LaunchId, continue: z.boolean() }),
@@ -465,6 +482,12 @@ export const ShimToDaemon = z.discriminatedUnion("t", [
   }),
   /** From the local CLI (same user, 0600 socket): re-read launch.json after `mcp-remote projects/config ...`. */
   z.object({ t: z.literal("reload") }),
+  /**
+   * From `mcp-remote run-codex` (Phase 5): a Codex turn of this launch just ended and its status file is
+   * written, so the daemon looks now instead of at its next liveness check. Only a hint: the daemon reads
+   * the status file and checks its token itself.
+   */
+  z.object({ t: z.literal("turn_end"), session_id: SessionId, launch_token: z.string().min(1).max(64) }),
 ]);
 export type ShimToDaemon = z.infer<typeof ShimToDaemon>;
 

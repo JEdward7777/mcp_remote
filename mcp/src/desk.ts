@@ -1,9 +1,12 @@
 // Desk-side CLI commands for remote launch: projects, config, setup-claude, attach.
 import { execFileSync, spawnSync } from "node:child_process";
 import { createConnection } from "node:net";
-import { realpathSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DaemonToShim, LaunchId } from "@mcp-remote/shared";
+import { AGENTS, Agent, DaemonToShim, LaunchId } from "@mcp-remote/shared";
+import { CODEX_FINAL, CODEX_MODES, CODEX_MODE_HELP, CodexMode, codexExtraArgsIssues } from "./codex";
 import { socketPath } from "./config";
 import { LineConn } from "./ipc";
 import {
@@ -72,11 +75,18 @@ export function listProjects(): void {
   out(`  claude: ${cfg.claude_path ?? `${which("claude") ?? "NOT FOUND on PATH"} (from PATH)`}`);
   if (cfg.extra_args.length) out(`  extra args: ${JSON.stringify(cfg.extra_args)}`);
   out(`  max sessions: ${cfg.max_sessions}, auto-restart default: ${cfg.auto_restart ? "on" : "off"}`);
+  out(`  agents: ${cfg.agents.join(", ")} (default for new projects and root folders: ${cfg.default_agent})`);
+  if (cfg.agents.includes("codex")) {
+    out(`  codex: ${cfg.codex_path ?? `${which("codex") ?? "NOT FOUND on PATH"} (from PATH)`}, mode: ${cfg.codex_mode ?? "(not passed; Codex's own default)"}`);
+    if (cfg.codex_extra_args.length) out(`  codex extra args: ${JSON.stringify(cfg.codex_extra_args)}`);
+  }
   out(`roots (each sub-folder is launchable): ${cfg.roots.length ? "" : "none"}`);
   for (const r of cfg.roots) out(`  ${r}`);
   out(`projects the phone can start (${projects.length}):`);
   if (!projects.length) out("  none yet: mcp-remote projects add <dir>   or   mcp-remote projects add-root <dir>");
-  for (const p of projects) out(`  ${p.name.padEnd(24)} ${p.id}  ${p.path}${p.source === "root" ? "  [root]" : ""}${trustNote(p.path, trusted)}`);
+  for (const p of projects) {
+    out(`  ${p.name.padEnd(24)} ${p.id}  ${p.agent.padEnd(6)} ${p.path}${p.source === "root" ? "  [root]" : ""}${p.agent === "claude" ? trustNote(p.path, trusted) : ""}`);
+  }
   if (!which("tmux") && !cfg.tmux_path) out("warning: tmux is not installed; the phone cannot launch sessions until it is (tmux 3.2+).");
 }
 
@@ -85,7 +95,9 @@ export async function projectsCommand(args: string[]): Promise<void> {
   const cfg = loadLaunchConfig();
   const ni = rest.indexOf("--name");
   const name = ni >= 0 ? rest[ni + 1] : undefined;
-  const positional = rest.filter((a, i) => !a.startsWith("--") && !(ni >= 0 && i === ni + 1));
+  const ai = rest.indexOf("--agent");
+  const agentArg = ai >= 0 ? rest[ai + 1] : undefined;
+  const positional = rest.filter((a, i) => !a.startsWith("--") && !(ni >= 0 && i === ni + 1) && !(ai >= 0 && i === ai + 1));
   switch (sub) {
     case "list":
     case undefined:
@@ -93,10 +105,17 @@ export async function projectsCommand(args: string[]): Promise<void> {
       return;
     case "add": {
       const dir = positional[0];
-      if (!dir) throw new Error("usage: mcp-remote projects add <dir> [--name <name>]");
+      if (!dir) throw new Error("usage: mcp-remote projects add <dir> [--name <name>] [--agent claude|codex]");
+      let agent: Agent | undefined;
+      if (ai >= 0) {
+        const r = Agent.safeParse(agentArg);
+        if (!r.success) throw new Error(`--agent must be one of: ${AGENTS.join(", ")}`);
+        agent = r.data;
+        if (!cfg.agents.includes(agent)) out(`note: ${agent} is not enabled on this computer yet (${agent === "codex" ? "mcp-remote setup-codex" : "mcp-remote config set agents claude,codex"})`);
+      }
       const path = normalizeDir(dir);
       cfg.projects = cfg.projects.filter((p) => p.path !== path);
-      cfg.projects.push(name ? { path, name } : { path });
+      cfg.projects.push({ path, ...(name ? { name } : {}), ...(agent ? { agent } : {}) });
       save(cfg);
       const trusted = claudeTrustedDirs();
       const note = trustNote(path, trusted);
@@ -143,7 +162,24 @@ export async function projectsCommand(args: string[]): Promise<void> {
   }
 }
 
-const CONFIG_KEYS = ["permission-mode", "claude-path", "extra-args", "max-sessions", "auto-restart", "tmux-path", "server-name", "startup-timeout"] as const;
+const CONFIG_KEYS = [
+  "permission-mode",
+  "claude-path",
+  "extra-args",
+  "max-sessions",
+  "auto-restart",
+  "tmux-path",
+  "server-name",
+  "startup-timeout",
+  "agents",
+  "default-agent",
+  "codex-path",
+  "codex-mode",
+  "codex-extra-args",
+  "codex-skip-git-check",
+  "codex-turn-timeout",
+  "codex-final-message",
+] as const;
 
 export async function configCommand(args: string[]): Promise<void> {
   const [sub, key, ...vals] = args;
@@ -153,13 +189,16 @@ export async function configCommand(args: string[]): Promise<void> {
     return;
   }
   if (sub === "modes") {
+    out("Claude Code (permission-mode):");
     for (const m of PERMISSION_MODES) out(`  ${m.padEnd(18)} ${PERMISSION_MODE_HELP[m]}`);
+    out("Codex (codex-mode; approvals are always \"never\": nobody can answer a prompt from the phone):");
+    for (const m of CODEX_MODES) out(`  ${m.padEnd(18)} ${CODEX_MODE_HELP[m]}`);
     return;
   }
   if (sub !== "set" && sub !== "unset") throw new Error("usage: mcp-remote config get | modes | set <key> <value> | unset <key>");
   if (!key || !(CONFIG_KEYS as readonly string[]).includes(key)) throw new Error(`key must be one of: ${CONFIG_KEYS.join(", ")}`);
   const value = vals.join(" ");
-  if (sub === "set" && !value && key !== "extra-args") throw new Error(`missing value for ${key}`);
+  if (sub === "set" && !value && key !== "extra-args" && key !== "codex-extra-args") throw new Error(`missing value for ${key}`);
   const unset = sub === "unset";
   switch (key) {
     case "permission-mode": {
@@ -211,6 +250,61 @@ export async function configCommand(args: string[]): Promise<void> {
       break;
     case "startup-timeout":
       cfg.startup_timeout_s = unset ? 90 : Number(value);
+      break;
+    case "agents": {
+      if (unset) cfg.agents = ["claude"];
+      else {
+        const list = value.split(/[\s,]+/).filter(Boolean);
+        const bad = list.find((a) => !Agent.safeParse(a).success);
+        if (bad || !list.length) throw new Error(`agents: a comma-separated list of ${AGENTS.join(", ")}`);
+        cfg.agents = [...new Set(list as Agent[])];
+      }
+      break;
+    }
+    case "default-agent": {
+      if (unset) cfg.default_agent = "claude";
+      else {
+        const r = Agent.safeParse(value);
+        if (!r.success) throw new Error(`default-agent must be one of: ${AGENTS.join(", ")}`);
+        cfg.default_agent = r.data;
+      }
+      break;
+    }
+    case "codex-path":
+      if (unset) cfg.codex_path = null;
+      else {
+        const p = which(value);
+        if (!p) throw new Error(`${value} is not an executable file`);
+        cfg.codex_path = realpathSync(p);
+      }
+      break;
+    case "codex-mode": {
+      if (unset) cfg.codex_mode = null;
+      else {
+        const m = CodexMode.safeParse(value);
+        if (!m.success) throw new Error(`codex mode must be one of: ${CODEX_MODES.join(", ")} (see \`mcp-remote config modes\`)`);
+        cfg.codex_mode = m.data;
+        out(`${m.data}: ${CODEX_MODE_HELP[m.data]}`);
+      }
+      break;
+    }
+    case "codex-extra-args": {
+      const args = unset ? [] : vals;
+      const issues = codexExtraArgsIssues(args);
+      if (issues.length) throw new Error(issues[0]);
+      cfg.codex_extra_args = args;
+      break;
+    }
+    case "codex-skip-git-check":
+      if (!unset && !["on", "off", "true", "false"].includes(value)) throw new Error("codex-skip-git-check must be on or off");
+      cfg.codex_skip_git_repo_check = !unset && (value === "on" || value === "true");
+      break;
+    case "codex-turn-timeout":
+      cfg.codex_turn_timeout_s = unset ? 3600 : Number(value);
+      break;
+    case "codex-final-message":
+      if (!unset && !(CODEX_FINAL as readonly string[]).includes(value)) throw new Error(`codex-final-message must be one of: ${CODEX_FINAL.join(", ")}`);
+      cfg.codex_final_message = unset ? "fallback" : (value as (typeof CODEX_FINAL)[number]);
       break;
   }
   save(cfg);
@@ -276,4 +370,104 @@ export function attach(args: string[]): void {
   if (!tmux) throw new Error("tmux is not installed");
   const res = spawnSync(tmux, [...baseArgs({ bin: tmux, socket: cfg.tmux_socket }), "attach-session", "-t", `=${r.data}`], { stdio: "inherit" });
   if (res.status !== 0) process.exitCode = res.status ?? 1;
+}
+
+/** Codex's config file (it honours CODEX_HOME, default ~/.codex). */
+export function codexConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(env.CODEX_HOME || join(homedir(), ".codex"), "config.toml");
+}
+
+/** argv for `codex mcp add` (verified on 0.164.0: `codex mcp add <name> [--env K=V] -- <command>...`). */
+export function codexMcpAddArgs(o: { name: string; node: string; cli: string; env: Record<string, string> }): string[] {
+  const args = ["mcp", "add", o.name];
+  for (const [k, v] of Object.entries(o.env)) args.push("--env", `${k}=${v}`);
+  args.push("--", o.node, o.cli, "shim");
+  return args;
+}
+
+interface CodexServerEntry {
+  name: string;
+  transport?: { type?: string; command?: string; args?: string[]; env?: Record<string, string> | null };
+}
+
+/**
+ * `mcp-remote setup-codex [--force] [--dry-run] [--no-register]`: enable Codex launches on this computer.
+ *  - checks the codex binary and its login (offline: `codex login status`);
+ *  - registers the shim in Codex's config with `codex mcp add` (Codex writes its own TOML; the file is backed
+ *    up first; nothing happens when the same registration exists; a different one needs --force).
+ *    Optional for phone launches (the daemon passes the shim to every turn itself), but it shows up in
+ *    `codex mcp list` and keeps the name taken. In your own Codex sessions the shim stays dormant (no tools);
+ *  - adds "codex" to the agents the phone may start (launch.json).
+ */
+export async function setupCodex(args: string[]): Promise<void> {
+  const dry = args.includes("--dry-run");
+  const force = args.includes("--force");
+  const register = !args.includes("--no-register");
+  const cfg = loadLaunchConfig();
+  const codex = cfg.codex_path ?? which("codex");
+  if (!codex) throw new Error("codex not found on PATH (install it: npm i -g @openai/codex, or `mcp-remote config set codex-path <path>`)");
+  const run = (a: string[]) => spawnSync(codex, a, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 });
+  const ver = run(["--version"]);
+  out(`codex: ${codex} (${(ver.stdout || "").trim() || "version unknown"})`);
+  const login = run(["login", "status"]);
+  const loginText = `${login.stdout ?? ""}${login.stderr ?? ""}`.split("\n").filter((l) => l.trim() && !/^WARNING:/.test(l)).join(" ").trim();
+  if (login.status === 0) out(`login: ${loginText || "ok"}`);
+  else if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) out(`login: ${loginText || "not logged in"} (an API key is set in this shell; the daemon needs it too: service.env)`);
+  else out(`login: ${loginText || "not logged in"}. Run \`codex login\` before starting Codex sessions from the phone.`);
+
+  const env: Record<string, string> = {};
+  if (process.env.MCP_REMOTE_CONFIG_DIR) env.MCP_REMOTE_CONFIG_DIR = process.env.MCP_REMOTE_CONFIG_DIR;
+  const node = realpathSync(process.execPath);
+  const cli = realpathSync(fileURLToPath(import.meta.url));
+  const addArgs = codexMcpAddArgs({ name: cfg.server_name, node, cli, env });
+  if (register) {
+    const listed = run(["mcp", "list", "--json"]);
+    let existing: CodexServerEntry | undefined;
+    try {
+      existing = (JSON.parse(listed.stdout || "[]") as CodexServerEntry[]).find((x) => x.name === cfg.server_name);
+    } catch {
+      existing = undefined;
+    }
+    const same =
+      existing?.transport?.type === "stdio" &&
+      existing.transport.command === node &&
+      JSON.stringify(existing.transport.args ?? []) === JSON.stringify([cli, "shim"]) &&
+      JSON.stringify(existing.transport.env ?? {}) === JSON.stringify(env);
+    const file = codexConfigPath();
+    if (same) out(`Codex already has the shim registered as "${cfg.server_name}" (${file}); nothing to change.`);
+    else if (existing && !force) {
+      throw new Error(
+        `Codex already has an MCP server named "${cfg.server_name}" with a different command (${file}). ` +
+          "Re-run with --force to replace it (the file is backed up first), or pick another name: mcp-remote config set server-name <name>",
+      );
+    } else if (dry) {
+      if (existsSync(file)) out(`would back up ${file} to ${file}.bak-<time>`);
+      process.stdout.write(`${codex} ${addArgs.map((a) => (/[\s"'$]/.test(a) ? JSON.stringify(a) : a)).join(" ")}\n`);
+    } else {
+      if (existsSync(file)) {
+        const bak = `${file}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+        copyFileSync(file, bak);
+        if (process.platform !== "win32") chmodSync(bak, 0o600);
+        out(`backed up ${file} to ${bak}`);
+      }
+      const r = spawnSync(codex, addArgs, { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 30_000 });
+      if (r.status !== 0) throw new Error(`codex mcp add failed (exit ${r.status}): ${(r.stderr || r.stdout || "").trim().slice(0, 500)}`);
+      out(`Registered the shim with Codex as "${cfg.server_name}" (${file}). Your own Codex sessions keep it dormant (no tools).`);
+    }
+  }
+  if (cfg.agents.includes("codex")) out("Codex launches are already enabled on this computer.");
+  else if (dry) out(`would enable Codex launches (agents: ${[...cfg.agents, "codex"].join(", ")})`);
+  else {
+    cfg.agents = [...cfg.agents, "codex"];
+    save(cfg);
+    out("Enabled Codex launches: the phone's Start picker now offers Codex.");
+  }
+  if (!cfg.codex_mode) {
+    out(
+      "Pick how Codex may act when started from the phone (D18), e.g. `mcp-remote config set codex-mode workspace-write` " +
+        "(see `mcp-remote config modes`). Unset, mcp-remote passes no sandbox and Codex's own default / config.toml applies.",
+    );
+  }
+  out("Choose Codex per project with `mcp-remote projects add <dir> --agent codex`, or pick it in the phone's Start picker.");
+  if (!dry) await notifyDaemon();
 }

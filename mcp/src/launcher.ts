@@ -11,19 +11,36 @@
 //   - startup: capture-pane every second until the shim registers or startup_timeout_s passes, to spot
 //     dialogs (see dialogs.ts)
 //   - one `tmux list-panes` every LIVENESS_MS while any launch is active, to notice exits
+import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import {
+  type Agent,
   LaunchRecord,
   MAX_DETAIL_CHARS,
   MAX_LAUNCHES_PER_MACHINE,
+  MAX_TEXT_CHARS,
   type LaunchState,
+  type MessageRecord,
   type ProjectInfo,
+  type SessionAnnounce,
+  type Urgency,
   backoffDelay,
 } from "@mcp-remote/shared";
+import {
+  AUTH_RE,
+  type CodexExitRecord,
+  MAX_TURN_CHARS,
+  MAX_TURN_MESSAGES,
+  NOT_GIT_RE,
+  NO_ROLLOUT_RE,
+  UUID_RE,
+  codexArgv,
+  codexPrompt,
+} from "./codex";
 import { configDir, ensureConfigDir } from "./config";
 import { BACKGROUND_CONVERSATION, DEV_CHANNELS_KEYS, NO_CONVERSATION, attentionText, autoAcceptable, detectDialog, lastLine } from "./dialogs";
 import { type LaunchConfig, defaultLaunchConfig, findProject, resolveProjects } from "./launch-config";
@@ -60,6 +77,13 @@ const Entry = LaunchRecord.extend({
   fork_pending: z.boolean().default(false),
   /** claude_session came from forking the folder's conversation (not from a fresh start). */
   from_fork: z.boolean().default(false),
+  // --- Codex launches (agent "codex"): no long-running process; one tmux session per turn ---
+  /** Codex conversation (thread id from `thread.started`); the next turn resumes it. null: next turn starts one. */
+  codex_thread: z.string().regex(UUID_RE).nullable().default(null),
+  /** The next turn resumes the folder's most recent Codex conversation (`exec resume --last`). */
+  codex_last: z.boolean().default(false),
+  /** When the running turn started; null = no turn running (persisted so a restarted daemon re-adopts it). */
+  turn_at: z.number().int().nullable().default(null),
 });
 type Entry = z.infer<typeof Entry> & {
   linked?: boolean;
@@ -86,10 +110,34 @@ type Entry = z.infer<typeof Entry> & {
   forking?: boolean;
   /** A shim of the current spawn linked at some point (so it got past startup). Re-adopted: assumed. */
   spawnLinked?: boolean;
+  // Codex (in memory only: unacknowledged messages are redelivered by the Hub after a daemon restart)
+  /** Phone messages waiting for the next turn. */
+  queue?: MessageRecord[];
+  /** Message ids already handed to a turn (and acknowledged); a redelivery is just acknowledged again. */
+  handed?: number[];
+  /** send_message calls Codex made during the running turn (counted by the daemon). */
+  turnSends?: number;
+  /** The running turn exceeded codex_turn_timeout_s and was stopped. */
+  timedOut?: boolean;
 };
 const StateFile = z.object({ v: z.literal(1), launches: z.array(Entry).max(MAX_LAUNCHES_PER_MACHINE) });
 
 export type OpResult = { ok: true; launch_id?: string } | { ok: false; error: string };
+
+/** `codex login status`: null = fine (or unknown), else why Codex can't run. Injected by tests. */
+export type CodexLoginCheck = (bin: string, cwd: string) => Promise<string | null>;
+
+/** Real check: offline, reads Codex's stored credentials ("Not logged in", exit 1, verified on 0.164.0). */
+export const codexLoginStatus: CodexLoginCheck = (bin, cwd) =>
+  new Promise((resolve) => {
+    // An API key in the environment works without a stored login; don't second-guess it.
+    if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY) return resolve(null);
+    execFile(bin, ["login", "status"], { cwd, timeout: 15_000, env: sanitizedEnv(), windowsHide: true }, (err, stdout, stderr) => {
+      const out = `${String(stdout)}\n${String(stderr)}`;
+      if (err && /not logged in/i.test(out)) resolve("Codex is not logged in on this computer: run `codex login` at the desk");
+      else resolve(null);
+    });
+  });
 
 export interface LauncherOptions {
   loadConfig: () => LaunchConfig;
@@ -115,6 +163,11 @@ export interface LauncherOptions {
   keyRetryMs?: number;
   /** Claude Code's config dir (default $CLAUDE_CONFIG_DIR or ~/.claude); tests point it elsewhere. */
   claudeConfigDir?: string;
+  /** Codex launches: acknowledge phone messages handed to a turn (the Hub stops redelivering them). */
+  onAck?: (sessionId: string, ids: number[]) => void;
+  /** Codex launches: a status message from the daemon to the phone (turn failed, not logged in, ...). */
+  onNotify?: (sessionId: string, text: string, urgency: Urgency) => void;
+  codexLoginCheck?: CodexLoginCheck;
 }
 
 function newId(): string {
@@ -155,6 +208,15 @@ export const NESTED_SESSION_VARS = [
   "CLAUDE_CODE_HOST_SESSION_ID",
   "CLAUDE_CODE_HOST_WORKTREE",
   "CLAUDE_CODE_HOST_WORKTREE_FENCE",
+  // Markers Codex sets for the commands it runs (codex-cli 0.164.0 binary strings), in case the daemon was
+  // started from inside a Codex session. Auth (OPENAI_API_KEY, CODEX_API_KEY, CODEX_HOME) is passed through.
+  "CODEX_THREAD_ID",
+  "CODEX_TOOL_CALL_ID",
+  "CODEX_SANDBOX",
+  "CODEX_SANDBOX_NETWORK_DISABLED",
+  "CODEX_PERMISSION_PROFILE",
+  "CODEX_NON_INTERACTIVE",
+  "CODEX_STARTING_DIFF",
 ];
 
 /** Environment for the tmux server (and so for launched sessions). */
@@ -162,7 +224,7 @@ export function sanitizedEnv(src: NodeJS.ProcessEnv = process.env): NodeJS.Proce
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(src)) {
     if (NESTED_SESSION_VARS.includes(k)) continue;
-    if (k === "MCP_REMOTE_SESSION_ID" || k === "MCP_REMOTE_LAUNCH_TOKEN" || k === "MCP_REMOTE_PROJECT_ID") continue;
+    if (k === "MCP_REMOTE_SESSION_ID" || k === "MCP_REMOTE_LAUNCH_TOKEN" || k === "MCP_REMOTE_PROJECT_ID" || k === "MCP_REMOTE_AGENT") continue;
     if (k === "TMUX" || k === "TMUX_PANE") continue;
     env[k] = v;
   }
@@ -197,8 +259,14 @@ export class Launcher {
   // -------------------------------------------------------------------------
   // Public surface
 
-  info(): { projects: ProjectInfo[]; available: boolean; launch_error: string | null; max_sessions: number } {
-    return { projects: this.projects, available: this.available, launch_error: this.launchError, max_sessions: this.cfg.max_sessions };
+  info(): { projects: ProjectInfo[]; available: boolean; launch_error: string | null; max_sessions: number; agents: Agent[] } {
+    return {
+      projects: this.projects,
+      available: this.available,
+      launch_error: this.launchError,
+      max_sessions: this.cfg.max_sessions,
+      agents: [...this.cfg.agents],
+    };
   }
 
   records(): LaunchRecord[] {
@@ -227,7 +295,7 @@ export class Launcher {
       configError = e instanceof Error ? e.message : String(e);
       log(`launch config: ${configError}`);
     }
-    this.projects = resolveProjects(this.cfg).map((p) => ({ id: p.id, name: p.name }));
+    this.projects = resolveProjects(this.cfg).map((p) => ({ id: p.id, name: p.name, agent: p.agent }));
     const platform = this.o.platform ?? process.platform;
     if (this.o.tmux) this.tmux = this.o.tmux;
     else if (platform === "win32") this.tmux = null;
@@ -263,12 +331,26 @@ export class Launcher {
     clearInterval(this.livenessTimer);
   }
 
-  async launch(projectId: string, opts: { continue: boolean; auto_restart?: boolean }): Promise<OpResult> {
+  async launch(projectId: string, opts: { continue: boolean; auto_restart?: boolean; agent?: Agent }): Promise<OpResult> {
     if (!this.available || !this.tmux) return { ok: false, error: this.launchError ?? "remote launch is not available" };
     await this.reload();
     if (!this.available) return { ok: false, error: this.launchError ?? "remote launch is not available" };
     const project = findProject(this.cfg, projectId);
     if (!project) return { ok: false, error: "unknown project: it is not in this computer's allowlist (mcp-remote projects list)" };
+    const agent = opts.agent ?? project.agent;
+    if (!this.cfg.agents.includes(agent)) {
+      return {
+        ok: false,
+        error:
+          agent === "codex"
+            ? "Codex is not enabled on this computer (at the desk: mcp-remote setup-codex)"
+            : "Claude Code is not enabled on this computer (mcp-remote config set agents claude,codex)",
+      };
+    }
+    if (agent === "codex" && opts.continue && this.entries.some((x) => x.agent === "codex" && x.project_id === project.id && ACTIVE.includes(x.state))) {
+      // `exec resume --last` would pick the conversation the running launch is using.
+      return { ok: false, error: "another Codex session is running in this folder; resuming the folder's last conversation would share it. Start a new conversation, or use Restart + resume on that session" };
+    }
     if (this.activeCount() >= this.cfg.max_sessions) {
       return { ok: false, error: `this computer already runs ${this.activeCount()} launched sessions (max ${this.cfg.max_sessions})` };
     }
@@ -290,10 +372,12 @@ export class Launcher {
       exit_code: null,
       detail: null,
       continued: opts.continue,
-      auto_restart: opts.auto_restart ?? this.cfg.auto_restart,
+      // A Codex turn failing is not the session crashing: there is no process to restart between turns.
+      auto_restart: agent === "codex" ? false : (opts.auto_restart ?? this.cfg.auto_restart),
       restarts: 0,
       started_at: now,
       updated_at: now,
+      agent,
       token: newToken(),
       path: project.path,
       spawned_at: now,
@@ -303,6 +387,9 @@ export class Launcher {
       shim_parent: null,
       fork_pending: false,
       from_fork: false,
+      codex_thread: null,
+      codex_last: false,
+      turn_at: null,
     };
     this.entries.push(e);
     e.busy = true;
@@ -332,6 +419,7 @@ export class Launcher {
       e.busy = false;
     }
     this.removeExitFile(e);
+    if (e.agent === "codex") this.resetCodexTurn(e, true);
     this.set(e, { state: "exited", exit_code: null, detail: "stopped from the phone" });
     return { ok: true };
   }
@@ -345,6 +433,9 @@ export class Launcher {
     if (!this.available) return { ok: false, error: this.launchError ?? "remote launch is not available" };
     const project = findProject(this.cfg, e.project_id);
     if (!project) return { ok: false, error: "this project is no longer in the computer's allowlist" };
+    if (!this.cfg.agents.includes(e.agent)) {
+      return { ok: false, error: `${e.agent === "codex" ? "Codex" : "Claude Code"} is no longer enabled on this computer` };
+    }
     if (!ACTIVE.includes(e.state) && this.activeCount() >= this.cfg.max_sessions) {
       return { ok: false, error: `this computer already runs ${this.activeCount()} launched sessions (max ${this.cfg.max_sessions})` };
     }
@@ -357,6 +448,7 @@ export class Launcher {
     e.busy = true;
     try {
       if (ACTIVE.includes(e.state)) await this.killAndWait(e);
+      if (e.agent === "codex") this.resetCodexTurn(e, false);
       e.path = project.path;
       e.project = project.name;
       e.continued = cont;
@@ -383,10 +475,19 @@ export class Launcher {
    * A shim registered with the daemon. "linked": it is the current spawn of a launch; "reject": it claims a
    * launch's session id without the current token; "none": not a launched session.
    */
-  shimRegister(sessionId: string, token: string | undefined, ancestors?: number[]): "linked" | "reject" | "none" {
+  shimRegister(sessionId: string, token: string | undefined, ancestors?: number[]): "linked" | "turn" | "reject" | "none" {
     const e = this.get(sessionId);
     if (!e) return "none";
     if (!token || token !== e.token) return "reject";
+    if (e.agent === "codex") {
+      // The shim Codex started for the running turn: it may message the phone; the session itself is
+      // announced by the daemon and its inbound messages go to turns, never to the shim.
+      if (e.turn_at === null || !ACTIVE.includes(e.state)) return "reject";
+      if (!e.shim_parent && ancestors?.[0]) e.shim_parent = ancestors[0];
+      e.lastRefusal = undefined;
+      e.linked = true;
+      return "turn";
+    }
     if (!e.shim_parent && ancestors?.[0]) e.shim_parent = ancestors[0];
     e.lastRefusal = undefined;
     e.linked = true;
@@ -542,6 +643,7 @@ export class Launcher {
   }
 
   private async spawn(e: Entry): Promise<void> {
+    if (e.agent === "codex") return this.startCodex(e);
     const tmux = this.tmux!;
     // Count as active right away, so concurrent launch/restart requests see it against max_sessions.
     e.state = "starting";
@@ -613,6 +715,7 @@ export class Launcher {
 
   private startStartup(e: Entry): void {
     this.clearStartup(e);
+    if (e.agent === "codex") return; // no interactive startup: nothing is ever read from or typed into it
     const tickMs = this.o.tickMs ?? 1000;
     const tick = async () => {
       this.startupTimers.delete(e.launch_id);
@@ -702,7 +805,8 @@ export class Launcher {
   }
 
   private ensureLiveness(): void {
-    const need = !this.disposed && this.entries.some((e) => ACTIVE.includes(e.state));
+    // An idle Codex session has no process to watch; only its running turns do.
+    const need = !this.disposed && this.entries.some((e) => ACTIVE.includes(e.state) && (e.agent !== "codex" || e.turn_at !== null));
     if (need && !this.livenessTimer) {
       this.livenessTimer = setInterval(() => void this.checkAll(), this.o.livenessMs ?? 15_000);
       this.livenessTimer.unref?.();
@@ -732,6 +836,10 @@ export class Launcher {
       }
       for (const e of this.entries) {
         if (!ACTIVE.includes(e.state) || e.busy) continue;
+        if (e.agent === "codex") {
+          await this.checkTurn(e, panes);
+          continue;
+        }
         const p = panes.find((x) => x.name === e.launch_id);
         if (p && !p.dead) {
           if (e.state === "running" && !e.linked && !e.detail) {
@@ -857,6 +965,291 @@ export class Launcher {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Codex launches (Phase 5). The session is the daemon's own (announced to the Hub while the launch is
+  // active); each batch of phone messages runs as one `codex exec` turn in the launch's tmux session.
+
+  /** Sessions the daemon announces itself: active Codex launches (they have no long-running shim). */
+  agentSessions(): SessionAnnounce[] {
+    return this.entries
+      .filter((e) => e.agent === "codex" && ACTIVE.includes(e.state))
+      .map((e) => ({ session_id: e.session_id, project: e.project.slice(0, 128), cwd: e.path.slice(0, 1024) }));
+  }
+
+  isAgentSession(sessionId: string): boolean {
+    const e = this.get(sessionId);
+    return !!e && e.agent === "codex" && ACTIVE.includes(e.state);
+  }
+
+  /** Phone messages for a Codex session: queued, then handed to the next turn (one turn at a time). */
+  deliver(sessionId: string, messages: MessageRecord[]): void {
+    const e = this.get(sessionId);
+    if (!e || e.agent !== "codex" || !ACTIVE.includes(e.state)) return;
+    e.queue ??= [];
+    e.handed ??= [];
+    const again: number[] = [];
+    for (const m of messages) {
+      if (m.direction !== "in" || m.session_id !== sessionId) continue;
+      if (e.handed.includes(m.id)) again.push(m.id); // already in a turn; the ack was lost
+      else if (!e.queue.some((q) => q.id === m.id)) e.queue.push(m);
+    }
+    if (again.length) this.o.onAck?.(sessionId, again);
+    e.queue.sort((a, b) => a.id - b.id);
+    void this.maybeStartTurn(e);
+  }
+
+  /** run-codex says the turn ended (a hint; the status file and its token are checked by checkTurn). */
+  turnEnded(sessionId: string, token: string): void {
+    const e = this.get(sessionId);
+    if (!e || e.agent !== "codex" || token !== e.token) return;
+    setTimeout(() => void this.checkAll(), 20).unref?.();
+  }
+
+  /** The running turn's shim sent a message to the phone. */
+  noteSend(sessionId: string): void {
+    const e = this.get(sessionId);
+    if (e?.agent === "codex" && e.turn_at !== null) e.turnSends = (e.turnSends ?? 0) + 1;
+  }
+
+  private promptFile(e: Entry): string {
+    return join(this.o.runDir ?? join(configDir(), "run"), `${e.launch_id}.prompt`);
+  }
+
+  /** A (re)started Codex session: no process yet; the first phone message starts the first turn. */
+  private async startCodex(e: Entry): Promise<void> {
+    e.state = "starting";
+    e.fresh = false;
+    e.linked = false;
+    e.restart_at = null;
+    e.stopping = false;
+    e.spawned_at = Date.now();
+    if (!e.continued) {
+      e.codex_thread = null;
+      e.codex_last = false;
+    } else if (!e.codex_thread) {
+      e.codex_last = true; // "resume": the folder's most recent Codex conversation
+    }
+    const bin = this.codexBin();
+    if (!bin) {
+      this.set(e, { state: "failed", exit_code: null, detail: "the codex command was not found on the daemon's PATH (mcp-remote config set codex-path /path/to/codex)" });
+      return;
+    }
+    if (!this.o.wrapper) {
+      this.set(e, { state: "failed", exit_code: null, detail: "Codex sessions need the daemon's run-codex wrapper" });
+      return;
+    }
+    const login = await (this.o.codexLoginCheck ?? codexLoginStatus)(bin, e.path).catch(() => null);
+    log(`started Codex session ${e.launch_id} for ${e.project}${e.codex_thread ? ` (resumes ${e.codex_thread})` : e.codex_last ? " (resumes the folder's last conversation)" : ""}`);
+    this.set(e, {
+      state: login ? "needs_attention" : "running",
+      exit_code: null,
+      ever_running: true,
+      detail: login ?? (e.continued && !e.codex_thread ? "resumes this folder's most recent Codex conversation with your first message" : null),
+    });
+    void this.maybeStartTurn(e);
+  }
+
+  private codexBin(): string | null {
+    return this.cfg.codex_path ?? which("codex");
+  }
+
+  /** Forget the running turn (after it was killed) and, when the session ends, the queue. */
+  private resetCodexTurn(e: Entry, dropQueue: boolean): void {
+    e.turn_at = null;
+    e.turnSends = 0;
+    e.timedOut = false;
+    e.linked = false;
+    try {
+      rmSync(this.promptFile(e), { force: true });
+    } catch {
+      /* ignore */
+    }
+    // Unacknowledged messages stay undelivered in the Hub, which resends them when the session is back.
+    if (dropQueue) e.queue = [];
+  }
+
+  private async maybeStartTurn(e: Entry): Promise<void> {
+    if (this.disposed || e.busy || e.stopping || e.turn_at !== null || !ACTIVE.includes(e.state) || !e.queue?.length) return;
+    if (!this.tmux || !this.available) return;
+    e.busy = true;
+    try {
+      await this.startTurn(e);
+    } finally {
+      e.busy = false;
+    }
+  }
+
+  /**
+   * Tell the phone about a problem with a turn. Every turn is the answer to messages the user sent, so each
+   * failed one is reported (a normal message: the user is waiting for a reply), and kept in the detail.
+   */
+  private codexProblem(e: Entry, text: string, attention: boolean): void {
+    this.o.onNotify?.(e.session_id, `[mcp-remote] ${text}`, "normal");
+    this.set(e, { ...(attention ? { state: "needs_attention" as const } : {}), detail: text });
+  }
+
+  private async startTurn(e: Entry): Promise<void> {
+    const tmux = this.tmux!;
+    const queue = e.queue ?? [];
+    const batch: MessageRecord[] = [];
+    let chars = 0;
+    while (queue.length && batch.length < MAX_TURN_MESSAGES) {
+      const m = queue[0]!;
+      if (batch.length && chars + m.text.length > MAX_TURN_CHARS) break;
+      batch.push(queue.shift()!);
+      chars += Math.min(m.text.length, MAX_TEXT_CHARS);
+    }
+    const putBack = () => {
+      e.queue = [...batch, ...(e.queue ?? [])];
+    };
+    const bin = this.codexBin();
+    if (!bin || !this.o.wrapper) {
+      putBack();
+      this.codexProblem(e, "the codex command was not found on the daemon's PATH (mcp-remote config set codex-path /path/to/codex); your message is kept for the next try", true);
+      return;
+    }
+    const resume = e.codex_thread ?? (e.codex_last ? "last" : null);
+    let codex: string[];
+    try {
+      codex = codexArgv({
+        bin,
+        mode: this.cfg.codex_mode,
+        extraArgs: this.cfg.codex_extra_args,
+        resume,
+        skipGitRepoCheck: this.cfg.codex_skip_git_repo_check,
+        serverName: this.cfg.server_name,
+        shim: this.o.wrapper,
+      });
+    } catch (err) {
+      putBack();
+      this.codexProblem(e, `cannot start Codex: ${err instanceof Error ? err.message : String(err)}`, true);
+      return;
+    }
+    e.token = newToken();
+    e.shim_parent = null;
+    e.lastRefusal = undefined;
+    e.turnSends = 0;
+    e.timedOut = false;
+    const status = this.statusFile(e);
+    const prompt = this.promptFile(e);
+    try {
+      mkdirSync(join(status, ".."), { recursive: true, mode: 0o700 });
+      rmSync(status, { force: true });
+      rmSync(prompt, { force: true });
+      // The only place message text goes: a 0600 file run-codex reads (and deletes) as Codex's stdin.
+      writeFileSync(prompt, codexPrompt(batch, resume === null), { mode: 0o600, flag: "wx" });
+    } catch (err) {
+      putBack();
+      this.codexProblem(e, `cannot write the turn's prompt file: ${err instanceof Error ? err.message : String(err)}`, true);
+      return;
+    }
+    const argv = [...this.o.wrapper, "run-codex", "--status-file", status, "--prompt-file", prompt, "--server-name", this.cfg.server_name, "--", ...codex];
+    const env: Record<string, string> = {
+      ...(this.o.extraEnv ?? {}),
+      MCP_REMOTE_SESSION_ID: e.session_id,
+      MCP_REMOTE_LAUNCH_TOKEN: e.token,
+      MCP_REMOTE_PROJECT_ID: e.project_id,
+      MCP_REMOTE_AGENT: "codex",
+      MCP_REMOTE_CONFIG_DIR: configDir(),
+    };
+    if (process.env.PATH) env.PATH = process.env.PATH;
+    await tmux.kill(e.launch_id).catch(() => {});
+    try {
+      await tmux.spawn({ name: e.launch_id, cwd: e.path, env, argv });
+    } catch (err) {
+      rmSync(prompt, { force: true });
+      putBack();
+      const msg = String((err as { stderr?: string }).stderr || (err instanceof Error ? err.message : err)).trim();
+      this.codexProblem(e, `tmux could not start the Codex turn: ${msg}`, true);
+      return;
+    }
+    e.panePid = (await tmux.list().catch(() => [])).find((x) => x.name === e.launch_id)?.pid ?? null;
+    e.handed = [...(e.handed ?? []), ...batch.map((m) => m.id)].slice(-2000);
+    this.o.onAck?.(e.session_id, batch.map((m) => m.id));
+    log(`${e.launch_id}: Codex turn with ${batch.length} message(s)${resume ? ` (resume ${resume})` : " (new conversation)"}`);
+    this.set(e, { turn_at: Date.now() });
+  }
+
+  /** One liveness look at a Codex launch: is its turn over (or over time)? */
+  private async checkTurn(e: Entry, panes: PaneInfo[]): Promise<void> {
+    if (e.turn_at === null) return;
+    const p = panes.find((x) => x.name === e.launch_id);
+    const rec = this.peekCodexRecord(e);
+    if (!rec && p && !p.dead) {
+      if (!e.timedOut && Date.now() - e.turn_at > this.cfg.codex_turn_timeout_s * 1000) {
+        e.timedOut = true;
+        log(`${e.launch_id}: Codex turn exceeded ${this.cfg.codex_turn_timeout_s}s; stopping it`);
+        await this.tmux?.kill(e.launch_id).catch(() => {});
+      }
+      return;
+    }
+    const screen = p ? await this.tmux!.capture(e.launch_id, 60).catch(() => "") : "";
+    this.removeExitFile(e);
+    await this.tmux!.kill(e.launch_id).catch(() => {});
+    this.onTurnExit(e, rec, p ? (p.status ?? deadStatus(screen)) : null, screen);
+  }
+
+  /** run-codex's record for the current turn (token checked), without removing it. */
+  private peekCodexRecord(e: Entry): CodexExitRecord | null {
+    try {
+      const r = JSON.parse(readFileSync(this.statusFile(e), "utf8")) as CodexExitRecord;
+      return r.token === e.token && r.codex ? r : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private onTurnExit(e: Entry, rec: CodexExitRecord | null, paneStatus: number | null, screen: string): void {
+    const sum = rec?.codex;
+    const code = rec ? exitCodeOf(rec) : paneStatus;
+    const sends = e.turnSends ?? 0;
+    const timedOut = !!e.timedOut;
+    e.turn_at = null;
+    e.linked = false;
+    e.timedOut = false;
+    e.turnSends = 0;
+    if (sum?.thread_id) {
+      e.codex_thread = sum.thread_id;
+      e.codex_last = false;
+    }
+    const tail = `${sum?.error ?? ""}\n${sum?.stderr_tail ?? ""}\n${screen}`;
+    const lastErr = clip(lastLine((sum?.error ?? sum?.stderr_tail ?? screen).split("\n").filter((l) => !/^Pane is dead|^\[mcp-remote\]/.test(l.trim())).join("\n")) ?? null);
+    log(`${e.launch_id}: Codex turn ended${code !== null ? ` with code ${code}` : ""}${sum?.completed ? " (completed)" : ""}`);
+    if (code === 0 && sum?.completed && !timedOut) {
+      if (sends === 0 && sum.final?.trim() && this.cfg.codex_final_message === "fallback") {
+        // Codex answered in its final message instead of using send_message: the user would see nothing.
+        this.o.onNotify?.(e.session_id, `${sum.final}`.slice(0, MAX_TEXT_CHARS), "normal");
+      }
+      this.set(e, { state: "running", exit_code: null, detail: null });
+    } else if (timedOut) {
+      this.codexProblem(e, `the Codex turn ran longer than ${Math.round(this.cfg.codex_turn_timeout_s / 60)} min and was stopped`, false);
+    } else if (sum?.auth || (!sum?.completed && AUTH_RE.test(tail))) {
+      this.codexProblem(e, `Codex could not authenticate (${lastErr ?? "not logged in"}). Run \`codex login\` at the desk, then send your message again`, true);
+    } else if (NO_ROLLOUT_RE.test(tail)) {
+      const was = e.codex_thread;
+      e.codex_thread = null;
+      e.codex_last = false;
+      this.codexProblem(e, `Codex could not find its earlier conversation${was ? ` (${was})` : ""}; send your message again to start a new one`, false);
+    } else if (NOT_GIT_RE.test(tail)) {
+      this.codexProblem(
+        e,
+        "Codex refuses to run in a folder that is not a git repository. At the desk: `git init` it, or allow it with `mcp-remote config set codex-skip-git-check on`",
+        true,
+      );
+    } else if (e.codex_last && !sum?.thread_id && /no (?:recorded )?(?:session|thread|conversation)/i.test(tail)) {
+      e.codex_last = false;
+      this.codexProblem(e, "No earlier Codex conversation in this folder to resume; send your message again to start a new one", false);
+    } else {
+      e.exit_code = code;
+      this.codexProblem(
+        e,
+        `the Codex turn failed${code !== null ? ` (exit ${code})` : ""}${lastErr ? `: ${lastErr}` : ""}. Your message may not have been handled`,
+        false,
+      );
+    }
+    void this.maybeStartTurn(e);
+  }
+
   private async readopt(): Promise<void> {
     const tmux = this.tmux!;
     let panes;
@@ -869,6 +1262,15 @@ export class Launcher {
     for (const e of this.entries) {
       if (!ACTIVE.includes(e.state)) continue;
       const p = panes.find((x) => x.name === e.launch_id);
+      if (e.agent === "codex") {
+        // The session itself survives a daemon restart (it is just state); a turn that was running is
+        // re-adopted if its tmux session is still there, else its recorded result is processed.
+        e.fresh = false;
+        log(`re-adopting Codex session ${e.launch_id} (${e.project})${e.turn_at !== null ? " with a running turn" : ""}`);
+        if (e.turn_at !== null && p && !p.dead) e.panePid = p.pid;
+        else if (e.turn_at !== null) await this.checkTurn(e, panes);
+        continue;
+      }
       if (!p) {
         this.set(e, { state: "exited", exit_code: this.takeExit(e), detail: "ended while the mcp-remote daemon was not running" });
         continue;
@@ -893,6 +1295,11 @@ export class Launcher {
     for (const p of panes) {
       if (!/^mr-[0-9a-f]{12}$/.test(p.name) || this.get(p.name) || p.dead) continue;
       const env = await tmux.showEnv(p.name);
+      if (env.MCP_REMOTE_AGENT === "codex") {
+        // A Codex turn whose session state is gone: its conversation id is unknown, so it can't be resumed.
+        log(`leaving orphan Codex turn ${p.name} alone (its session state is lost)`);
+        continue;
+      }
       const project = env.MCP_REMOTE_PROJECT_ID ? findProject(this.cfg, env.MCP_REMOTE_PROJECT_ID) : undefined;
       if (env.MCP_REMOTE_SESSION_ID !== p.name || !env.MCP_REMOTE_LAUNCH_TOKEN || !project) {
         log(`leaving unknown tmux session ${p.name} alone`);
@@ -923,6 +1330,10 @@ export class Launcher {
         shim_parent: null,
         fork_pending: false,
         from_fork: false,
+        agent: "claude",
+        codex_thread: null,
+        codex_last: false,
+        turn_at: null,
         fresh: false,
         spawnLinked: true,
         panePid: p.pid,

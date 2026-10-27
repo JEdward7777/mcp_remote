@@ -2,7 +2,7 @@
 // Runs Claude Code in the foreground of the tmux pane and records how it ended, because tmux 3.4 sometimes
 // never records a dead pane's exit status (reproduced: the pty closing and the process exiting at the same
 // moment leaves #{pane_dead_status} empty for good). argv only, no shell.
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { constants } from "node:os";
 import { renameSync, writeFileSync } from "node:fs";
 
@@ -37,12 +37,28 @@ export function runClaude(args: string[]): void {
     }
   };
   const child = spawn(cmd[0], cmd.slice(1), { stdio: "inherit" });
-  // `tmux kill-session` signals the pane's process (this wrapper), not the whole group. Pass the signal on
-  // to our process group (we are its leader: tmux starts the pane with setsid), so claude gets it even when
-  // it sits behind a non-exec wrapper (Volta, npm's cli-wrapper, a shell script). We receive our own copy
-  // too and ignore it; stay alive until claude has exited so its status is recorded.
-  // Keyboard SIGINT/SIGQUIT (Ctrl-C, Ctrl-\ when not in raw mode) already reach the whole foreground group
-  // from the terminal: just survive them, don't forward (that would deliver them twice).
+  forwardGroupSignals(child);
+  child.on("error", (e) => {
+    record({ code: 127, signal: null, error: e.message });
+    process.stderr.write(`mcp-remote: cannot run ${cmd[0]}: ${e.message}\n`);
+    process.exit(127);
+  });
+  child.on("exit", (code, signal) => {
+    const r = { code, signal };
+    record(r);
+    process.exit(exitCodeOf({ token, ...r }) ?? 1);
+  });
+}
+
+/**
+ * `tmux kill-session` signals the pane's process (this wrapper), not the whole group. Pass the signal on
+ * to our process group (we are its leader: tmux starts the pane with setsid), so the agent gets it even when
+ * it sits behind a non-exec wrapper (Volta, npm's cli-wrapper, a shell script). We receive our own copy
+ * too and ignore it; stay alive until the child has exited so its status is recorded.
+ * Keyboard SIGINT/SIGQUIT (Ctrl-C, Ctrl-\ when not in raw mode) already reach the whole foreground group
+ * from the terminal: just survive them, don't forward (that would deliver them twice).
+ */
+export function forwardGroupSignals(child: ChildProcess): void {
   for (const sig of ["SIGINT", "SIGQUIT"] as const) process.on(sig, () => {});
   const echoes: Record<string, number> = {};
   for (const sig of ["SIGHUP", "SIGTERM"] as const) {
@@ -66,14 +82,4 @@ export function runClaude(args: string[]): void {
       }
     });
   }
-  child.on("error", (e) => {
-    record({ code: 127, signal: null, error: e.message });
-    process.stderr.write(`mcp-remote: cannot run ${cmd[0]}: ${e.message}\n`);
-    process.exit(127);
-  });
-  child.on("exit", (code, signal) => {
-    const r = { code, signal };
-    record(r);
-    process.exit(exitCodeOf({ token, ...r }) ?? 1);
-  });
 }

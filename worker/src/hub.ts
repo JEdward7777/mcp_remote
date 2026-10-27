@@ -1526,7 +1526,14 @@ export class Hub extends DurableObject<Env> {
         const req_id = f.client_id;
         const out: HubToDaemon =
           f.t === "launch"
-            ? { t: "launch", req_id, project_id: f.project_id, continue: f.continue, ...(f.auto_restart !== undefined ? { auto_restart: f.auto_restart } : {}) }
+            ? {
+                t: "launch",
+                req_id,
+                project_id: f.project_id,
+                continue: f.continue,
+                ...(f.auto_restart !== undefined ? { auto_restart: f.auto_restart } : {}),
+                ...(f.agent ? { agent: f.agent } : {}),
+              }
             : f.t === "launch_restart"
               ? { t: "launch_restart", req_id, launch_id: f.launch_id, continue: f.continue }
               : { t: f.t, req_id, launch_id: f.launch_id };
@@ -1666,7 +1673,13 @@ export class Hub extends DurableObject<Env> {
         return;
       }
       case "projects": {
-        const caps = { projects: f.projects, available: f.available, launch_error: f.launch_error, max_sessions: f.max_sessions };
+        const caps = {
+          projects: f.projects,
+          available: f.available,
+          launch_error: f.launch_error,
+          max_sessions: f.max_sessions,
+          ...(f.agents ? { agents: f.agents } : {}),
+        };
         // Sent on every reconnect; only a real change costs a state broadcast.
         const w = this.sql.exec(
           "UPDATE machines SET launch_caps = ?1 WHERE machine_id = ?2 AND launch_caps IS NOT ?1",

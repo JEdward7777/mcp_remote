@@ -1,7 +1,8 @@
-// mcp-remote CLI: pair | daemon | shim | projects | config | setup-claude | attach | install-service | uninstall-service
+// mcp-remote CLI: pair | daemon | shim | projects | config | setup-claude | setup-codex | attach | install-service | uninstall-service
 import { Daemon, EXIT_CONFIG } from "./daemon";
 import { configPath, loadConfig, loadServiceEnv, serviceEnvPath } from "./config";
-import { attach, configCommand, projectsCommand, setupClaude } from "./desk";
+import { attach, configCommand, projectsCommand, setupClaude, setupCodex } from "./desk";
+import { runCodex } from "./codex";
 import { installService, uninstallService } from "./service";
 import { runClaude } from "./run-claude";
 import { realpathSync } from "node:fs";
@@ -18,15 +19,22 @@ const USAGE = `usage:
 
   remote launch (start Claude Code sessions from the phone, in tmux):
   mcp-remote projects list                              show launch settings and launchable projects
-  mcp-remote projects add <dir> [--name <name>]         allow the phone to start sessions in <dir>
+  mcp-remote projects add <dir> [--name <name>] [--agent claude|codex]
+                                                        allow the phone to start sessions in <dir>
   mcp-remote projects add-root <dir>                    allow every sub-folder of <dir> (one level)
   mcp-remote projects remove <dir|name|id>
   mcp-remote config get | modes                         show launch settings / permission modes
   mcp-remote config set <key> <value> | unset <key>     keys: permission-mode, claude-path, extra-args,
                                                         max-sessions, auto-restart, tmux-path,
-                                                        server-name, startup-timeout
+                                                        server-name, startup-timeout, agents,
+                                                        default-agent, codex-path, codex-mode,
+                                                        codex-extra-args, codex-skip-git-check,
+                                                        codex-turn-timeout, codex-final-message
   mcp-remote setup-claude [--scope user|local] [--force] [--dry-run]
                                                         register the shim with Claude Code (claude mcp add)
+  mcp-remote setup-codex [--force] [--dry-run] [--no-register]
+                                                        enable Codex sessions from the phone (and register
+                                                        the shim with Codex: codex mcp add)
   mcp-remote attach <mr-id>                             open a phone-launched session's terminal
   mcp-remote install-service [--dry-run] [--no-start]   run the daemon as a user service (systemd/launchd)
   mcp-remote uninstall-service
@@ -99,6 +107,13 @@ async function main(argv: string[]): Promise<void> {
       return;
     case "run-claude":
       runClaude(rest);
+      return;
+    case "run-codex":
+      runCodex(rest);
+      return;
+    case "setup-codex":
+      setLogPrefix("mcp-remote");
+      await setupCodex(rest);
       return;
     case "attach":
       attach(rest);
