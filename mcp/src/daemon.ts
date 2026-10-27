@@ -59,10 +59,12 @@ interface ShimEntry {
 }
 
 interface PendingSend {
-  /** null: a status message from the daemon itself (Codex sessions); the answer is only logged. */
+  /** null: a status message from the daemon itself (Codex sessions, see outbox). */
   shim: LineConn<ShimToDaemon> | null;
   shimReqId: string;
   timer: NodeJS.Timeout;
+  /** The launcher's outbox item this send carries (daemon status messages). */
+  outbox?: { sessionId: string; id: string };
 }
 
 /** A Codex session the daemon announces itself (Phase 5), and the shim of its running turn, if any. */
@@ -136,7 +138,7 @@ export class Daemon {
             onAck: (session_id, ids) => {
               for (let i = 0; i < ids.length; i += 500) this.toHub({ t: "ack", session_id, ids: ids.slice(i, i + 500) });
             },
-            onNotify: (session_id, text, urgency) => this.daemonSend(session_id, text, urgency),
+            onNotify: (session_id, item) => this.daemonSend(session_id, item),
             ...(opts.launcher ?? {}),
             onChange: (launches) => {
               this.syncAgentSessions();
@@ -249,8 +251,8 @@ export class Daemon {
           // Right token, wrong process (see Launcher.isOwnShim): not from this session's tmux pane, or a
           // claude started inside the session while its own shim is away (e.g. right after a daemon restart).
           return refuse(
-            `session "${sid}" belongs to the Claude Code in its tmux pane; this process is not that Claude Code's ` +
-              "shim (a claude started inside a phone-launched session?)",
+            `session "${sid}" belongs to the agent in its tmux pane; this process is not that agent's ` +
+              "shim (an agent started inside a phone-launched session?)",
           );
         }
         const agentSession = this.agentSessions.get(sid);
@@ -447,16 +449,24 @@ export class Daemon {
     }
   }
 
-  /** A status message to the phone from the daemon itself (Codex sessions); best effort. */
-  private daemonSend(sessionId: string, text: string, urgency: Urgency): void {
-    if (!this.hubReady) {
-      log(`could not tell the phone (not connected): ${text.slice(0, 200)}`);
-      return;
-    }
+  /**
+   * A status message to the phone from the daemon itself (Codex sessions). false = not connected: the launcher
+   * keeps it (persisted) and it is sent after the next hello. Its outbox entry goes when the Hub answered.
+   */
+  private daemonSend(sessionId: string, item: { id: string; text: string; urgency: Urgency }): boolean {
+    if (!this.hubReady) return false;
     const hubReq = `r${++this.reqSeq}`;
-    const timer = setTimeout(() => this.pending.delete(hubReq), SEND_TIMEOUT_MS);
-    this.pending.set(hubReq, { shim: null, shimReqId: "", timer });
-    this.toHub({ t: "send", req_id: hubReq, session_id: sessionId, text: text.slice(0, MAX_TEXT_CHARS), urgency });
+    const timer = setTimeout(() => {
+      if (this.pending.delete(hubReq)) this.launcher?.outboxRetry(item.id);
+    }, SEND_TIMEOUT_MS);
+    this.pending.set(hubReq, { shim: null, shimReqId: "", timer, outbox: { sessionId, id: item.id } });
+    this.toHub({ t: "send", req_id: hubReq, session_id: sessionId, text: item.text.slice(0, MAX_TEXT_CHARS), urgency: item.urgency });
+    return true;
+  }
+
+  /** After hello: status messages that could not be sent before (daemon was offline, or restarted). */
+  private flushOutboxes(): void {
+    for (const sid of this.launcher?.outboxSessions() ?? []) this.launcher!.flushOutbox(sid);
   }
 
   /** Full session list; also clears refusals so they are retried (the Hub re-refuses if still taken). */
@@ -475,6 +485,7 @@ export class Daemon {
     if (!this.launcher) return "remote launch is disabled in this daemon";
     await this.launcher.reload();
     this.sendLaunchInfo();
+    this.launcher.retryQueued();
     const i = this.launcher.info();
     return i.available ? null : i.launch_error;
   }
@@ -586,6 +597,7 @@ export class Daemon {
       log(`connected to ${this.opts.config.url}`);
       this.sendHello();
       this.sendLaunchInfo();
+      this.flushOutboxes();
       this.broadcastShims({ t: "hub_status", connected: true });
       // Half-open detection: the Hub's auto-response answers "ping" without waking the Durable
       // Object; if not even that comes back in time, the connection is dead (e.g. NAT dropped it).
@@ -644,6 +656,7 @@ export class Daemon {
           if (!p) return;
           clearTimeout(p.timer);
           this.pending.delete(f.req_id);
+          if (p.outbox) this.launcher?.outboxDone(p.outbox.sessionId, p.outbox.id);
           p.shim?.send({
             t: "sent",
             req_id: p.shimReqId,
@@ -673,7 +686,12 @@ export class Daemon {
               clearTimeout(p.timer);
               this.pending.delete(f.req_id);
               if (p.shim) p.shim.send({ t: "send_error", req_id: p.shimReqId, error: f.error } satisfies DaemonToShim);
-              else log(`server refused a status message: ${f.error}`);
+              else if (p.outbox) {
+                log(`server refused a status message: ${f.error}`);
+                // Rate limited / budget: try again after the next hello; anything else won't get better.
+                if (f.retry_after_s !== undefined) this.launcher?.outboxRetry(p.outbox.id);
+                else this.launcher?.outboxDone(p.outbox.sessionId, p.outbox.id);
+              }
               return;
             }
           }
@@ -703,6 +721,7 @@ export class Daemon {
       for (const [k, p] of this.pending) {
         clearTimeout(p.timer);
         this.pending.delete(k);
+        if (p.outbox) this.launcher?.outboxRetry(p.outbox.id);
         p.shim?.send({
           t: "send_error",
           req_id: p.shimReqId,

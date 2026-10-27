@@ -177,6 +177,11 @@ export function codexArgv(o: CodexArgvOptions): string[] {
     `${srv}.startup_timeout_sec=30`,
     "-c",
     `${srv}.tool_timeout_sec=${SHIM_TOOL_TIMEOUT_S}`,
+    // exec mode cancels MCP tool calls that would need interactive approval ("MCP tool call cancelled:
+    // interactive approval is unavailable in exec mode", 0.164.0 binary); our three tools are pre-approved.
+    // Values auto|prompt|writes|approve (0.164.0 rejects anything else when parsing -c).
+    "-c",
+    `${srv}.default_tools_approval_mode=${tomlString("approve")}`,
   );
   argv.push(...o.extraArgs);
   // `--` ends the options: nothing after it is read as a flag (the thread id is a validated UUID anyway).

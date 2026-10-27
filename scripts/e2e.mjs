@@ -992,6 +992,28 @@ async function main() {
     await waitFor(() => sessionOf(pa, cid)?.online && !tmuxHas(cid), { what: "codex online after restart", timeout: 20_000 });
     check("a turn survives a daemon restart (re-adopted) and its reply reaches the phone", !!late && launchOf(cid).state === "running");
 
+    logStep("codex: a turn that ends while the daemon is stopped; its answer is sent after the daemon is back (outbox)");
+    pa.send({ t: "send", session_id: cid, text: "slow while the daemon is down" });
+    await waitFor(() => codexEvents().some((e) => e.event === "turn" && e.texts.at(-1) === "slow while the daemon is down") && tmuxHas(cid), { what: "slow turn 3", timeout: 20_000 });
+    liveDaemon.kill("SIGTERM");
+    await waitFor(() => liveDaemon.exitCode !== null || liveDaemon.signalCode !== null, { what: "daemon stopped (outbox)" });
+    // The shim's send_message fails (no daemon), so Codex ends the turn with a final answer, recorded by run-codex.
+    await waitFor(() => existsSync(join(machineDir, "run", `${cid}.exit`)), { what: "turn ended while the daemon was down", timeout: 30_000 });
+    check(
+      "with the daemon down, the turn's send_message failed and the turn ended",
+      codexEvents().some((e) => e.event === "send_result" && e.ok === false) && !pa.frames.some((f) => f.t === "message" && /slow while the daemon is down/.test(f.message.text) && f.message.direction === "out"),
+    );
+    liveDaemon = spawnLogged("daemonO", process.execPath, [CLI, "daemon"], { env: daemonEnv });
+    const outboxed = await waitFor(
+      () => pa.frames.find((f) => f.t === "message" && f.message.session_id === cid && f.message.text === "codex (final): slow while the daemon is down"),
+      { what: "outbox message after the daemon restart", timeout: 45_000 },
+    );
+    await waitFor(() => sessionOf(pa, cid)?.online && !tmuxHas(cid), { what: "codex online again (outbox)", timeout: 20_000 });
+    check("the answer of a turn that ended while the daemon was stopped reaches the phone after the restart (persisted outbox)", !!outboxed);
+    const st = JSON.parse(readFileSync(join(machineDir, "launches.json"), "utf8"));
+    await waitFor(() => JSON.parse(readFileSync(join(machineDir, "launches.json"), "utf8")).launches.find((l) => l.launch_id === cid)?.outbox.length === 0, { what: "outbox emptied", timeout: 10_000 });
+    check("the outbox is emptied once the Hub confirmed the message", !!st);
+
     logStep("codex: stop mid-turn kills the turn's process group; Restart + resume continues the thread");
     pa.send({ t: "send", session_id: cid, text: "hang forever" });
     await waitFor(() => codexEvents().some((e) => e.event === "turn" && e.texts.at(-1) === "hang forever") && tmuxHas(cid), { what: "hanging turn", timeout: 20_000 });

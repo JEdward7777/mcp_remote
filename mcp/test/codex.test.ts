@@ -42,6 +42,8 @@ describe("codexArgv", () => {
     expect(a).toContain('mcp_servers.mcp-remote.args=["/opt/mcp remote/cli.js", "shim"]');
     expect(a).toContain(`mcp_servers.mcp-remote.env_vars=[${SHIM_ENV_VARS.map((v) => `"${v}"`).join(", ")}]`);
     expect(a.some((x) => /tool_timeout_sec=\d+/.test(x))).toBe(true);
+    // exec mode would cancel tool calls needing approval: our tools are pre-approved (review round 1).
+    expect(a).toContain('mcp_servers.mcp-remote.default_tools_approval_mode="approve"');
     // Every -c value is its own argv element right after "-c".
     for (let i = 0; i < a.length; i++) if (a[i]!.startsWith("mcp_servers.")) expect(a[i - 1]).toBe("-c");
   });

@@ -261,6 +261,15 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
     return null;
   }
 
+  /**
+   * A tool call can come right after the client started us (a Codex turn's first send_message) or while the
+   * daemon restarts: give the daemon link a few seconds to come up before reporting it unreachable.
+   */
+  async function linkSettled(ms = 5000): Promise<void> {
+    const end = Date.now() + ms;
+    while (act.active && !stopping && !registered && !registerRefused && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
+  }
+
   function sendToPhone(text: string, urgency: Urgency): Promise<SendResult> {
     const why = unreachable();
     if (why) return Promise.resolve({ ok: false, error: why });
@@ -308,6 +317,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
     if (name === "get_location") {
       const a = GetLocationArgs.safeParse(req.params.arguments ?? {});
       if (!a.success) return err(`invalid arguments: ${a.error.issues.map((i) => i.message).join("; ")}`);
+      await linkSettled();
       const { result, via } = await askLocation(a.data.reason, a.data.max_age_s, a.data.timeout_s);
       const text = formatLocation(result, Date.now(), { via, timeoutS: a.data.timeout_s });
       // Transport problems are errors; the user's choices (declined, turned off, no answer) are answers.
@@ -316,6 +326,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
     if (name !== "send_message") return err(`unknown tool: ${name}`);
     const args = SendArgs.safeParse(req.params.arguments ?? {});
     if (!args.success) return err(`invalid arguments: ${args.error.issues.map((i) => i.message).join("; ")}`);
+    await linkSettled();
     const r = await sendToPhone(args.data.text, args.data.urgency);
     if (!r.ok) return err(`Message NOT sent: ${r.error}`);
     return {

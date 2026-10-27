@@ -30,6 +30,8 @@ let notes: { sid: string; text: string; urgency: Urgency }[];
 let launchers: Launcher[];
 let loginProblem: string | null;
 let changes: number;
+let connected: boolean;
+let sentItems: { sid: string; id: string }[];
 
 beforeEach(() => {
   dir = realpathSync(mkdtempSync(join(tmpdir(), "mcpr-cx-")));
@@ -43,6 +45,8 @@ beforeEach(() => {
   launchers = [];
   loginProblem = null;
   changes = 0;
+  connected = true;
+  sentItems = [];
   cfg = LaunchConfig.parse({
     roots: [join(dir, "code")],
     claude_path: "/opt/fake/claude",
@@ -71,7 +75,12 @@ function make(): Launcher {
     statePath: join(dir, "launches.json"),
     extraEnv: { MCP_REMOTE_SOCKET: "/tmp/d.sock" },
     onAck: (sid, ids) => acks.push({ sid, ids }),
-    onNotify: (sid, text, urgency) => notes.push({ sid, text, urgency }),
+    onNotify: (sid, item) => {
+      if (!connected) return false;
+      notes.push({ sid, text: item.text, urgency: item.urgency });
+      sentItems.push({ sid, id: item.id });
+      return true;
+    },
     codexLoginCheck: async () => loginProblem,
   });
   launchers.push(l);
@@ -316,7 +325,7 @@ describe("codex launches", () => {
     const s = await waitFor(() => tmux.spawns[0], "turn");
     expect(s.argv).toContain("--last");
     const again = await l.launch(alpha(), { continue: true, agent: "codex" });
-    expect(again).toMatchObject({ ok: false, error: expect.stringMatching(/share/) });
+    expect(again).toMatchObject({ ok: false, error: expect.stringMatching(/could pick its conversation/) });
   });
 
   it("a turn over the time limit is stopped and reported", async () => {
@@ -369,5 +378,104 @@ describe("codex launches", () => {
     await sleep(80);
     expect(tmux.sessions.has(id)).toBe(true);
     expect(notes).toEqual([]);
+  });
+});
+
+describe("codex launches: review round 1", () => {
+  it("status messages wait in a persisted outbox while the daemon is offline and go out after reconnecting", async () => {
+    connected = false;
+    const l = make();
+    await l.init();
+    const id = await startCodex(l);
+    l.deliver(id, [msg(id, "q")]);
+    await waitFor(() => tmux.spawns.length === 1, "turn");
+    endTurn(id, { final: "the answer" });
+    await waitFor(() => !tmux.sessions.has(id), "turn processed");
+    expect(notes).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "launches.json"), "utf8")).launches[0].outbox).toMatchObject([{ text: "the answer", urgency: "normal" }]);
+    // Bounded: only the newest 3 are kept.
+    for (const t of ["f1", "f2", "f3"]) {
+      l.deliver(id, [msg(id, t)]);
+      await waitFor(() => tmux.sessions.has(id), "turn " + t);
+      endTurn(id, { code: 1, error: t });
+      await waitFor(() => !tmux.sessions.has(id), "done " + t);
+    }
+    // A daemon restart keeps them; after hello the daemon flushes; the Hub's answer removes each.
+    l.dispose();
+    const l2 = make();
+    await l2.init();
+    connected = true;
+    expect(l2.outboxSessions()).toEqual([id]);
+    l2.flushOutbox(id);
+    expect(notes.map((n) => n.text.replace(/^.*: /, ""))).toEqual(["f1. Your message may not have been handled", "f2. Your message may not have been handled", "f3. Your message may not have been handled"]);
+    l2.flushOutbox(id); // in flight: not sent twice
+    expect(notes).toHaveLength(3);
+    l2.outboxRetry(sentItems[0]!.id); // answer lost: resent on the next flush
+    l2.flushOutbox(id);
+    expect(notes).toHaveLength(4);
+    for (const x of sentItems) l2.outboxDone(x.sid, x.id);
+    expect(l2.outboxSessions()).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "launches.json"), "utf8")).launches[0].outbox).toEqual([]);
+  });
+
+  it("a fresh start next to a session waiting to resume the folder's last conversation is refused (bypass A)", async () => {
+    const l = make();
+    await l.init();
+    await startCodex(l, { continue: true });
+    const b = await l.launch(alpha(), { continue: false, agent: "codex" });
+    expect(b).toMatchObject({ ok: false, error: expect.stringMatching(/waiting to resume/) });
+    // Claude Code in the same folder is unaffected.
+    expect((await l.launch(alpha(), { continue: false, agent: "claude" })).ok).toBe(true);
+  });
+
+  it("Restart + resume of a session that never ran (no thread) is refused next to another active Codex session (bypass B)", async () => {
+    const l = make();
+    await l.init();
+    const a = await startCodex(l);
+    const b = await startCodex(l);
+    expect(await l.restart(a, true)).toMatchObject({ ok: false, error: expect.stringMatching(/another Codex session is active/) });
+    // With its own thread it resumes exactly that one: fine.
+    l.deliver(a, [msg(a, "q")]);
+    await waitFor(() => tmux.sessions.has(a), "turn");
+    endTurn(a, { thread_id: "01a17b47-7383-7830-b9f5-1582b9c56491", final: "x", sends: 1 });
+    await waitFor(() => !tmux.sessions.has(a), "turn done");
+    expect((await l.restart(a, true)).ok).toBe(true);
+    expect((await l.restart(b, false)).ok).toBe(true);
+  });
+
+  it("a codex-only computer starts projects without --agent with Codex", async () => {
+    cfg = LaunchConfig.parse({ ...cfg, agents: ["codex"] });
+    const l = make();
+    await l.init();
+    expect(l.info().projects[0]!.agent).toBe("codex");
+    const r = await l.launch(alpha(), { continue: false });
+    expect(r.ok && rec(l, r.launch_id!).agent).toBe("codex");
+  });
+
+  it("messages kept after a failed turn start run once the settings are fixed (reload)", async () => {
+    cfg = LaunchConfig.parse({ ...cfg, codex_path: join(dir, "missing-codex") });
+    const l = make();
+    await l.init();
+    // codex disappears after the start (start itself checks it)
+    cfg = LaunchConfig.parse({ ...cfg, codex_path: "/opt/fake/codex" });
+    await l.reload();
+    const id = await startCodex(l);
+    cfg = LaunchConfig.parse({ ...cfg, codex_path: null });
+    const saved = process.env.PATH;
+    process.env.PATH = join(dir, "nowhere");
+    try {
+      await l.reload();
+      l.deliver(id, [msg(id, "keep me")]);
+      await waitFor(() => notes.length === 1, "problem note");
+      expect(notes[0]!.text).toMatch(/not found/);
+      expect(tmux.spawns).toHaveLength(0);
+    } finally {
+      process.env.PATH = saved;
+    }
+    cfg = LaunchConfig.parse({ ...cfg, codex_path: "/opt/fake/codex" });
+    await l.reload();
+    l.retryQueued();
+    const s = await waitFor(() => tmux.spawns[0], "turn after fix");
+    expect(readFileSync(s.argv[s.argv.indexOf("--prompt-file") + 1]!, "utf8")).toContain("keep me");
   });
 });

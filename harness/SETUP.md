@@ -404,7 +404,11 @@ running turn's summary; between turns there is no process at all).
    backed up to `config.toml.bak-<time>` first), is a no-op when the same registration exists, refuses to replace a
    different `mcp-remote` entry without `--force`, and adds `codex` to the agents the phone may start
    (`agents` in `launch.json`). `--no-register` skips the `config.toml` part: phone launches don't need it,
-   because the daemon passes the shim to every turn with `-c mcp_servers.mcp-remote.{command,args,env_vars,...}`
+   because the daemon passes the shim to every turn with
+   `-c mcp_servers.mcp-remote.{command,args,env_vars,tool_timeout_sec,default_tools_approval_mode,...}`
+   (`default_tools_approval_mode="approve"`: `codex exec` cancels MCP tool calls that would need an interactive
+   approval, so the shim's three tools are pre-approved for phone turns only; the `config.toml` entry doesn't need it,
+   the shim is dormant in your own sessions)
    (Codex starts MCP servers with only HOME, PATH, USER and a few more variables; `env_vars` forwards the
    session's id and token). In Codex sessions you start yourself the registered shim stays **dormant** (no tools,
    nothing on the phone): Codex doesn't forward `MCP_REMOTE_*` variables, and its command line has no channels flag.
@@ -434,7 +438,8 @@ running turn's summary; between turns there is no process at all).
    ```
 
    The phone's Start picker shows an agent menu when the computer offers both, preset to the project's agent;
-   launches and sessions carry a "Codex" badge.
+   launches and sessions carry a "Codex" badge. On a computer where only one agent is enabled (e.g.
+   `config set agents codex`), every project starts with that one, whatever its own `agent` says.
 
 How it behaves:
 
@@ -446,6 +451,9 @@ How it behaves:
   unanswered. Nothing else of a turn (commands, reasoning) reaches the phone (D17).
 - **Delivered ticks** appear when a turn takes the message (the daemon acknowledges it then). Messages still
   queued when a session stops stay undelivered and arrive after Restart.
+- **Status messages survive outages**: the fallback answer and the failure notices below come from the daemon
+  itself. If it can't reach the server at that moment (a turn ended while the daemon was stopped, a network
+  blip), they wait in `launches.json` (at most 3 per session, newest kept) and are sent after it reconnects.
 - **Failures**: a failed turn is reported on the phone as a short `[mcp-remote] ...` message (normal urgency;
   the session stays running: a turn failing is not the session ending, and there is no auto-restart). An
   authentication failure (401 / not logged in), a non-git folder or a missing `codex` also set **needs you at
@@ -454,7 +462,9 @@ How it behaves:
 - **Stop** kills the running turn (tmux ends it; `run-codex` passes SIGHUP to the whole process group) and ends
   the session. **Restart** = new conversation with the next message; **Restart + resume** = the same Codex
   thread. "resume last conversation" on a new start = `codex exec resume --last` (the folder's most recent Codex
-  conversation; refused while another Codex session runs in that folder, since they would share it).
+  conversation, taken with the session's first message). It is refused while another Codex session is active in
+  that folder (also for Restart + resume of a session that has no conversation yet), and while a session waits to
+  do so, other Codex starts in that folder are refused, since either could take the other's conversation.
 - **Daemon restart**: sessions come back by themselves; a turn that was running keeps running in tmux, its shim
   reconnects to the new daemon (its reply still reaches the phone), and its result is picked up. Messages not yet
   handed to a turn are redelivered by the Hub.
@@ -907,6 +917,9 @@ Phase 4b (sign-up, Registry, admin, one-line install) adds these; `developers.cl
 Phase 5 (Codex) adds these. Everything about Codex was checked against codex-cli 0.164.0 without any login or
 credentials and with the network cut off (`unshare -n`), so no request ever reached OpenAI:
 
+- [ ] A logged-in exec turn's `send_message` is not cancelled for approval ("MCP tool call cancelled: interactive
+      approval is unavailable in exec mode"); the daemon passes `default_tools_approval_mode="approve"` for the
+      shim (accepted by 0.164.0's config parser offline).
 - [ ] With a real login, a phone message to a Codex session runs a turn and Codex calls `send_message` (the
       e2e uses `scripts/fake-codex.mjs`, which follows the documented event format); check `mcp-remote attach`
       during a turn and that the reply arrives with the chosen urgency.

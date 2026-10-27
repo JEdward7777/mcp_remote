@@ -54,6 +54,11 @@ export const MAX_AUTO_RESTARTS = 5;
 export const STABLE_RUN_MS = 10 * 60_000;
 const ACTIVE: LaunchState[] = ["starting", "running", "needs_attention"];
 
+/** Daemon status messages kept per session until the Hub confirmed them. */
+export const MAX_OUTBOX = 3;
+const OutboxItem = z.object({ id: z.string().regex(/^[0-9a-f]{12}$/), text: z.string().min(1).max(MAX_TEXT_CHARS), urgency: z.enum(["silent", "normal", "urgent"]) });
+export type OutboxItem = z.infer<typeof OutboxItem>;
+
 const Entry = LaunchRecord.extend({
   token: z.string(),
   path: z.string(),
@@ -84,6 +89,12 @@ const Entry = LaunchRecord.extend({
   codex_last: z.boolean().default(false),
   /** When the running turn started; null = no turn running (persisted so a restarted daemon re-adopts it). */
   turn_at: z.number().int().nullable().default(null),
+  /**
+   * Status messages from the daemon to the phone (fallback final answer, failed-turn notices) not yet confirmed
+   * by the Hub: kept across daemon restarts and network blips, sent after the next hello. Bounded: the newest
+   * MAX_OUTBOX per session.
+   */
+  outbox: z.array(OutboxItem).max(MAX_OUTBOX).default([]),
 });
 type Entry = z.infer<typeof Entry> & {
   linked?: boolean;
@@ -165,8 +176,12 @@ export interface LauncherOptions {
   claudeConfigDir?: string;
   /** Codex launches: acknowledge phone messages handed to a turn (the Hub stops redelivering them). */
   onAck?: (sessionId: string, ids: number[]) => void;
-  /** Codex launches: a status message from the daemon to the phone (turn failed, not logged in, ...). */
-  onNotify?: (sessionId: string, text: string, urgency: Urgency) => void;
+  /**
+   * Codex launches: send a status message from the daemon to the phone (turn failed, not logged in, the
+   * fallback final answer). Return false when it can't be sent now (not connected); call outboxDone once the
+   * Hub answered and outboxRetry when the answer was lost, so it is sent again after the next hello.
+   */
+  onNotify?: (sessionId: string, item: OutboxItem) => boolean;
   codexLoginCheck?: CodexLoginCheck;
 }
 
@@ -248,6 +263,8 @@ export class Launcher {
   private restartTimers = new Map<string, NodeJS.Timeout>();
   private livenessTimer: NodeJS.Timeout | undefined;
   private checking = false;
+  /** Outbox items handed to the daemon and not answered yet. */
+  private inflight = new Set<string>();
   private disposed = false;
   readonly statePath: string;
 
@@ -295,7 +312,7 @@ export class Launcher {
       configError = e instanceof Error ? e.message : String(e);
       log(`launch config: ${configError}`);
     }
-    this.projects = resolveProjects(this.cfg).map((p) => ({ id: p.id, name: p.name, agent: p.agent }));
+    this.projects = resolveProjects(this.cfg).map((p) => ({ id: p.id, name: p.name, agent: this.agentFor(p.agent) }));
     const platform = this.o.platform ?? process.platform;
     if (this.o.tmux) this.tmux = this.o.tmux;
     else if (platform === "win32") this.tmux = null;
@@ -337,7 +354,7 @@ export class Launcher {
     if (!this.available) return { ok: false, error: this.launchError ?? "remote launch is not available" };
     const project = findProject(this.cfg, projectId);
     if (!project) return { ok: false, error: "unknown project: it is not in this computer's allowlist (mcp-remote projects list)" };
-    const agent = opts.agent ?? project.agent;
+    const agent = opts.agent ?? this.agentFor(project.agent);
     if (!this.cfg.agents.includes(agent)) {
       return {
         ok: false,
@@ -347,9 +364,9 @@ export class Launcher {
             : "Claude Code is not enabled on this computer (mcp-remote config set agents claude,codex)",
       };
     }
-    if (agent === "codex" && opts.continue && this.entries.some((x) => x.agent === "codex" && x.project_id === project.id && ACTIVE.includes(x.state))) {
-      // `exec resume --last` would pick the conversation the running launch is using.
-      return { ok: false, error: "another Codex session is running in this folder; resuming the folder's last conversation would share it. Start a new conversation, or use Restart + resume on that session" };
+    if (agent === "codex") {
+      const conflict = this.codexFolderConflict(project.id, null, opts.continue);
+      if (conflict) return { ok: false, error: conflict };
     }
     if (this.activeCount() >= this.cfg.max_sessions) {
       return { ok: false, error: `this computer already runs ${this.activeCount()} launched sessions (max ${this.cfg.max_sessions})` };
@@ -390,6 +407,7 @@ export class Launcher {
       codex_thread: null,
       codex_last: false,
       turn_at: null,
+      outbox: [],
     };
     this.entries.push(e);
     e.busy = true;
@@ -435,6 +453,11 @@ export class Launcher {
     if (!project) return { ok: false, error: "this project is no longer in the computer's allowlist" };
     if (!this.cfg.agents.includes(e.agent)) {
       return { ok: false, error: `${e.agent === "codex" ? "Codex" : "Claude Code"} is no longer enabled on this computer` };
+    }
+    if (e.agent === "codex") {
+      // Resuming without a known thread means `exec resume --last`, the folder's most recent conversation.
+      const conflict = this.codexFolderConflict(e.project_id, e, cont && !e.codex_thread);
+      if (conflict) return { ok: false, error: conflict };
     }
     if (!ACTIVE.includes(e.state) && this.activeCount() >= this.cfg.max_sessions) {
       return { ok: false, error: `this computer already runs ${this.activeCount()} launched sessions (max ${this.cfg.max_sessions})` };
@@ -1065,6 +1088,34 @@ export class Launcher {
     void this.maybeStartTurn(e);
   }
 
+  /** The project's agent, or the only agent enabled here when that one is not (a codex-only computer). */
+  private agentFor(projectAgent: Agent): Agent {
+    if (this.cfg.agents.includes(projectAgent)) return projectAgent;
+    return this.cfg.agents.length === 1 ? this.cfg.agents[0]! : projectAgent;
+  }
+
+  /**
+   * `exec resume --last` takes the folder's most recent Codex conversation, which is only safe while no other
+   * Codex session in that folder can create or use one first: refuse a "resume last" start next to another
+   * active Codex session, and any start next to a session still waiting to resume the folder's last one.
+   */
+  private codexFolderConflict(projectId: string, self: Entry | null, wantsLast: boolean): string | null {
+    const others = this.entries.filter((x) => x !== self && x.agent === "codex" && x.project_id === projectId && ACTIVE.includes(x.state));
+    if (wantsLast && others.length) {
+      return (
+        "another Codex session is active in this folder; resuming the folder's last conversation could pick its conversation. " +
+        "Start a new conversation, or stop the other session first"
+      );
+    }
+    if (others.some((x) => x.codex_last && !x.codex_thread)) {
+      return (
+        "another Codex session in this folder is waiting to resume the folder's last conversation (it does with its first " +
+        "message); a new conversation here now could be picked instead. Send that session a message first, or stop it"
+      );
+    }
+    return null;
+  }
+
   private codexBin(): string | null {
     return this.cfg.codex_path ?? which("codex");
   }
@@ -1100,8 +1151,54 @@ export class Launcher {
    * failed one is reported (a normal message: the user is waiting for a reply), and kept in the detail.
    */
   private codexProblem(e: Entry, text: string, attention: boolean): void {
-    this.o.onNotify?.(e.session_id, `[mcp-remote] ${text}`, "normal");
+    this.notify(e, `[mcp-remote] ${text}`, "normal");
     this.set(e, { ...(attention ? { state: "needs_attention" as const } : {}), detail: text });
+  }
+
+  /** Queue a status message for the phone (persisted until the Hub confirms it) and try to send it now. */
+  private notify(e: Entry, text: string, urgency: Urgency): void {
+    const item: OutboxItem = { id: randomBytes(6).toString("hex"), text: text.slice(0, MAX_TEXT_CHARS), urgency };
+    const dropped = [...e.outbox, item].slice(0, -MAX_OUTBOX);
+    for (const d of dropped) this.inflight.delete(d.id);
+    e.outbox = [...e.outbox, item].slice(-MAX_OUTBOX);
+    this.saveState();
+    this.flushOutbox(e.session_id);
+  }
+
+  /** After a settings reload: messages put back because a turn could not start (codex missing, ...) get another try. */
+  retryQueued(): void {
+    for (const e of this.entries) if (e.agent === "codex" && e.queue?.length) void this.maybeStartTurn(e);
+  }
+
+  /** Sessions with status messages waiting (the daemon flushes them after hello). */
+  outboxSessions(): string[] {
+    return this.entries.filter((e) => e.outbox.length).map((e) => e.session_id);
+  }
+
+  /** Hand waiting status messages of a session to the daemon (each once until outboxRetry). */
+  flushOutbox(sessionId: string): void {
+    const e = this.get(sessionId);
+    if (!e || !this.o.onNotify) return;
+    for (const item of e.outbox) {
+      if (this.inflight.has(item.id)) continue;
+      if (!this.o.onNotify(e.session_id, item)) return; // not connected: all of it waits for the next hello
+      this.inflight.add(item.id);
+    }
+  }
+
+  /** The Hub answered (stored it, or refused it for good): forget it. */
+  outboxDone(sessionId: string, id: string): void {
+    this.inflight.delete(id);
+    const e = this.get(sessionId);
+    if (!e || !e.outbox.some((x) => x.id === id)) return;
+    e.outbox = e.outbox.filter((x) => x.id !== id);
+    this.saveState();
+  }
+
+  /** The answer was lost (connection dropped, timeout): send it again after the next hello. */
+  outboxRetry(id?: string): void {
+    if (id) this.inflight.delete(id);
+    else this.inflight.clear();
   }
 
   private async startTurn(e: Entry): Promise<void> {
@@ -1170,6 +1267,8 @@ export class Launcher {
     };
     if (process.env.PATH) env.PATH = process.env.PATH;
     await tmux.kill(e.launch_id).catch(() => {});
+    // No stale pid from the previous turn: a shim registering before list() below must not be checked against it.
+    e.panePid = null;
     try {
       await tmux.spawn({ name: e.launch_id, cwd: e.path, env, argv });
     } catch (err) {
@@ -1237,7 +1336,7 @@ export class Launcher {
     if (code === 0 && sum?.completed && !timedOut) {
       if (sends === 0 && sum.final?.trim() && this.cfg.codex_final_message === "fallback") {
         // Codex answered in its final message instead of using send_message: the user would see nothing.
-        this.o.onNotify?.(e.session_id, `${sum.final}`.slice(0, MAX_TEXT_CHARS), "normal");
+        this.notify(e, sum.final, "normal");
       }
       this.setQuiet(e, { state: "running", exit_code: null, detail: null });
     } else if (timedOut) {
@@ -1353,6 +1452,7 @@ export class Launcher {
         codex_thread: null,
         codex_last: false,
         turn_at: null,
+        outbox: [],
         fresh: false,
         spawnLinked: true,
         panePid: p.pid,

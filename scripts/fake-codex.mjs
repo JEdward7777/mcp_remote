@@ -11,7 +11,8 @@
 //   "slow ..."        reply after 3 s (queueing test)
 //   "final-only ..."  no send_message; only a final agent message (fallback test)
 //   "fail ..."        turn.failed, exit 1
-//   anything else     send_message "codex: <text of every message in this turn, joined with ' | '>"
+//   anything else     send_message "codex: <text of every message in this turn, joined with ' | '>", called once
+//                     (no retry, like Codex); if it fails the final answer is "codex (final): <texts>"
 // $FAKE_CODEX_HOME holds its state (threads, mcp servers); the file $FAKE_CODEX_HOME/logged-out makes it
 // behave as not logged in (`login status` -> "Not logged in", exec -> a 401 like the API). Every start is
 // logged as one JSON line to $FAKE_CODEX_LOG.
@@ -178,24 +179,22 @@ if (last.startsWith("hang")) {
 }
 if (last.startsWith("slow")) await new Promise((r) => setTimeout(r, 3000));
 
+let sent = false;
 if (!last.startsWith("final-only") && client) {
   const text = `codex: ${texts.join(" | ")}`;
   const args = { text, urgency: "normal" };
   emit({ type: "item.started", item: { id: "item_1", type: "mcp_tool_call", server: name, tool: "send_message", arguments: args, result: null, error: null, status: "in_progress" } });
-  // Like the real shim may: retry while the daemon link comes up.
-  let r;
-  for (let i = 0; i < 100; i++) {
-    r = await client.callTool({ name: "send_message", arguments: args });
-    if (!r.isError) break;
-    await new Promise((res) => setTimeout(res, 100));
-  }
+  // One call, no retry (like Codex): a failure goes back to the "model" and the turn ends with a final answer.
+  const r = await client.callTool({ name: "send_message", arguments: args });
+  sent = !r.isError;
   log("send_result", { ok: !r.isError, text: r.content?.[0]?.text });
   emit({
     type: "item.completed",
     item: { id: "item_1", type: "mcp_tool_call", server: name, tool: "send_message", arguments: args, result: r.isError ? null : { content: r.content, structured_content: null }, error: r.isError ? { message: r.content?.[0]?.text } : null, status: r.isError ? "failed" : "completed" },
   });
 }
-emit({ type: "item.completed", item: { id: "item_2", type: "agent_message", text: last.startsWith("final-only") ? `final answer for: ${last}` : "Done; I messaged you." } });
+const finalText = last.startsWith("final-only") ? `final answer for: ${last}` : sent ? "Done; I messaged you." : `codex (final): ${texts.join(" | ")}`;
+emit({ type: "item.completed", item: { id: "item_2", type: "agent_message", text: finalText } });
 emit({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 0 } });
 await client?.close().catch(() => {});
 process.exit(0);
