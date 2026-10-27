@@ -265,6 +265,9 @@ export class Daemon {
         if (link === "reject") {
           return refuse(`session id "${sid}" belongs to a phone-launched session; only the shim that session starts can use it`);
         }
+        if (f.agent === "codex" && link !== "turn") {
+          return refuse(`no Codex turn of session "${sid}" is running (a codex started outside mcp-remote with its environment?)`);
+        }
         if (link === "turn") {
           // The shim of a running Codex turn: it can message the phone (send_message, get_location); the
           // session itself is the daemon's (already announced), so nothing is announced or delivered here.

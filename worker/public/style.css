@@ -129,3 +129,4 @@ form.invite-form input[type=number] { width: 5em; padding: 6px; }
 form.invite-form input:not([type]) { flex: 1 1 160px; padding: 6px; }
 p.audit { margin: 2px 0; overflow-wrap: anywhere; }
 .badge.st-exited { opacity: .8; }
+.badge.ag-codex { border-color: var(--accent); color: var(--accent); }

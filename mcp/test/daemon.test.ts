@@ -636,3 +636,104 @@ describe("daemon tells shims why the server refused (phase 3 review round 2)", (
   });
 });
 
+
+describe("daemon codex sessions (Phase 5)", () => {
+  async function setup() {
+    const code = join(realpathSync(dir), "code");
+    mkdirSync(join(code, "alpha"), { recursive: true });
+    const cfg = LaunchConfig.parse({ roots: [code], codex_path: "/opt/fake/codex", agents: ["claude", "codex"], default_agent: "codex" });
+    const tmux = new FakeTmux();
+    daemon = new Daemon({
+      config: { url: `http://127.0.0.1:${port}`, token: "mrm1.test.token.value.sig", machine_id: "m1" },
+      socket: join(dir, "d.sock"),
+      launcher: {
+        loadConfig: () => cfg,
+        tmux,
+        tickMs: 10,
+        livenessMs: 20,
+        stopWaitMs: 200,
+        wrapper: ["/usr/bin/node", "/opt/cli.js"],
+        runDir: join(dir, "run"),
+        codexLoginCheck: async () => null,
+      },
+      reconnect: FAST_RECONNECT,
+    });
+    await daemon.start();
+    await waitFor(() => hubSockets.length === 1, "connect");
+    return { tmux, alpha: projectIdFor(join(code, "alpha")) };
+  }
+  const hub = (f: unknown) => hubSockets[0]!.send(JSON.stringify(f));
+  const lastLaunches = () => [...hubFrames].reverse().find((f) => f.t === "launches")?.launches ?? [];
+
+  it("announces the Codex session itself, hands messages to turns, acks them, links the turn's shim without re-announcing", async () => {
+    const { tmux, alpha } = await setup();
+    const proj = await waitFor(() => hubFrames.find((f) => f.t === "projects"), "projects");
+    expect(proj).toMatchObject({ agents: ["claude", "codex"], projects: [{ id: alpha, agent: "codex" }] });
+    hub({ t: "launch", req_id: "c1", project_id: alpha, continue: false });
+    await waitFor(() => hubFrames.find((f) => f.t === "launch_result" && f.req_id === "c1" && f.ok), "launched");
+    const id = lastLaunches()[0].launch_id;
+    expect(lastLaunches()[0]).toMatchObject({ agent: "codex", state: "running" });
+    await waitFor(() => hubFrames.find((f) => f.t === "session_up" && f.session.session_id === id), "session_up by the daemon");
+
+    // A shim without the turn token can't take the id.
+    const impostor = await shim(id, "alpha");
+    expect(impostor.frames[0]).toMatchObject({ t: "register_refused" });
+
+    const m = { id: 9, session_id: id, direction: "in", text: "hi codex", urgency: null, created_at: 1, delivered: false };
+    hub({ t: "deliver", session_id: id, messages: [m] });
+    await waitFor(() => tmux.spawns.length === 1, "turn");
+    await waitFor(() => hubFrames.find((f) => f.t === "ack" && f.session_id === id), "ack");
+    expect(hubFrames.find((f) => f.t === "ack" && f.session_id === id)).toEqual({ t: "ack", session_id: id, ids: [9] });
+
+    // The turn's shim (token from the spawn env) registers: no second session_up; send_message works.
+    const ups = hubFrames.filter((f) => f.t === "session_up").length;
+    const sock = createConnection(join(dir, "d.sock"));
+    await new Promise<void>((r) => sock.once("connect", () => r()));
+    const frames: any[] = [];
+    const conn = new LineConn(sock, DaemonToShim, (f) => frames.push(f), () => {});
+    const token = tmux.spawns[0]!.env.MCP_REMOTE_LAUNCH_TOKEN;
+    conn.send({ t: "register", v: 1, session: { session_id: id, project: "alpha" }, launch_token: token });
+    await waitFor(() => frames.find((f) => f.t === "registered"), "turn shim registered");
+    // A nested process with the same turn token is refused while the turn's shim is connected.
+    const nested = createConnection(join(dir, "d.sock"));
+    await new Promise<void>((r) => nested.once("connect", () => r()));
+    const nf: any[] = [];
+    const nconn = new LineConn(nested, DaemonToShim, (f) => nf.push(f), () => {});
+    nconn.send({ t: "register", v: 1, session: { session_id: id, project: "alpha" }, launch_token: token });
+    await waitFor(() => nf.find((f) => f.t === "register_refused"), "nested refused");
+    conn.send({ t: "send", req_id: "s1", text: "on it", urgency: "normal" });
+    await waitFor(() => frames.find((f) => f.t === "sent" && f.req_id === "s1"), "sent");
+    expect(hubFrames.find((f) => f.t === "send" && f.text === "on it")).toMatchObject({ session_id: id });
+    // A turn shim's own acks are ignored (only the daemon acks a Codex session's messages).
+    const acks = hubFrames.filter((f) => f.t === "ack").length;
+    conn.send({ t: "ack", ids: [123] });
+    await sleep(50);
+    expect(hubFrames.filter((f) => f.t === "ack").length).toBe(acks);
+    expect(hubFrames.filter((f) => f.t === "session_up").length).toBe(ups);
+    conn.close();
+    await sleep(50);
+    expect(hubFrames.find((f) => f.t === "session_down" && f.session_id === id)).toBeUndefined();
+
+    // The turn fails: the phone gets a status message from the daemon (it shares the session).
+    mkdirSync(join(dir, "run"), { recursive: true });
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(
+      join(dir, "run", `${id}.exit`),
+      JSON.stringify({ token, code: 2, signal: null, codex: { thread_id: null, started: true, completed: false, error: "boom", final: null, auth: false, sends: 0, stderr_tail: "" } }),
+    );
+    const tsock = createConnection(join(dir, "d.sock"));
+    await new Promise<void>((r) => tsock.once("connect", () => r()));
+    tsock.end(JSON.stringify({ t: "turn_end", session_id: id, launch_token: token }) + "\n");
+    await waitFor(() => hubFrames.find((f) => f.t === "send" && /turn failed \(exit 2\): boom/.test(f.text)), "failure message");
+
+    // A reconnect re-announces it in hello.
+    hubSockets[0]!.terminate();
+    await waitFor(() => hubSockets.length === 2, "reconnected");
+    const hello = await waitFor(() => [...hubFrames].reverse().find((f) => f.t === "hello"), "hello");
+    expect(hello.sessions.map((s: any) => s.session_id)).toContain(id);
+
+    // Stop: session goes down.
+    hubSockets[1]!.send(JSON.stringify({ t: "launch_stop", req_id: "c2", launch_id: id }));
+    await waitFor(() => hubFrames.find((f) => f.t === "session_down" && f.session_id === id), "session_down");
+  });
+});

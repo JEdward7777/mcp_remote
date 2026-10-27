@@ -145,6 +145,30 @@ describe("shim", () => {
     expect((r.content as { text: string }[])[0]!.text).toMatch(/inactive.*--dangerously-load-development-channels/);
   }, 20_000);
 
+  it("stays dormant in a desk Codex session (registered with setup-codex, no launch token) (Phase 5)", async () => {
+    const c = await startShim(null, {}, ["exec", "--json", "-"]);
+    expect(c.getInstructions()).toBeUndefined();
+    expect((await c.listTools()).tools).toEqual([]);
+    await sleep(1000);
+    expect(hubFrames.filter((f) => f.t === "session_up")).toEqual([]);
+  }, 20_000);
+
+  it("in a phone-driven Codex turn: no channel capability, Codex instructions, same tools (Phase 5)", async () => {
+    const c = await startShim("mr-0123456789ab", { MCP_REMOTE_AGENT: "codex", MCP_REMOTE_LAUNCH_TOKEN: "tok-not-current" }, ["exec", "resume", "--json"]);
+    expect(c.getServerCapabilities()?.experimental?.["claude/channel"]).toBeUndefined();
+    expect(c.getInstructions()).toMatch(/ONLY way to reach them is the mcp-remote send_message tool/);
+    expect((await c.listTools()).tools.map((t) => t.name)).toEqual(["send_message", "get_location", "map_link"]);
+    // The daemon has no such turn: the shim is refused and says so.
+    let r;
+    for (let i = 0; i < 30; i++) {
+      r = await c.callTool({ name: "send_message", arguments: { text: "hi" } });
+      if (/refused/.test((r.content as { text: string }[])[0]!.text)) break;
+      await sleep(100);
+    }
+    expect((r!.content as { text: string }[])[0]!.text).toMatch(/refused this session/);
+    expect(hubFrames.filter((f) => f.t === "session_up")).toEqual([]);
+  }, 20_000);
+
   it("registers when its parent was started with the channels flag, or with MCP_REMOTE_ACTIVATE=1", async () => {
     await startShim(null, { CLAUDE_PROJECT_DIR: "/x/flagged" }, ["--dangerously-load-development-channels", "server:mcp-remote"]);
     for (let i = 0; i < 50 && !hubFrames.find((f) => f.t === "session_up"); i++) await sleep(100);

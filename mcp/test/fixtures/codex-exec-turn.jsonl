@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"bash -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"bash -lc ls","aggregated_output":"README.md\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"reasoning","text":"**Replying on the phone**"}}
+{"type":"item.started","item":{"id":"item_2","type":"mcp_tool_call","server":"mcp-remote","tool":"send_message","arguments":{"text":"Done: README listed","urgency":"normal"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"mcp-remote","tool":"send_message","arguments":{"text":"Done: README listed","urgency":"normal"},"result":{"content":[{"type":"text","text":"Sent to the user's phone (urgency normal, id 12)."}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"I listed the files and messaged you."}}
+{"type":"turn.completed","usage":{"input_tokens":2400,"cached_input_tokens":1024,"cache_write_input_tokens":0,"output_tokens":120,"reasoning_output_tokens":64}}

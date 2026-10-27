@@ -1202,7 +1202,8 @@ export class Launcher {
   private onTurnExit(e: Entry, rec: CodexExitRecord | null, paneStatus: number | null, screen: string): void {
     const sum = rec?.codex;
     const code = rec ? exitCodeOf(rec) : paneStatus;
-    const sends = e.turnSends ?? 0;
+    // send_message calls: as the daemon counted them, or as Codex reported them (whichever saw more).
+    const sends = Math.max(e.turnSends ?? 0, sum?.sends ?? 0);
     const timedOut = !!e.timedOut;
     e.turn_at = null;
     e.linked = false;

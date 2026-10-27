@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
-import { AGENTS, Agent, MAX_LAUNCHES_PER_MACHINE, MAX_PROJECTS_PER_MACHINE, type ProjectInfo } from "@mcp-remote/shared";
+import { Agent, MAX_LAUNCHES_PER_MACHINE, MAX_PROJECTS_PER_MACHINE, type ProjectInfo } from "@mcp-remote/shared";
 import { CodexFinal, CodexMode, codexExtraArgsIssues } from "./codex";
 import { configDir, ensureConfigDir } from "./config";
 
@@ -126,7 +126,7 @@ export const LaunchConfig = z.object({
   agents: z
     .array(Agent)
     .min(1)
-    .max(AGENTS.length)
+    .max(8)
     .default(["claude"])
     .transform((a) => [...new Set(a)]),
   /** Agent for projects without their own `agent` (roots' sub-folders, and projects added without --agent). */

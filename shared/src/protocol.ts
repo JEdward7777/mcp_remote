@@ -471,6 +471,8 @@ export const ShimToDaemon = z.discriminatedUnion("t", [
     /** Parent, grandparent, ... pids of the shim (launched sessions only): tells the session's own shim
      * (child of the Claude Code in the tmux pane) from one started by a nested `claude` deeper down. */
     ancestors: z.array(z.number().int().positive()).max(8).optional(),
+    /** Started by Codex for a phone-driven turn (Phase 5): only valid as that turn's shim, never a session of its own. */
+    agent: z.literal("codex").optional(),
   }),
   z.object({ t: z.literal("send"), req_id: ReqId, text: MessageText, urgency: Urgency }),
   z.object({ t: z.literal("ack"), ids: z.array(z.number().int()).min(1).max(500) }),

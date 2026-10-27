@@ -217,6 +217,7 @@ export async function runShim(opts: ShimOptions = {}): Promise<void> {
         v: PROTOCOL_VERSION,
         session: { session_id: sessionId, project: project.slice(0, 128), cwd: cwd.slice(0, 1024) },
         ...(launchToken ? { launch_token: launchToken, ancestors: ancestors(8) } : {}),
+        ...(codexTurn ? { agent: "codex" as const } : {}),
       } satisfies ShimToDaemon);
     });
     sock.on("error", () => {

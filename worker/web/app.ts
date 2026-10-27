@@ -1,5 +1,6 @@
 // Phone PWA (no framework). Bundled to public/app.js by build-web.mjs.
 import type {
+  Agent,
   HubToPhone,
   LaunchRecord,
   LocationRequestInfo,
@@ -479,6 +480,17 @@ function newClientId(): string {
   return `${pageId}-${++clientSeq}`;
 }
 
+const AGENT_LABEL: Record<Agent, string> = { claude: "Claude Code", codex: "Codex" };
+
+/** Which agent a launch runs (records from older daemons have none: Claude Code). */
+function agentOf(l: LaunchRecord): Agent {
+  return l.agent ?? "claude";
+}
+
+function agentBadge(a: Agent): HTMLElement {
+  return h("span", { class: `badge ag-${a}`, title: `agent: ${AGENT_LABEL[a]}` }, AGENT_LABEL[a]);
+}
+
 function stateBadge(l: LaunchRecord): HTMLElement {
   const code = l.state === "exited" && l.exit_code !== null ? ` (${l.exit_code})` : "";
   return h("span", { class: `badge st-${l.state}`, title: `launch state: ${l.state}` }, STATE_LABEL[l.state] + code);
@@ -499,13 +511,14 @@ function launchButtons(m: MachineRecord, l: LaunchRecord): HTMLElement {
     };
     box.append(b);
   };
+  const agent = AGENT_LABEL[agentOf(l)];
   const restart = (cont: boolean) => {
-    if (active && !confirm(`Restart ${l.project}? The running Claude Code session is ended first.`)) return;
+    if (active && !confirm(`Restart ${l.project}? The running ${agent} session is ended first.`)) return;
     launchOp({ t: "launch_restart", machine_id: m.machine_id, launch_id: l.launch_id, continue: cont, client_id: newClientId() }, l.launch_id);
   };
   const pendingRestart = l.state === "exited" && !!l.detail?.includes("restarting in");
   mk("Stop", "danger", active || pendingRestart, () => {
-    if (!confirm(`Stop ${l.project}? This ends the Claude Code session on ${m.name}.`)) return;
+    if (!confirm(`Stop ${l.project}? This ends the ${agent} session on ${m.name}.`)) return;
     launchOp({ t: "launch_stop", machine_id: m.machine_id, launch_id: l.launch_id, client_id: newClientId() }, l.launch_id);
   });
   mk("Restart", "", true, () => restart(false));
@@ -526,7 +539,7 @@ function launchRow(m: MachineRecord, l: LaunchRecord): HTMLElement {
   return h(
     "div",
     { class: `launch-row st-${l.state}`, "data-launch": l.launch_id },
-    h("div", { class: "launch-top" }, title, stateBadge(l), h("span", { class: "sid" }, l.launch_id)),
+    h("div", { class: "launch-top" }, title, agentBadge(agentOf(l)), stateBadge(l), h("span", { class: "sid" }, l.launch_id)),
     !m.online ? h("div", { class: "launch-detail" }, "Computer offline: last known state.") : null,
     l.detail ? h("div", { class: "launch-detail" }, l.detail) : null,
     launchButtons(m, l),
@@ -536,6 +549,11 @@ function launchRow(m: MachineRecord, l: LaunchRecord): HTMLElement {
 interface LauncherForm {
   root: HTMLElement;
   select: HTMLSelectElement;
+  /** Agent picker; shown only when the computer offers more than one agent. */
+  agent: HTMLSelectElement;
+  agentKey: string;
+  /** The project the agent picker was last defaulted for. */
+  agentFor: string;
   cont: HTMLInputElement;
   auto: HTMLInputElement;
   btn: HTMLButtonElement;
@@ -546,12 +564,14 @@ interface LauncherForm {
 function buildLauncher(machineId: string): LauncherForm {
   const root = h("form", { class: "launcher" });
   const select = h("select", { "aria-label": "project" });
+  const agent = h("select", { "aria-label": "agent" });
+  agent.hidden = true;
   const cont = h("input", { type: "checkbox" });
   const auto = h("input", { type: "checkbox" });
   const btn = h("button", { type: "submit" }, "Start session");
   const note = h("p", { class: "muted launch-note" });
   root.append(
-    h("div", { class: "launcher-row" }, select, btn),
+    h("div", { class: "launcher-row" }, select, agent, btn),
     h(
       "div",
       { class: "launcher-row opts" },
@@ -560,6 +580,10 @@ function buildLauncher(machineId: string): LauncherForm {
     ),
     note,
   );
+  select.onchange = () => render(); // re-defaults the agent picker to the chosen project's agent
+  agent.onchange = () => {
+    auto.disabled = agent.value === "codex";
+  };
   root.onsubmit = (ev) => {
     ev.preventDefault();
     if (!select.value) return;
@@ -569,13 +593,14 @@ function buildLauncher(machineId: string): LauncherForm {
         machine_id: machineId,
         project_id: select.value,
         continue: cont.checked,
-        ...(auto.checked ? { auto_restart: true } : {}),
+        ...(auto.checked && agent.value !== "codex" ? { auto_restart: true } : {}),
+        ...(!agent.hidden && agent.value ? { agent: agent.value as Agent } : {}),
         client_id: newClientId(),
       },
       null,
     );
   };
-  return { root, select, cont, auto, btn, note, key: "" };
+  return { root, select, agent, agentKey: "", agentFor: "", cont, auto, btn, note, key: "" };
 }
 
 function updateLauncher(f: LauncherForm, m: MachineRecord): void {
@@ -589,6 +614,21 @@ function updateLauncher(f: LauncherForm, m: MachineRecord): void {
     if (projects.some((p) => p.id === keep)) f.select.value = keep;
     f.key = key;
   }
+  // Agent picker: only when this computer offers more than one; defaults to the project's own agent.
+  const agents = info?.agents ?? ["claude"];
+  const akey = agents.join(",");
+  if (akey !== f.agentKey) {
+    f.agent.replaceChildren(...agents.map((a) => h("option", { value: a }, AGENT_LABEL[a])));
+    f.agentKey = akey;
+    f.agentFor = "";
+  }
+  f.agent.hidden = agents.length < 2;
+  if (f.agentFor !== f.select.value) {
+    const pa = projects.find((p) => p.id === f.select.value)?.agent ?? "claude";
+    if (agents.includes(pa)) f.agent.value = pa;
+    f.agentFor = f.select.value;
+  }
+  f.auto.disabled = f.agent.value === "codex" && !f.agent.hidden;
   const active = info ? info.launches.filter((l) => ACTIVE_STATES.includes(l.state)).length : 0;
   let why = "";
   if (!info) why = "This computer's daemon has not reported launch support (update mcp-remote on it).";
@@ -694,7 +734,11 @@ function updateSessions(v: SessionsView): void {
           { class: "session", href: `#/s/${s.session_id}`, "data-session": s.session_id },
           h("span", { class: s.online ? "dot on" : "dot off", title: s.online ? "online" : "offline" }),
           h("span", { class: "proj" }, s.project),
-          launches.some((l) => l.session_id === s.session_id) ? h("span", { class: "badge", title: "started from the phone" }, "launched") : null,
+          ...(() => {
+            const l = launches.find((x) => x.session_id === s.session_id);
+            if (!l) return [];
+            return [h("span", { class: "badge", title: "started from the phone" }, "launched"), agentOf(l) !== "claude" ? agentBadge(agentOf(l)) : null];
+          })(),
           h("span", { class: "sid" }, s.session_id.slice(0, 8)),
           urgencyBadge(s.last_urgency),
           s.pending_in ? h("span", { class: "pending", title: "messages waiting for the session" }, String(s.pending_in)) : null,
@@ -767,7 +811,7 @@ function updateThread(v: ThreadView): void {
     v.launchBar.className = `launch-bar st-${lf.launch.state}`;
     v.launchBar.replaceChildren(
       ...nodes(
-        h("div", { class: "launch-top" }, h("span", { class: "muted" }, "Started from the phone"), stateBadge(lf.launch)),
+        h("div", { class: "launch-top" }, h("span", { class: "muted" }, "Started from the phone"), agentBadge(agentOf(lf.launch)), stateBadge(lf.launch)),
         lf.launch.detail ? h("div", { class: "launch-detail" }, lf.launch.detail) : null,
         launchButtons(lf.machine, lf.launch),
       ),
